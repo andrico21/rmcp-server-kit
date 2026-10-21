@@ -20,7 +20,7 @@ use std::{fs, path::PathBuf, sync::LazyLock};
 
 use axum::{
     body::Body,
-    http::{Extensions, Method, Request, StatusCode},
+    http::{Extensions, HeaderValue, Method, Request, StatusCode, header::WWW_AUTHENTICATE},
     middleware::Next,
     response::{IntoResponse as _, Response},
 };
@@ -34,7 +34,7 @@ use tracing::field;
 #[cfg(feature = "metrics")]
 use crate::metrics::record_rate_limit_deny;
 use crate::{
-    auth::AuthIdentity,
+    auth::{AuthIdentity, AuthMethod},
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     config::{
         EnvOverride, EnvOverrideSource, RBAC_REDACTION_SALT_ENV, RBAC_REDACTION_SALT_FILE_ENV,
@@ -1355,6 +1355,7 @@ pub(crate) async fn rbac_middleware(
     policy: Arc<RbacPolicy>,
     tool_limiter: Option<Arc<ToolRateLimiter>>,
     knobs: DenyLogKnobs,
+    scope_challenge: Option<Arc<ScopeChallenge>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -1408,17 +1409,25 @@ pub(crate) async fn rbac_middleware(
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
         let tool_calls = extract_tool_calls(&json);
         if !tool_calls.is_empty() {
-            for params in tool_calls {
+            for params in &tool_calls {
                 if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_key.as_ref()) {
                     #[cfg(feature = "metrics")]
                     record_rate_limit_deny(&parts.extensions, "tool");
                     return resp;
                 }
                 if policy.is_enabled()
-                    && let Some(resp) =
+                    && let Some((denial, resp)) =
                         enforce_tool_policy(&policy, &identity_name, &role, params, &deny_fields)
                 {
-                    return resp;
+                    drop(denial);
+                    return decorate_scope_denial(
+                        scope_challenge.as_deref(),
+                        &policy,
+                        &parts.extensions,
+                        &tool_calls,
+                        params,
+                        resp,
+                    );
                 }
             }
         }
@@ -1441,6 +1450,106 @@ pub(crate) async fn rbac_middleware(
                 ),
             )
             .await
+    }
+}
+
+/// Resolve a role from scope mappings by first match in configuration order.
+///
+/// Returns the role of the first `(scope, role)` mapping whose scope is
+/// present in `granted`. Configuration order wins over the order of `granted`.
+/// Matching is exact (case-sensitive, no trimming); an empty `granted` slice or
+/// no overlap yields `None`.
+pub(crate) fn first_matching_scope_role<'mapping, I>(
+    mappings: I,
+    granted: &[&str],
+) -> Option<&'mapping str>
+where
+    I: IntoIterator<Item = (&'mapping str, &'mapping str)>,
+{
+    mappings
+        .into_iter()
+        .find(|(scope, _role)| granted.contains(scope))
+        .map(|(_scope, role)| role)
+}
+
+/// Configuration-ordered hints that can only decorate an existing denial.
+pub(crate) struct ScopeChallenge {
+    /// Scope-to-role mappings in the exact JWT resolution order.
+    pub scope_roles: Arc<[(String, String)]>,
+    /// Protected resource metadata location advertised by authentication.
+    pub resource_metadata: String,
+}
+
+/// Decorate the existing denial without changing its verdict, body or deny log.
+fn decorate_scope_denial(
+    challenge: Option<&ScopeChallenge>,
+    policy: &RbacPolicy,
+    extensions: &Extensions,
+    calls: &[&serde_json::Value],
+    denied_params: &serde_json::Value,
+    mut response: Response,
+) -> Response {
+    if let Some((scope, value)) =
+        challenge.and_then(|config| config.header_for_denial(policy, extensions, calls))
+    {
+        let _previous = response.headers_mut().insert(WWW_AUTHENTICATE, value);
+        let tool_name = denied_params
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        tracing::debug!(scope = %scope, tool = tool_name, "insufficient_scope challenge issued");
+    }
+    response
+}
+
+impl ScopeChallenge {
+    /// Build a hint only for verified scope-derived OAuth denials.
+    fn header_for_denial<'challenge>(
+        &'challenge self,
+        policy: &RbacPolicy,
+        extensions: &Extensions,
+        calls: &[&serde_json::Value],
+    ) -> Option<(&'challenge str, HeaderValue)> {
+        let caller = extensions.get::<AuthIdentity>()?;
+        let scope = self.unlocking_scope(policy, caller, calls)?;
+        let value = HeaderValue::from_str(&format!(
+            "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"{}\", error_description=\"additional scope required\"", self.resource_metadata
+        )).ok()?;
+        Some((scope, value))
+    }
+
+    /// Simulate the real scope resolution and all calls without granting access.
+    pub(crate) fn unlocking_scope<'challenge>(
+        &'challenge self,
+        policy: &RbacPolicy,
+        identity: &AuthIdentity,
+        calls: &[&serde_json::Value],
+    ) -> Option<&'challenge str> {
+        if identity.method != AuthMethod::OAuthJwt {
+            return None;
+        }
+        let granted = identity.granted_scopes.as_deref()?;
+        let mut union: Vec<&str> = granted.iter().map(String::as_str).collect();
+        self.scope_roles.iter().find_map(|(scope, _role)| {
+            if granted.contains(scope) {
+                return None;
+            }
+            union.push(scope);
+            let role = first_matching_scope_role(
+                self.scope_roles.iter().map(|(mapped_scope, mapped_role)| {
+                    (mapped_scope.as_str(), mapped_role.as_str())
+                }),
+                &union,
+            );
+            let _candidate = union.pop();
+            role.filter(|candidate_role| {
+                *candidate_role != identity.role
+                    && calls
+                        .iter()
+                        .all(|params| evaluate_tool_call(policy, candidate_role, params).is_ok())
+            })
+            .map(|_| scope.as_str())
+        })
     }
 }
 
@@ -1516,8 +1625,8 @@ fn enforce_rate_limit(
     }
 }
 
-/// Apply RBAC tool/host + argument-allowlist checks. Returns `Some(response)`
-/// when the caller must be rejected. Assumes `policy.is_enabled()`.
+/// Apply RBAC tool/host + argument-allowlist checks. Returns the denial and
+/// response when the caller must be rejected. Assumes `policy.is_enabled()`.
 ///
 /// `identity_name` is passed explicitly (rather than read from
 /// [`current_identity()`]) because this function runs *before* the
@@ -1530,7 +1639,328 @@ fn enforce_tool_policy(
     role: &str,
     params: &serde_json::Value,
     fields: &DenyLogFields,
-) -> Option<Response> {
+) -> Option<(ToolDenial, Response)> {
+    let denial = evaluate_tool_call(policy, role, params).err()?;
+    denial.log(identity_name, role, fields);
+    let response = denial.error(role).into_response();
+    Some((denial, response))
+}
+
+/// The first failed tool-call constraint, with only denial-rendering context.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolDenial {
+    /// A supplied host cannot be interpreted as a host name.
+    NonStringHost {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// JSON type name, never the caller's raw value.
+        value_type: &'static str,
+    },
+    /// The role cannot call this tool on the optional host.
+    RoleDenied {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Supplied string host, or absent for operation-only checks.
+        host: Option<String>,
+    },
+    /// Strict confinement does not permit this argument name.
+    StrictUnknownArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+    },
+    /// Strict confinement cannot constrain a structured value.
+    StrictStructuredArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+        /// JSON type name, never the caller's raw value.
+        value_type: &'static str,
+    },
+    /// A value allowlist cannot match a non-string argument.
+    NonStringAllowlistedArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+        /// JSON type name, never the caller's raw value.
+        value_type: &'static str,
+    },
+    /// The value failed its allowlist; only its keyed digest is retained.
+    ArgumentNotAllowed {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+        /// Policy-keyed HMAC prefix for correlation without raw input.
+        arg_hmac: String,
+    },
+    /// A required argument was absent or not string-valued.
+    MissingRequiredArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// First unsatisfied requirement in policy order.
+        argument: String,
+    },
+}
+
+impl ToolDenial {
+    /// Render the existing client-safe RBAC error without logging.
+    fn error(&self, role: &str) -> RmcpServerKitError {
+        match self {
+            Self::NonStringHost {
+                tool: tool_name,
+                value_type: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument 'host' must be a string for tool '{tool_name}'"
+            )),
+            Self::RoleDenied {
+                tool: tool_name,
+                host: _,
+            } => RmcpServerKitError::Rbac(format!("{tool_name} denied for role '{role}'")),
+            Self::StrictUnknownArgument {
+                tool: tool_name,
+                argument: arg_key,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' is not permitted for tool '{tool_name}'"
+            )),
+            Self::StrictStructuredArgument {
+                tool: tool_name,
+                argument: arg_key,
+                value_type: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' must not be an object or array for tool '{tool_name}'"
+            )),
+            Self::NonStringAllowlistedArgument {
+                tool: tool_name,
+                argument: arg_key,
+                value_type: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' must be a string for tool '{tool_name}'"
+            )),
+            Self::ArgumentNotAllowed {
+                tool: tool_name,
+                argument: arg_key,
+                arg_hmac: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
+            )),
+            Self::MissingRequiredArgument {
+                tool: tool_name,
+                argument: missing,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{missing}' is required for tool '{tool_name}'"
+            )),
+        }
+    }
+
+    /// Emit the existing deny event with its original field order.
+    fn log(&self, identity_name: &str, role: &str, fields: &DenyLogFields) {
+        match self {
+            Self::NonStringHost { tool, value_type } => {
+                log_non_string_host(identity_name, role, fields, tool, value_type);
+            }
+            Self::RoleDenied { tool, host } => {
+                log_role_denied(identity_name, role, fields, tool, host.as_deref());
+            }
+            Self::StrictUnknownArgument { tool, argument } => {
+                log_strict_unknown_argument(identity_name, role, fields, tool, argument);
+            }
+            Self::StrictStructuredArgument {
+                tool,
+                argument,
+                value_type,
+            } => log_strict_structured_argument(
+                identity_name,
+                role,
+                fields,
+                tool,
+                argument,
+                value_type,
+            ),
+            Self::NonStringAllowlistedArgument {
+                tool,
+                argument,
+                value_type,
+            } => log_non_string_allowlisted_argument(
+                identity_name,
+                role,
+                fields,
+                tool,
+                argument,
+                value_type,
+            ),
+            Self::ArgumentNotAllowed {
+                tool,
+                argument,
+                arg_hmac,
+            } => log_argument_not_allowed(identity_name, role, fields, tool, argument, arg_hmac),
+            Self::MissingRequiredArgument { tool, argument } => {
+                log_missing_required_argument(identity_name, role, fields, tool, argument);
+            }
+        }
+    }
+}
+
+/// Emit the original host-shape denial event.
+fn log_non_string_host(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    value_type: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        value_type = value_type,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "non-string host argument rejected"
+    );
+}
+
+/// Emit the original role denial event.
+fn log_role_denied(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    host: Option<&str>,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        host = host.unwrap_or("-"),
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "RBAC denied"
+    );
+}
+
+/// Emit the original strict unknown-argument denial event.
+fn log_strict_unknown_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "unknown argument rejected by strict allowlist"
+    );
+}
+
+/// Emit the original strict structured-argument denial event.
+fn log_strict_structured_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+    value_type: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        value_type = value_type,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "structured argument rejected by strict allowlist"
+    );
+}
+
+/// Emit the original non-string allowlisted-argument denial event.
+fn log_non_string_allowlisted_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+    value_type: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        value_type = value_type,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "non-string argument rejected by allowlist"
+    );
+}
+
+/// Emit the original disallowed-value denial event.
+fn log_argument_not_allowed(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+    arg_hmac: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        arg_hmac = %arg_hmac,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "argument not in allowlist"
+    );
+}
+
+/// Emit the original missing-argument denial event.
+fn log_missing_required_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "required argument missing"
+    );
+}
+
+/// Evaluate tool/host and argument constraints without logs or HTTP responses.
+///
+/// Assumes the caller is enforcing an enabled policy, as the middleware does.
+///
+/// # Errors
+/// Returns the first failed constraint in the existing enforcement order.
+pub(crate) fn evaluate_tool_call(
+    policy: &RbacPolicy,
+    role: &str,
+    params: &serde_json::Value,
+) -> Result<(), ToolDenial> {
     let tool_name = params
         .get("name")
         .and_then(|value| value.as_str())
@@ -1539,7 +1969,7 @@ fn enforce_tool_policy(
         .get("arguments")
         .and_then(|arguments| arguments.get("host"));
 
-    // M2 precedent (see `check_argument`): a caller-supplied `host` of the
+    // M2 precedent: a caller-supplied `host` of the
     // wrong JSON type must not silently downgrade the host-glob check to an
     // operation-only check. `as_str()` on an array/object/number/bool/null
     // yields `None`, which would route to `check_operation` and skip
@@ -1549,22 +1979,10 @@ fn enforce_tool_policy(
     if let Some(value) = host_value
         && !value.is_string()
     {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            value_type = json_value_type(value),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "non-string host argument rejected"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument 'host' must be a string for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
+        return Err(ToolDenial::NonStringHost {
+            tool: tool_name.to_owned(),
+            value_type: json_value_type(value),
+        });
     }
     // Absent `host` still routes to `check_operation` by design: hostless
     // tools (`ping`, `list_hosts`) legitimately carry no host argument.
@@ -1575,20 +1993,10 @@ fn enforce_tool_policy(
         |host_name| policy.check(role, tool_name, host_name),
     );
     if decision == RbacDecision::Deny {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            host = host.unwrap_or("-"),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "RBAC denied"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!("{tool_name} denied for role '{role}'"))
-                .into_response(),
-        );
+        return Err(ToolDenial::RoleDenied {
+            tool: tool_name.to_owned(),
+            host: host.map(str::to_owned),
+        });
     }
 
     let args = params
@@ -1597,186 +2005,46 @@ fn enforce_tool_policy(
     let strict = policy.strict_argument_names(role, tool_name);
     if let Some(arguments) = args {
         for (arg_key, arg_val) in arguments {
-            if let Some(permitted) = &strict
-                && let Some(resp) = check_strict_argument(
-                    identity_name,
-                    role,
-                    tool_name,
-                    permitted,
-                    arg_key,
-                    arg_val,
-                    fields,
-                )
-            {
-                return Some(resp);
+            if let Some(permitted) = &strict {
+                if !permitted.contains(&arg_key.as_str()) {
+                    return Err(ToolDenial::StrictUnknownArgument {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                    });
+                }
+                if arg_val.is_object() || arg_val.is_array() {
+                    return Err(ToolDenial::StrictStructuredArgument {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                        value_type: json_value_type(arg_val),
+                    });
+                }
             }
-            if let Some(resp) = check_argument(
-                policy,
-                identity_name,
-                role,
-                tool_name,
-                arg_key,
-                arg_val,
-                fields,
-            ) {
-                return Some(resp);
+            if policy.has_argument_allowlist(role, tool_name, arg_key) {
+                let Some(val_str) = arg_val.as_str() else {
+                    return Err(ToolDenial::NonStringAllowlistedArgument {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                        value_type: json_value_type(arg_val),
+                    });
+                };
+                if !policy.argument_allowed(role, tool_name, arg_key, val_str) {
+                    return Err(ToolDenial::ArgumentNotAllowed {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                        arg_hmac: policy.redact_arg(val_str),
+                    });
+                }
             }
         }
     }
-    check_required_arguments(policy, identity_name, role, tool_name, args, fields)
-}
-
-/// Deny arguments outside the allowlisted set when strict confinement is on.
-///
-/// Object and array values are denied outright: their contents cannot be
-/// constrained, so admitting them would reopen the bypass one level down.
-fn check_strict_argument(
-    identity_name: &str,
-    role: &str,
-    tool_name: &str,
-    permitted: &[&str],
-    arg_key: &str,
-    arg_val: &serde_json::Value,
-    fields: &DenyLogFields,
-) -> Option<Response> {
-    if !permitted.contains(&arg_key) {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            argument = arg_key,
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "unknown argument rejected by strict allowlist"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument '{arg_key}' is not permitted for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
+    if let Some(missing) = policy.missing_required_argument(role, tool_name, args) {
+        return Err(ToolDenial::MissingRequiredArgument {
+            tool: tool_name.to_owned(),
+            argument: missing.to_owned(),
+        });
     }
-    if arg_val.is_object() || arg_val.is_array() {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            argument = arg_key,
-            value_type = json_value_type(arg_val),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "structured argument rejected by strict allowlist"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument '{arg_key}' must not be an object or array for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
-    }
-    None
-}
-
-/// Deny when a `required` argument is missing or not string-valued.
-///
-/// Absence can only be judged here: [`check_argument`] is keyed by a present
-/// argument and structurally cannot observe a missing one. This runs even when
-/// `args` is `None` - i.e. the call carried no `arguments` object, or a
-/// non-object - because returning early on that would let a caller skip every
-/// `required` constraint by omitting the object entirely.
-fn check_required_arguments(
-    policy: &RbacPolicy,
-    identity_name: &str,
-    role: &str,
-    tool_name: &str,
-    args: Option<&serde_json::Map<String, serde_json::Value>>,
-    fields: &DenyLogFields,
-) -> Option<Response> {
-    let missing = policy.missing_required_argument(role, tool_name, args)?;
-    tracing::warn!(
-        user = %identity_name,
-        role = %role,
-        tool = tool_name,
-        argument = missing,
-        client_ip = fields.client_ip.map(field::display),
-        peer_ip = fields.peer_ip.map(field::display),
-        request_id = fields.request_id.as_deref(),
-        "required argument missing"
-    );
-    Some(
-        RmcpServerKitError::Rbac(format!(
-            "argument '{missing}' is required for tool '{tool_name}'"
-        ))
-        .into_response(),
-    )
-}
-
-/// Deny a present argument whose value is not permitted by its allowlist.
-///
-/// Non-string values for an allowlisted argument are denied (fail closed);
-/// the log records the value's type, never the value itself.
-fn check_argument(
-    policy: &RbacPolicy,
-    identity_name: &str,
-    role: &str,
-    tool_name: &str,
-    arg_key: &str,
-    arg_val: &serde_json::Value,
-    fields: &DenyLogFields,
-) -> Option<Response> {
-    if !policy.has_argument_allowlist(role, tool_name, arg_key) {
-        return None;
-    }
-    let Some(val_str) = arg_val.as_str() else {
-        // M2: an allowlist is configured for this argument but the
-        // caller sent a non-string JSON value (array/object/number/
-        // bool/null), which can never satisfy a `Vec<String>`
-        // allowlist. Fail closed; log the type (not the value) so
-        // operators see the rejected shape without leaking inputs.
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            argument = arg_key,
-            value_type = json_value_type(arg_val),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "non-string argument rejected by allowlist"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument '{arg_key}' must be a string for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
-    };
-    if policy.argument_allowed(role, tool_name, arg_key, val_str) {
-        return None;
-    }
-    // Redact the raw value: log an HMAC-SHA256 prefix instead of
-    // the literal string. Operators correlate hashes across log
-    // lines without ever exposing potentially sensitive inputs
-    // (paths, IDs, tokens accidentally passed as args, etc.).
-    tracing::warn!(
-        user = %identity_name,
-        role = %role,
-        tool = tool_name,
-        argument = arg_key,
-        arg_hmac = %policy.redact_arg(val_str),
-        client_ip = fields.client_ip.map(field::display),
-        peer_ip = fields.peer_ip.map(field::display),
-        request_id = fields.request_id.as_deref(),
-        "argument not in allowlist"
-    );
-    Some(
-        RmcpServerKitError::Rbac(format!(
-            "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
-        ))
-        .into_response(),
-    )
+    Ok(())
 }
 
 /// Name of the JSON value's type, for shape-only deny log fields.
@@ -1985,10 +2253,237 @@ mod tests {
     use super::*;
     #[cfg(feature = "metrics")]
     use crate::metrics::McpMetrics;
-    use crate::{
-        auth::AuthMethod,
-        transport::{ClientIp, PeerAddr, RequestId},
-    };
+    use crate::transport::{ClientIp, PeerAddr, RequestId};
+
+    // rmcp parser differential (RMCP_UPGRADE_CHECKLIST.md section 3)
+    #[derive(Debug, PartialEq)]
+    enum RmcpOutcome {
+        ToolCall {
+            name: String,
+            arguments: Option<Map<String, JsonValue>>,
+        },
+        CustomToolsCall,
+        OtherRequest,
+        Notification,
+        Response,
+        Reject,
+    }
+
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "foreign non-exhaustive enum: rmcp::model::ClientRequest"
+    )]
+    fn rmcp_outcome(raw: &str) -> RmcpOutcome {
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage};
+
+        match serde_json::from_str::<ClientJsonRpcMessage>(raw) {
+            Ok(JsonRpcMessage::Request(request)) => match request.request {
+                ClientRequest::CallToolRequest(call) => RmcpOutcome::ToolCall {
+                    name: call.params.name.into_owned(),
+                    arguments: call.params.arguments,
+                },
+                ClientRequest::CustomRequest(custom) if custom.method == "tools/call" => {
+                    RmcpOutcome::CustomToolsCall
+                }
+                _ => RmcpOutcome::OtherRequest,
+            },
+            Ok(JsonRpcMessage::Notification(_)) => RmcpOutcome::Notification,
+            Ok(JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) => RmcpOutcome::Response,
+            Err(_) => RmcpOutcome::Reject,
+        }
+    }
+
+    fn rbac_extracted(raw: &str) -> Vec<JsonValue> {
+        serde_json::from_str::<JsonValue>(raw).map_or_else(
+            |_| Vec::new(),
+            |value| extract_tool_calls(&value).into_iter().cloned().collect(),
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum Expected {
+        Reject,
+        CustomToolsCall,
+        Notification,
+        ToolCall(&'static str, Option<&'static str>),
+    }
+
+    const DIFFERENTIAL_CORPUS: &[(&str, &str, Expected)] = &[
+        (
+            "row 1 dup params allowed last",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied","arguments":{}},"params":{"name":"allowed","arguments":{}}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 2 dup params denied last",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"allowed","arguments":{}},"params":{"name":"denied","arguments":{}}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 3 dup name",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied","name":"allowed","arguments":{}}}"#,
+            Expected::CustomToolsCall,
+        ),
+        (
+            "row 4 dup arguments",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"p":"bad"},"arguments":{"p":"ok"}}}"#,
+            Expected::CustomToolsCall,
+        ),
+        (
+            "row 5 dup argument key",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"p":"bad","p":"ok"}}}"#,
+            Expected::ToolCall("t", Some(r#"{"p":"ok"}"#)),
+        ),
+        (
+            "row 6 dup method call first",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"ping","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 7 dup method call last",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 8 float id",
+            r#"{"jsonrpc":"2.0","id":1.0,"method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::ToolCall("denied", None),
+        ),
+        (
+            "row 9 null id",
+            r#"{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 10 call plus result",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied"},"result":{}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 11 dup id",
+            r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 12 params then null",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied"},"params":null}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 13 batch",
+            r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied"}}]"#,
+            Expected::Reject,
+        ),
+        (
+            "row 14 valid",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"allowed","arguments":{"p":"ok"}}}"#,
+            Expected::ToolCall("allowed", Some(r#"{"p":"ok"}"#)),
+        ),
+        (
+            "row 15 string id",
+            r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"allowed"}}"#,
+            Expected::ToolCall("allowed", None),
+        ),
+        // Benign: no tool name exists; RBAC extracts nothing and rmcp calls on_custom_request.
+        (
+            "row 16 no params",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
+            Expected::CustomToolsCall,
+        ),
+        (
+            "row 17 notification",
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Notification,
+        ),
+    ];
+
+    fn check_differential_invariant(raw: &str, outcome: RmcpOutcome) -> anyhow::Result<()> {
+        let extracted = rbac_extracted(raw);
+        match outcome {
+            RmcpOutcome::ToolCall { name, arguments } => {
+                assert_eq!(
+                    extracted.len(),
+                    1,
+                    "RBAC must inspect exactly one call: {raw}"
+                );
+                let params = extracted.first().context("dispatched tool has params")?;
+                assert_eq!(
+                    params.get("name").and_then(JsonValue::as_str),
+                    Some(name.as_str()),
+                    "{raw}"
+                );
+                assert_eq!(
+                    params.get("arguments").and_then(JsonValue::as_object),
+                    arguments.as_ref(),
+                    "{raw}"
+                );
+            }
+            RmcpOutcome::CustomToolsCall => {
+                let value: JsonValue = serde_json::from_str(raw)?;
+                if value.get("params").is_some() {
+                    assert!(
+                        !extracted.is_empty(),
+                        "custom tools/call params must be inspected: {raw}"
+                    );
+                }
+            }
+            RmcpOutcome::OtherRequest
+            | RmcpOutcome::Notification
+            | RmcpOutcome::Response
+            | RmcpOutcome::Reject => {}
+        }
+        Ok(())
+    }
+
+    /// Pins upstream parser outcomes and RBAC inspection of every dispatched tool.
+    #[test]
+    fn rbac_and_rmcp_agree_on_every_dispatched_tool_call() -> anyhow::Result<()> {
+        // Given: raw wire fixtures preserve duplicate keys.
+        for &(label, raw, expected) in DIFFERENTIAL_CORPUS {
+            let pinned = match expected {
+                Expected::Reject => RmcpOutcome::Reject,
+                Expected::CustomToolsCall => RmcpOutcome::CustomToolsCall,
+                Expected::Notification => RmcpOutcome::Notification,
+                Expected::ToolCall(name, arguments) => RmcpOutcome::ToolCall {
+                    name: name.to_owned(),
+                    arguments: arguments.map(serde_json::from_str).transpose()?,
+                },
+            };
+            // When: rmcp parses the same bytes that RBAC inspects.
+            let outcome = rmcp_outcome(raw);
+            // Then: both the pinned outcome and the security invariant hold.
+            assert_eq!(
+                outcome, pinned,
+                "{label}: rmcp parsing changed: re-run docs/RMCP_UPGRADE_CHECKLIST.md section 3"
+            );
+            check_differential_invariant(raw, outcome)?;
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Checks RBAC inspection across permutations of duplicated wire fields.
+        #[test]
+        fn differential_invariant_holds_for_duplicated_keys(frags in collection::vec(0_usize..11, 1..8)) {
+            // Given: fragments are raw so duplicate fields survive construction.
+            const FRAGMENTS: [&str; 11] = [
+                r#""jsonrpc":"2.0""#, r#""id":1"#, r#""id":1.0"#, r#""id":null"#,
+                r#""method":"tools/call""#, r#""method":"ping""#,
+                r#""params":{"name":"allowed","arguments":{}}"#,
+                r#""params":{"name":"denied","arguments":{}}"#,
+                r#""params":{"name":"allowed","name":"denied"}"#,
+                r#""params":null"#, r#""result":{}"#,
+            ];
+            let fields = frags.into_iter().filter_map(|index| FRAGMENTS.get(index).copied()).collect::<Vec<_>>();
+            let raw = format!("{{{}}}", fields.join(","));
+            // When: both parsers consume the same raw object.
+            let result = check_differential_invariant(&raw, rmcp_outcome(&raw));
+            // Then: any tool rmcp dispatches was inspected by RBAC.
+            prop_assert!(result.is_ok(), "{result:?}");
+        }
+    }
 
     fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], run: impl FnOnce() -> R) -> R {
         temp_env::with_vars(
@@ -4042,7 +4537,7 @@ mod tests {
             .route("/mcp", routing::post(ok_handler))
             .layer(middleware::from_fn(move |req, next| {
                 let policy_clone = Arc::clone(&policy);
-                rbac_middleware(policy_clone, None, DenyLogKnobs::default(), req, next)
+                rbac_middleware(policy_clone, None, DenyLogKnobs::default(), None, req, next)
             }))
     }
 
@@ -4055,8 +4550,15 @@ mod tests {
                     let identity_clone = identity.clone();
                     async move {
                         let _previous_identity = req.extensions_mut().insert(identity_clone);
-                        rbac_middleware(policy_clone, None, DenyLogKnobs::default(), req, next)
-                            .await
+                        rbac_middleware(
+                            policy_clone,
+                            None,
+                            DenyLogKnobs::default(),
+                            None,
+                            req,
+                            next,
+                        )
+                        .await
                     }
                 },
             ))
@@ -4071,6 +4573,7 @@ mod tests {
             vec!["*".into()],
         )));
         let identity = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4103,6 +4606,7 @@ mod tests {
                             peer_ip: true,
                             request_id: true,
                         },
+                        None,
                         req,
                         next,
                     )
@@ -4147,6 +4651,7 @@ mod tests {
         let limiter = build_tool_rate_limiter_with_policy(1, None, KeyEvictionPolicy::default());
         let metrics = Arc::new(McpMetrics::new().context("metrics build")?);
         let identity = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4175,6 +4680,7 @@ mod tests {
                                 policy_clone,
                                 Some(limiter_clone),
                                 DenyLogKnobs::default(),
+                                None,
                                 req,
                                 next,
                             )
@@ -4219,6 +4725,1273 @@ mod tests {
         Ok(())
     }
 
+    /// Builds the scope-step-up policy, including argument and global vetoes.
+    fn step_up_policy() -> RbacPolicy {
+        let mut config = RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()])
+                .with_argument_allowlists(vec![ArgumentAllowlist::new_required(
+                    "echo",
+                    "message",
+                    vec!["read".into()],
+                )]),
+            RoleConfig::new(
+                "ops",
+                vec!["echo".into(), "admin_only".into()],
+                vec!["*".into()],
+            )
+            .with_argument_allowlists(vec![ArgumentAllowlist::new_required(
+                "echo",
+                "message",
+                vec!["read".into(), "write".into()],
+            )]),
+            RoleConfig::new(
+                "root",
+                vec!["echo".into(), "admin_only".into()],
+                vec!["*".into()],
+            ),
+        ]);
+        config.global_deny = vec!["blocked".into()];
+        RbacPolicy::new(&config)
+    }
+
+    /// Tests real middleware responses with a scope-derived OAuth identity.
+    async fn step_up_response(
+        challenge: Option<Arc<ScopeChallenge>>,
+        identity: AuthIdentity,
+        body: serde_json::Value,
+    ) -> anyhow::Result<Response> {
+        step_up_response_with(Arc::new(step_up_policy()), challenge, (identity, body)).await
+    }
+
+    /// [`step_up_response`] against a caller-supplied policy.
+    async fn step_up_response_with(
+        policy: Arc<RbacPolicy>,
+        challenge: Option<Arc<ScopeChallenge>>,
+        (identity, body): (AuthIdentity, serde_json::Value),
+    ) -> anyhow::Result<Response> {
+        let app = Router::new()
+            .route("/mcp", routing::post(ok_handler))
+            .layer(middleware::from_fn(move |mut req: Request<Body>, next| {
+                let request_policy = Arc::clone(&policy);
+                let request_challenge = challenge.clone();
+                let request_identity = identity.clone();
+                async move {
+                    let _previous = req.extensions_mut().insert(request_identity);
+                    rbac_middleware(
+                        request_policy,
+                        None,
+                        DenyLogKnobs::default(),
+                        request_challenge,
+                        req,
+                        next,
+                    )
+                    .await
+                }
+            }));
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await
+        .context("middleware response")
+    }
+
+    /// Scope order is decisive: adding admin after read cannot change the role.
+    #[tokio::test]
+    async fn step_up_skips_scope_that_cannot_change_role() -> anyhow::Result<()> {
+        // Given a narrow mapping before the admin mapping.
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:read".into(), "viewer".into()),
+                ("mcp:admin".into(), "ops".into()),
+            ]),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        });
+        let identity = step_up_identity();
+        // When the read-only caller requests an admin tool.
+        let response = step_up_response(
+            Some(challenge),
+            identity,
+            serde_json::json!({"method":"tools/call", "params":{"name":"admin_only"}}),
+        )
+        .await?;
+        // Then no hint sends the client into a futile retry.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key("www-authenticate"));
+        Ok(())
+    }
+
+    /// An OAuth fixture whose private scopes are never printed by Debug.
+    fn step_up_identity() -> AuthIdentity {
+        AuthIdentity {
+            name: "scope-user".into(),
+            role: "viewer".into(),
+            method: AuthMethod::OAuthJwt,
+            raw_token: None,
+            sub: None,
+            granted_scopes: Some(Arc::from(["mcp:read".into()])),
+        }
+    }
+
+    /// Real middleware keeps every verdict/body while hinting only unlockable denials.
+    #[tokio::test]
+    async fn step_up_response_matrix_preserves_denials() -> anyhow::Result<()> {
+        // Given admin-first mappings and role-specific argument permissions.
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:admin".into(), "ops".into()),
+                ("mcp:read".into(), "viewer".into()),
+            ]),
+            resource_metadata: "https://mcp.example/.well-known/oauth-protected-resource/mcp"
+                .into(),
+        });
+        for (params, unlocks) in [
+            (serde_json::json!({"name":"admin_only"}), true),
+            (
+                serde_json::json!({"name":"echo","arguments":{"message":"write"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"name":"echo","arguments":{"message":"never"}}),
+                false,
+            ),
+            (serde_json::json!({"name":"blocked"}), false),
+            (
+                serde_json::json!({"name":"admin_only","arguments":{"host":42_u32}}),
+                false,
+            ),
+        ] {
+            let body = serde_json::json!({"method":"tools/call","params":params});
+            // When the same call runs with the knob enabled and disabled.
+            let plain = step_up_response(None, step_up_identity(), body.clone()).await?;
+            let hinted =
+                step_up_response(Some(Arc::clone(&challenge)), step_up_identity(), body).await?;
+            // Then the denial verdict and bytes remain identical.
+            assert_eq!(plain.status(), StatusCode::FORBIDDEN);
+            assert_eq!(hinted.status(), plain.status());
+            assert_eq!(
+                hinted.headers().get_all("www-authenticate").iter().count(),
+                usize::from(unlocks)
+            );
+            assert_eq!(
+                hinted.into_body().collect().await?.to_bytes(),
+                plain.into_body().collect().await?.to_bytes()
+            );
+        }
+        Ok(())
+    }
+
+    /// Neither non-OAuth identities nor claim-derived roles receive scope hints.
+    #[tokio::test]
+    async fn step_up_requires_scope_derived_oauth_identity() -> anyhow::Result<()> {
+        // Given an enabled hint configuration.
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:admin".into(), "ops".into()),
+                ("mcp:read".into(), "viewer".into()),
+            ]),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        });
+        for (method, scopes) in [
+            (AuthMethod::BearerToken, true),
+            (AuthMethod::MtlsCertificate, true),
+            (AuthMethod::OAuthJwt, false),
+        ] {
+            let mut identity = step_up_identity();
+            identity.method = method;
+            if !scopes {
+                identity.granted_scopes = None;
+            }
+            // When a caller without scope-based OAuth authority is denied.
+            let response = step_up_response(
+                Some(Arc::clone(&challenge)),
+                identity,
+                serde_json::json!({"method":"tools/call","params":{"name":"admin_only"}}),
+            )
+            .await?;
+            // Then no scope challenge is emitted.
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!response.headers().contains_key("www-authenticate"));
+        }
+        Ok(())
+    }
+
+    /// A batch hint must unlock every tool call, not only its first denial.
+    #[tokio::test]
+    async fn step_up_batch_requires_every_call_to_unlock() -> anyhow::Result<()> {
+        // Given admin-first mappings and batches in which a call no role may
+        // make sits first, in the middle or last, next to unlockable calls.
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:admin".into(), "ops".into()),
+                ("mcp:read".into(), "viewer".into()),
+            ]),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        });
+        let call =
+            |params: serde_json::Value| serde_json::json!({"method":"tools/call","params":params});
+        let admin = || call(serde_json::json!({"name":"admin_only"}));
+        let nobody = || call(serde_json::json!({"name":"denied_for_everyone"}));
+        let read = || call(serde_json::json!({"name":"echo","arguments":{"message":"read"}}));
+        let write = || call(serde_json::json!({"name":"echo","arguments":{"message":"write"}}));
+        for (batch, hinted) in [
+            (vec![admin(), nobody()], false),
+            (vec![nobody(), admin()], false),
+            (vec![admin(), nobody(), admin()], false),
+            (vec![read(), nobody(), admin()], false),
+            (vec![nobody(), read(), write()], false),
+            (vec![admin(), read(), admin()], true),
+            (vec![write(), admin()], true),
+            (vec![read(), admin(), write()], true),
+        ] {
+            let label = serde_json::Value::Array(batch.clone()).to_string();
+            // When the batch is denied at its first call the reader may not make.
+            let response = step_up_response(
+                Some(Arc::clone(&challenge)),
+                step_up_identity(),
+                serde_json::Value::Array(batch),
+            )
+            .await?;
+            // Then a hint exists only when one scope unlocks every call, and
+            // it is a single challenge field.
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
+            let challenges: Vec<_> = response
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .map(HeaderValue::to_str)
+                .collect::<Result<_, _>>()?;
+            let expected = hinted.then_some(
+                "Bearer error=\"insufficient_scope\", scope=\"mcp:admin\", resource_metadata=\"/.well-known/oauth-protected-resource\", error_description=\"additional scope required\"",
+            );
+            assert_eq!(
+                challenges,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Two- to four-mapping orders, several with more than one unlocking scope.
+    fn step_up_mapping_orders() -> Vec<Vec<(&'static str, &'static str)>> {
+        let admin = ("mcp:admin", "ops");
+        let read = ("mcp:read", "viewer");
+        let root = ("mcp:root", "root");
+        let nobody = ("mcp:x", "nobody");
+        let upper_admin = ("MCP:ADMIN", "root");
+        vec![
+            vec![admin, read],
+            vec![read, admin],
+            vec![root, admin, read],
+            vec![admin, root, read],
+            vec![read, root, admin],
+            vec![read, admin, root],
+            vec![root, read, admin],
+            vec![admin, read, root],
+            vec![read, admin, nobody],
+            vec![nobody, admin, read, root],
+            vec![upper_admin, admin, read],
+        ]
+    }
+
+    /// Case-variant, duplicate, padded and empty grants, each with its resolved
+    /// role (`None`) and with forced roles that may contradict the grants.
+    fn step_up_grants() -> Vec<(Vec<&'static str>, Option<&'static str>)> {
+        [
+            vec![],
+            vec!["mcp:read"],
+            vec!["mcp:read", "mcp:read", ""],
+            vec!["mcp:admin"],
+            vec!["mcp:read", "mcp:admin"],
+            vec!["other"; 4096],
+            vec!["MCP:READ"],
+            vec!["MCP:READ", "mcp:x"],
+            vec!["Mcp:Admin", "mcp:read"],
+            vec!["mcp:read", "MCP:ROOT"],
+            vec!["mcp:x"],
+            vec![" mcp:read", "mcp:admin\t"],
+            vec!["mcp:root", "mcp:root"],
+        ]
+        .into_iter()
+        .flat_map(|scopes| {
+            [None, Some("viewer"), Some("ops")].map(|forced| (scopes.clone(), forced))
+        })
+        .collect()
+    }
+
+    /// Differentially exhaust all candidate scopes and preserve middleware verdicts.
+    #[tokio::test]
+    async fn step_up_differential_scope_matrix() -> anyhow::Result<()> {
+        // Given every mapping order, every grant/role pair and malformed parameters.
+        let policy = step_up_policy();
+        for mappings in step_up_mapping_orders() {
+            let challenge = Arc::new(ScopeChallenge {
+                scope_roles: mappings
+                    .iter()
+                    .map(|(scope, role)| ((*scope).to_owned(), (*role).to_owned()))
+                    .collect(),
+                resource_metadata: "/.well-known/oauth-protected-resource".into(),
+            });
+            for (scopes, forced_role) in step_up_grants() {
+                let mut identity = step_up_identity();
+                identity.role = forced_role
+                    .or_else(|| {
+                        challenge
+                            .scope_roles
+                            .iter()
+                            .find(|(scope, _)| scopes.contains(&scope.as_str()))
+                            .map(|(_, role)| role.as_str())
+                    })
+                    .unwrap_or("viewer")
+                    .into();
+                identity.granted_scopes =
+                    Some(scopes.iter().map(|scope| (*scope).to_owned()).collect());
+                for call_list in step_up_call_lists() {
+                    let calls: Vec<&serde_json::Value> = call_list.iter().collect();
+                    let denied = calls
+                        .iter()
+                        .any(|params| evaluate_tool_call(&policy, &identity.role, params).is_err());
+                    // When hints are selected and the same request traverses both middleware modes.
+                    let hint = challenge.unlocking_scope(&policy, &identity, &calls);
+                    let unlocking: Vec<&str> = challenge
+                        .scope_roles
+                        .iter()
+                        .filter_map(|(candidate, _)| {
+                            if scopes.contains(&candidate.as_str()) {
+                                return None;
+                            }
+                            let mut union = scopes.clone();
+                            union.push(candidate);
+                            // Frozen resolve_role semantics: configuration order, not token order.
+                            let role = challenge
+                                .scope_roles
+                                .iter()
+                                .find(|(scope, _)| union.contains(&scope.as_str()))
+                                .map(|(_, role)| role.as_str());
+                            role.filter(|candidate_role| {
+                                *candidate_role != identity.role
+                                    && calls.iter().all(|params| {
+                                        evaluate_tool_call(&policy, candidate_role, params).is_ok()
+                                    })
+                            })
+                            .map(|_| candidate.as_str())
+                        })
+                        .collect();
+                    // Then hints are sound and complete over every configured extra scope.
+                    assert_eq!(hint, unlocking.first().copied(), "{call_list:?}");
+                    let body = match call_list.as_slice() {
+                        [params] => serde_json::json!({"method":"tools/call","params":params}),
+                        batch => serde_json::Value::Array(
+                            batch
+                                .iter()
+                                .map(|params| serde_json::json!({"method":"tools/call","params":params}))
+                                .collect(),
+                        ),
+                    };
+                    let plain = step_up_response(None, identity.clone(), body.clone()).await?;
+                    let hinted =
+                        step_up_response(Some(Arc::clone(&challenge)), identity.clone(), body)
+                            .await?;
+                    assert_eq!(plain.status(), hinted.status());
+                    let expected_header = unlocking.first().filter(|_| denied).map(|scope| {
+                        format!(
+                            "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"/.well-known/oauth-protected-resource\", error_description=\"additional scope required\""
+                        )
+                    });
+                    let headers: Vec<_> = hinted
+                        .headers()
+                        .get_all("www-authenticate")
+                        .iter()
+                        .map(HeaderValue::to_str)
+                        .collect::<Result<_, _>>()?;
+                    assert_eq!(
+                        headers,
+                        expected_header.as_deref().into_iter().collect::<Vec<_>>(),
+                        "{call_list:?}"
+                    );
+                    assert_eq!(
+                        plain.into_body().collect().await?.to_bytes(),
+                        hinted.into_body().collect().await?.to_bytes()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Single calls, malformed parameters, and batches in both orientations
+    /// with the call that blocks every candidate first, in the middle or last.
+    fn step_up_call_lists() -> Vec<Vec<serde_json::Value>> {
+        let admin = serde_json::json!({"name":"admin_only"});
+        let read = serde_json::json!({"name":"echo","arguments":{"message":"read"}});
+        let write = serde_json::json!({"name":"echo","arguments":{"message":"write"}});
+        let never = serde_json::json!({"name":"echo","arguments":{"message":"never"}});
+        let blocked = serde_json::json!({"name":"blocked"});
+        let nobody = serde_json::json!({"name":"denied_for_everyone"});
+        let mut lists: Vec<Vec<serde_json::Value>> = [
+            admin.clone(),
+            read.clone(),
+            write.clone(),
+            never.clone(),
+            blocked.clone(),
+            serde_json::json!({"name":"admin_only","arguments":{"host":null}}),
+            serde_json::json!([]),
+            serde_json::json!(null),
+        ]
+        .into_iter()
+        .map(|params| vec![params])
+        .collect();
+        for (first, second) in [
+            (&admin, &nobody),
+            (&admin, &never),
+            (&admin, &write),
+            (&read, &admin),
+            (&write, &blocked),
+        ] {
+            lists.push(vec![first.clone(), second.clone()]);
+            lists.push(vec![second.clone(), first.clone()]);
+        }
+        lists.push(vec![admin.clone(), nobody, admin.clone()]);
+        lists.push(vec![read.clone(), never, admin.clone()]);
+        lists.push(vec![write, admin, read]);
+        lists
+    }
+
+    /// Pins the exact hint: first unlocking scope in config order, case-sensitive, skipping granted.
+    #[tokio::test]
+    async fn step_up_hint_is_first_unlocking_scope_in_config_order() -> anyhow::Result<()> {
+        let admin = ("mcp:admin", "ops");
+        let read = ("mcp:read", "viewer");
+        let root = ("mcp:root", "root");
+        let nobody = ("mcp:x", "nobody");
+        let admin_only = serde_json::json!({"name":"admin_only"});
+        let echo_read = serde_json::json!({"name":"echo","arguments":{"message":"read"}});
+        // Given configurations with several unlocking scopes, case-variant grants,
+        // padded and duplicate grants, and one identity whose role differs from
+        // the resolution of its granted scopes.
+        for (mappings, granted, role, params, expected) in [
+            (
+                vec![root, admin, read],
+                vec!["mcp:read"],
+                "viewer",
+                &admin_only,
+                Some("mcp:root"),
+            ),
+            (
+                vec![admin, root, read],
+                vec!["mcp:read"],
+                "viewer",
+                &admin_only,
+                Some("mcp:admin"),
+            ),
+            (
+                vec![read, root, admin],
+                vec!["mcp:read"],
+                "viewer",
+                &admin_only,
+                None,
+            ),
+            (
+                vec![nobody, admin, read, root],
+                vec!["mcp:read"],
+                "viewer",
+                &admin_only,
+                Some("mcp:admin"),
+            ),
+            (
+                vec![read, admin, nobody],
+                vec!["MCP:READ", "mcp:x"],
+                "nobody",
+                &admin_only,
+                Some("mcp:admin"),
+            ),
+            (
+                vec![read, admin, nobody],
+                vec!["MCP:READ", "mcp:x"],
+                "nobody",
+                &echo_read,
+                Some("mcp:read"),
+            ),
+            (
+                vec![root, admin, read],
+                vec!["mcp:read", "mcp:read", " mcp:root"],
+                "viewer",
+                &admin_only,
+                Some("mcp:root"),
+            ),
+            (
+                vec![admin, read],
+                vec!["mcp:admin"],
+                "viewer",
+                &admin_only,
+                Some("mcp:read"),
+            ),
+        ] {
+            let challenge = Arc::new(ScopeChallenge {
+                scope_roles: mappings
+                    .iter()
+                    .map(|(scope, mapped)| ((*scope).to_owned(), (*mapped).to_owned()))
+                    .collect(),
+                resource_metadata: "/.well-known/oauth-protected-resource".into(),
+            });
+            let mut identity = step_up_identity();
+            identity.role = role.into();
+            identity.granted_scopes =
+                Some(granted.iter().map(|scope| (*scope).to_owned()).collect());
+            // When the denied call traverses the real middleware.
+            let response = step_up_response(
+                Some(challenge),
+                identity,
+                serde_json::json!({"method":"tools/call","params":params}),
+            )
+            .await?;
+            // Then the challenge names exactly the expected scope, or is absent.
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let header: Vec<_> = response
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .map(HeaderValue::to_str)
+                .collect::<Result<_, _>>()?;
+            let expected_header = expected.map(|scope| {
+                format!(
+                    "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"/.well-known/oauth-protected-resource\", error_description=\"additional scope required\""
+                )
+            });
+            assert_eq!(
+                header,
+                expected_header.as_deref().into_iter().collect::<Vec<_>>(),
+                "{mappings:?} {granted:?} {params}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Challenge events remain captured with concurrent tracing dispatchers.
+    #[tokio::test]
+    async fn step_up_debug_event_records_only_issued_hint() -> anyhow::Result<()> {
+        use tracing::callsite::rebuild_interest_cache;
+        // Given a pinned scoped DEBUG subscriber and an unlockable denial.
+        let logs = CapturedLogs::default();
+        let pin = tracing::Dispatch::new(subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = subscriber::set_default(subscriber);
+        rebuild_interest_cache();
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:admin".into(), "ops".into()),
+                ("mcp:read".into(), "viewer".into()),
+            ]),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        });
+        // When the real middleware emits a hint for a single call and for
+        // batches whose denied call comes last, first or in the middle.
+        // A globally denied call is refused without any hint (and without an event).
+        for (body, hinted) in [
+            (
+                serde_json::json!({"method":"tools/call","params":{"name":"admin_only"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"method":"tools/call","params":{"name":"blocked"}}),
+                false,
+            ),
+            (
+                serde_json::json!([
+                    {"method":"tools/call","params":{"name":"echo","arguments":{"message":"read"}}},
+                    {"method":"tools/call","params":{"name":"admin_only"}}
+                ]),
+                true,
+            ),
+            (
+                serde_json::json!([
+                    {"method":"tools/call","params":{"name":"admin_only"}},
+                    {"method":"tools/call","params":{"name":"echo","arguments":{"message":"read"}}}
+                ]),
+                true,
+            ),
+            (
+                serde_json::json!([
+                    {"method":"tools/call","params":{"name":"echo","arguments":{"message":"read"}}},
+                    {"method":"tools/call","params":{"name":"admin_only"}},
+                    {"method":"tools/call","params":{"name":"echo","arguments":{"message":"write"}}}
+                ]),
+                true,
+            ),
+        ] {
+            let response =
+                step_up_response(Some(Arc::clone(&challenge)), step_up_identity(), body).await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all("www-authenticate")
+                    .iter()
+                    .count(),
+                usize::from(hinted)
+            );
+        }
+        // Then each hint is one DEBUG event naming the denied tool, without identity data.
+        let contents = logs.contents();
+        let events: Vec<_> = contents
+            .lines()
+            .filter(|line| line.contains("insufficient_scope challenge issued"))
+            .collect();
+        assert_eq!(events.len(), 4, "{contents}");
+        for event in events {
+            assert_eq!(event.split_whitespace().next(), Some("DEBUG"), "{event}");
+            assert!(event.contains("scope=mcp:admin"), "{event}");
+            assert!(event.contains("tool=\"admin_only\""), "{event}");
+            assert!(!event.contains("scope-user"), "{event}");
+        }
+        drop(guard);
+        drop(pin);
+        Ok(())
+    }
+
+    /// Role names that prefix each other are compared exactly, in both directions.
+    #[test]
+    fn step_up_hint_survives_prefix_related_role_names() -> anyhow::Result<()> {
+        // Given roles whose names prefix each other, a blank role and duplicates.
+        let star = || vec!["*".to_owned()];
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into(), "view_only".into()], star()),
+            RoleConfig::new(
+                "viewer-plus",
+                vec!["echo".into(), "admin_only".into()],
+                star(),
+            ),
+            RoleConfig::new("ops-ro", vec!["echo".into(), "ro_report".into()], star()),
+            RoleConfig::new("ops", vec!["echo".into(), "admin_only".into()], star()),
+        ]));
+        let admin = ("mcp:admin", "ops");
+        let ro = ("mcp:ro", "ops-ro");
+        let read_ro = ("mcp:read", "ops-ro");
+        let read = ("mcp:read", "viewer");
+        let plus = ("mcp:plus", "viewer-plus");
+        for (mappings, granted, role, tool, expected) in [
+            (
+                vec![admin, read_ro],
+                "mcp:read",
+                "ops-ro",
+                "admin_only",
+                Some("mcp:admin"),
+            ),
+            (
+                vec![plus, read],
+                "mcp:read",
+                "viewer",
+                "admin_only",
+                Some("mcp:plus"),
+            ),
+            (
+                vec![ro, admin],
+                "mcp:admin",
+                "ops",
+                "ro_report",
+                Some("mcp:ro"),
+            ),
+            (
+                vec![read, plus],
+                "mcp:plus",
+                "viewer-plus",
+                "view_only",
+                Some("mcp:read"),
+            ),
+            (
+                vec![("mcp:extra", "viewer"), read],
+                "mcp:read",
+                "viewer",
+                "admin_only",
+                None,
+            ),
+            (
+                vec![admin, read],
+                "mcp:read",
+                "",
+                "admin_only",
+                Some("mcp:admin"),
+            ),
+            (
+                vec![("mcp:blank", ""), read],
+                "mcp:read",
+                "viewer",
+                "admin_only",
+                None,
+            ),
+        ] {
+            let challenge = ScopeChallenge {
+                scope_roles: mappings
+                    .iter()
+                    .map(|(scope, mapped)| ((*scope).to_owned(), (*mapped).to_owned()))
+                    .collect(),
+                resource_metadata: "/.well-known/oauth-protected-resource".into(),
+            };
+            let mut identity = step_up_identity();
+            identity.role = role.into();
+            identity.granted_scopes = Some(Arc::from([granted.to_owned()]));
+            let params = serde_json::json!({"name":tool});
+            // When the denied call is simulated against every mapping.
+            let hint = challenge.unlocking_scope(&policy, &identity, &[&params]);
+            // Then the hint is exact: a prefix is never mistaken for the same role.
+            anyhow::ensure!(
+                hint == expected,
+                "{mappings:?} {role:?} {tool}: hint {hint:?}, expected {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pins the current behaviour for calls without a string `name`: they are
+    /// simulated like the real check (as the empty tool name), so a wildcard
+    /// role that really passes them is hinted, and nothing else is.
+    #[tokio::test]
+    async fn step_up_hints_nameless_calls_only_for_a_role_that_passes_them() -> anyhow::Result<()> {
+        // Given a viewer limited to echo and an ops role allowed every tool.
+        let star = || vec!["*".to_owned()];
+        let wildcard = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], star()),
+            RoleConfig::new("ops", star(), star()),
+        ])));
+        let named = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], star()),
+            RoleConfig::new("ops", vec!["admin_only".into()], star()),
+        ])));
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:admin".into(), "ops".into()),
+                ("mcp:read".into(), "viewer".into()),
+            ]),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        });
+        let call =
+            |params: serde_json::Value| serde_json::json!({"method":"tools/call","params":params});
+        for params in [
+            serde_json::json!({"arguments":{}}),
+            serde_json::json!({"name":42_u32}),
+            serde_json::json!({"name":null}),
+            serde_json::json!({"name":""}),
+        ] {
+            for (body, policy, hinted) in [
+                (call(params.clone()), Arc::clone(&wildcard), true),
+                (
+                    serde_json::json!([
+                        call(params.clone()),
+                        call(serde_json::json!({"name":"admin_only"}))
+                    ]),
+                    Arc::clone(&wildcard),
+                    true,
+                ),
+                (call(params.clone()), Arc::clone(&named), false),
+                (
+                    serde_json::json!([
+                        call(serde_json::json!({"name":"admin_only"})),
+                        call(params.clone())
+                    ]),
+                    Arc::clone(&named),
+                    false,
+                ),
+            ] {
+                let label = body.to_string();
+                // When the denied request traverses the real middleware.
+                let response = step_up_response_with(
+                    policy,
+                    Some(Arc::clone(&challenge)),
+                    (step_up_identity(), body),
+                )
+                .await?;
+                // Then only the role that really passes the nameless call is hinted.
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{label}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get_all("www-authenticate")
+                        .iter()
+                        .count(),
+                    usize::from(hinted),
+                    "{label}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Only the policy 403 is decorated: its other headers stay identical and
+    /// a rate-limited 429 never carries a scope challenge.
+    #[tokio::test]
+    async fn step_up_decorates_only_the_policy_denial() -> anyhow::Result<()> {
+        // Given a one-call-per-minute tool limiter and an unlockable admin call.
+        let peer: SocketAddr = "10.9.9.2:40000".parse()?;
+        let client = ClientIp::new(peer.ip());
+        let challenge = Arc::new(ScopeChallenge {
+            scope_roles: Arc::from([
+                ("mcp:admin".into(), "ops".into()),
+                ("mcp:read".into(), "viewer".into()),
+            ]),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        });
+        let mut denials = Vec::new();
+        for scope_challenge in [None, Some(Arc::clone(&challenge))] {
+            let enabled = scope_challenge.is_some();
+            let policy = Arc::new(step_up_policy());
+            let limiter =
+                build_tool_rate_limiter_with_policy(1, None, KeyEvictionPolicy::default());
+            let app = Router::new()
+                .route("/mcp", routing::post(ok_handler))
+                .layer(middleware::from_fn(
+                    move |mut req: Request<Body>, next: Next| {
+                        let request_policy = Arc::clone(&policy);
+                        let request_limiter = Arc::clone(&limiter);
+                        let request_challenge = scope_challenge.clone();
+                        async move {
+                            let _identity = req.extensions_mut().insert(step_up_identity());
+                            let _client = req.extensions_mut().insert(client);
+                            rbac_middleware(
+                                request_policy,
+                                Some(request_limiter),
+                                DenyLogKnobs::default(),
+                                request_challenge,
+                                req,
+                                next,
+                            )
+                            .await
+                        }
+                    },
+                ));
+            // When the same denied call is sent twice.
+            let mut statuses = Vec::new();
+            for _attempt in 0..2_u8 {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/mcp")
+                            .body(Body::from(
+                                serde_json::json!({"method":"tools/call","params":{"name":"admin_only"}})
+                                    .to_string(),
+                            ))?,
+                    )
+                    .await?;
+                statuses.push((
+                    response.status(),
+                    response
+                        .headers()
+                        .get_all("www-authenticate")
+                        .iter()
+                        .count(),
+                ));
+                if response.status() == StatusCode::FORBIDDEN {
+                    let mut headers = response.headers().clone();
+                    let _challenge = headers.remove("www-authenticate");
+                    denials.push(headers);
+                }
+            }
+            // Then only the first (policy) denial may carry the challenge.
+            assert_eq!(
+                statuses,
+                [
+                    (StatusCode::FORBIDDEN, usize::from(enabled)),
+                    (StatusCode::TOO_MANY_REQUESTS, 0)
+                ]
+            );
+        }
+        // And apart from the challenge, the 403 headers are byte-identical.
+        let [plain, hinted] = denials.as_slice() else {
+            anyhow::bail!("expected two policy denials, got {}", denials.len());
+        };
+        assert_eq!(plain, hinted);
+        // And with the knob on, requests the policy allows are never decorated.
+        for body in [
+            serde_json::json!({"method":"tools/list"}),
+            serde_json::json!({"method":"tools/call","params":{"name":"echo","arguments":{"message":"read"}}}),
+        ] {
+            let allowed = step_up_response(
+                Some(Arc::clone(&challenge)),
+                step_up_identity(),
+                body.clone(),
+            )
+            .await?;
+            assert_eq!(allowed.status(), StatusCode::OK, "{body}");
+            assert!(
+                !allowed.headers().contains_key("www-authenticate"),
+                "{body}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A challenge over `mappings` advertising the relative metadata location.
+    fn step_up_challenge(mappings: &[(&str, &str)]) -> Arc<ScopeChallenge> {
+        Arc::new(ScopeChallenge {
+            scope_roles: mappings
+                .iter()
+                .map(|(scope, role)| ((*scope).to_owned(), (*role).to_owned()))
+                .collect(),
+            resource_metadata: "/.well-known/oauth-protected-resource".into(),
+        })
+    }
+
+    /// Sends `batch` as the `mcp:read` viewer and asserts the challenge names
+    /// the expected scope or is absent. When a `(scope, role)` is expected,
+    /// the same request replayed with that scope added and its role resolved
+    /// must be allowed: a hint never sends the client into a step-up loop.
+    async fn step_up_assert_hint_unlocks(
+        policy: &Arc<RbacPolicy>,
+        challenge: &Arc<ScopeChallenge>,
+        (batch, expected): (Vec<serde_json::Value>, Option<(&str, &str)>),
+    ) -> anyhow::Result<()> {
+        let label = serde_json::Value::Array(batch.clone()).to_string();
+        let body = if let [single] = batch.as_slice() {
+            single.clone()
+        } else {
+            serde_json::Value::Array(batch)
+        };
+        let denied = step_up_response_with(
+            Arc::clone(policy),
+            Some(Arc::clone(challenge)),
+            (step_up_identity(), body.clone()),
+        )
+        .await?;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{label}");
+        let challenges: Vec<_> = denied
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(HeaderValue::to_str)
+            .collect::<Result<_, _>>()?;
+        let expected_header = expected.map(|(scope, _role)| {
+            format!(
+                "Bearer error=\"insufficient_scope\", scope=\"{scope}\", resource_metadata=\"/.well-known/oauth-protected-resource\", error_description=\"additional scope required\""
+            )
+        });
+        assert_eq!(
+            challenges,
+            expected_header.as_deref().into_iter().collect::<Vec<_>>(),
+            "{label}"
+        );
+        if let Some((scope, role)) = expected {
+            let mut identity = step_up_identity();
+            identity.role = role.into();
+            identity.granted_scopes = Some(Arc::from(["mcp:read".to_owned(), scope.to_owned()]));
+            let retried = step_up_response_with(
+                Arc::clone(policy),
+                Some(Arc::clone(challenge)),
+                (identity, body),
+            )
+            .await?;
+            assert_eq!(retried.status(), StatusCode::OK, "retry as {role}: {label}");
+        }
+        Ok(())
+    }
+
+    /// Roles need not be nested: a call the current role already passes
+    /// still vetoes a candidate role that cannot make it, in either batch
+    /// orientation, so every call of the batch is simulated.
+    #[tokio::test]
+    async fn step_up_candidate_must_pass_calls_the_current_role_already_passes()
+    -> anyhow::Result<()> {
+        // Given a viewer allowed only echo, an ops role allowed only
+        // admin_only, and a root role allowed both.
+        let star = || vec!["*".to_owned()];
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], star()),
+            RoleConfig::new("ops", vec!["admin_only".into()], star()),
+            RoleConfig::new("root", vec!["echo".into(), "admin_only".into()], star()),
+        ])));
+        let ops_only = step_up_challenge(&[("mcp:admin", "ops"), ("mcp:read", "viewer")]);
+        let ops_then_root = step_up_challenge(&[
+            ("mcp:admin", "ops"),
+            ("mcp:root", "root"),
+            ("mcp:read", "viewer"),
+        ]);
+        let call = |name: &str| serde_json::json!({"method":"tools/call","params":{"name":name}});
+        for (challenge, batch, expected) in [
+            (&ops_only, vec![call("echo"), call("admin_only")], None),
+            (&ops_only, vec![call("admin_only"), call("echo")], None),
+            (
+                &ops_only,
+                vec![call("echo"), call("echo"), call("admin_only")],
+                None,
+            ),
+            (
+                &ops_only,
+                vec![call("admin_only"), call("admin_only")],
+                Some(("mcp:admin", "ops")),
+            ),
+            (
+                &ops_then_root,
+                vec![call("echo"), call("admin_only")],
+                Some(("mcp:root", "root")),
+            ),
+            (
+                &ops_then_root,
+                vec![call("admin_only"), call("echo")],
+                Some(("mcp:root", "root")),
+            ),
+        ] {
+            // When the denied batch traverses the real middleware, then only
+            // a role that passes every call, earlier ones included, is hinted.
+            step_up_assert_hint_unlocks(&policy, challenge, (batch, expected)).await?;
+        }
+        Ok(())
+    }
+
+    /// Batches longer than three calls are simulated up to their last call.
+    #[tokio::test]
+    async fn step_up_long_batches_require_every_call_to_unlock() -> anyhow::Result<()> {
+        use core::iter::repeat_with;
+
+        // Given admin-first mappings and batches of four, five and eight calls
+        // whose last call alone blocks every candidate, plus unlockable ones.
+        let policy = Arc::new(step_up_policy());
+        let challenge = step_up_challenge(&[("mcp:admin", "ops"), ("mcp:read", "viewer")]);
+        let call =
+            |params: serde_json::Value| serde_json::json!({"method":"tools/call","params":params});
+        let admin = || call(serde_json::json!({"name":"admin_only"}));
+        let read = || call(serde_json::json!({"name":"echo","arguments":{"message":"read"}}));
+        let write = || call(serde_json::json!({"name":"echo","arguments":{"message":"write"}}));
+        let nobody = || call(serde_json::json!({"name":"denied_for_everyone"}));
+        let never = || call(serde_json::json!({"name":"echo","arguments":{"message":"never"}}));
+        let unlocks = Some(("mcp:admin", "ops"));
+        let mut cases = vec![
+            (vec![admin(), read(), write(), admin(), read()], unlocks),
+            (
+                vec![
+                    read(),
+                    admin(),
+                    write(),
+                    admin(),
+                    read(),
+                    write(),
+                    admin(),
+                    write(),
+                ],
+                unlocks,
+            ),
+        ];
+        for head in [3_usize, 4, 7] {
+            for last in [nobody(), never()] {
+                let mut batch: Vec<serde_json::Value> = repeat_with(admin).take(head).collect();
+                batch.push(last);
+                cases.push((batch, None));
+            }
+        }
+        for case in cases {
+            // When the batch is denied, then a hint exists only if one scope
+            // unlocks all of its calls, and replaying it is then allowed.
+            step_up_assert_hint_unlocks(&policy, &challenge, case).await?;
+        }
+        Ok(())
+    }
+
+    /// With three unlocking scopes the hint is the first in config order.
+    #[tokio::test]
+    async fn step_up_names_the_first_of_three_unlocking_scopes() -> anyhow::Result<()> {
+        // Given three mappings that each unlock admin_only for the viewer.
+        let policy = Arc::new(step_up_policy());
+        let challenge = step_up_challenge(&[
+            ("mcp:admin", "ops"),
+            ("mcp:root", "root"),
+            ("mcp:z", "ops"),
+            ("mcp:read", "viewer"),
+        ]);
+        let call = serde_json::json!({"method":"tools/call","params":{"name":"admin_only"}});
+        // When the denied call traverses the real middleware, then the first
+        // unlocking mapping is named and replaying it as that role is allowed.
+        step_up_assert_hint_unlocks(
+            &policy,
+            &challenge,
+            (vec![call], Some(("mcp:admin", "ops"))),
+        )
+        .await
+    }
+
+    /// The simulation keeps a string `host`: a candidate role whose host
+    /// globs exclude it is never hinted, matching is ASCII-case-insensitive,
+    /// and an absent `host` stays the operation-only check.
+    #[tokio::test]
+    async fn step_up_simulates_the_candidate_role_host_globs() -> anyhow::Result<()> {
+        // Given a viewer limited to echo, an ops role limited to `prod-*`
+        // hosts and a root role on every host.
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+            RoleConfig::new("ops", vec!["admin_only".into()], vec!["prod-*".into()]),
+            RoleConfig::new("root", vec!["admin_only".into()], vec!["*".into()]),
+        ])));
+        let ops_only = step_up_challenge(&[("mcp:admin", "ops"), ("mcp:read", "viewer")]);
+        let ops_then_root = step_up_challenge(&[
+            ("mcp:admin", "ops"),
+            ("mcp:root", "root"),
+            ("mcp:read", "viewer"),
+        ]);
+        let on = |host: &str| serde_json::json!({"method":"tools/call","params":{"name":"admin_only","arguments":{"host":host}}});
+        let hostless = serde_json::json!({"method":"tools/call","params":{"name":"admin_only"}});
+        let ops = Some(("mcp:admin", "ops"));
+        for (challenge, batch, expected) in [
+            (&ops_only, vec![on("dev-1")], None),
+            (&ops_only, vec![on("prod-1")], ops),
+            (&ops_only, vec![on("PROD-1")], ops),
+            (&ops_only, vec![hostless.clone()], ops),
+            (&ops_only, vec![on("prod-1"), on("dev-1")], None),
+            (&ops_only, vec![on("dev-1"), on("prod-1")], None),
+            (&ops_only, vec![hostless, on("prod-2")], ops),
+            (
+                &ops_then_root,
+                vec![on("dev-1")],
+                Some(("mcp:root", "root")),
+            ),
+            (&ops_then_root, vec![on("prod-1")], ops),
+        ] {
+            // When the denied call traverses the real middleware, then the
+            // hint names a role whose host globs admit every requested host.
+            step_up_assert_hint_unlocks(&policy, challenge, (batch, expected)).await?;
+        }
+        Ok(())
+    }
+
+    /// Valid RFC 6750 scope tokens outside the `mcp:<word>` shape:
+    /// un-namespaced, empty or leading namespace, nested namespaces, dots,
+    /// slashes, a URL, dashes and underscores, upper and mixed case, digits,
+    /// `~ % +`, the remaining punctuation, role-name spellings and a
+    /// 200-byte token.
+    fn step_up_scope_alphabet() -> Vec<String> {
+        let mut alphabet: Vec<String> = [
+            "read",
+            "admin",
+            "mcp:",
+            ":read",
+            "a:b:c",
+            "mcp.read",
+            "api/read",
+            "https://example.test/scope/read",
+            "mcp:read-only",
+            "mcp_admin",
+            "READ",
+            "Mcp:Admin",
+            "mcp:v2",
+            "scope42",
+            "mcp:~a%2B+b",
+            "!#$&'()*,;<=>?@[]^`{|}",
+            "ops",
+            "viewer",
+            "urn:example:mcp:tools.admin",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        alphabet.push(format!("mcp:{}", "long".repeat(49)));
+        alphabet
+    }
+
+    /// Every alphabet scope as the unlocking hint, as a held scope that keeps
+    /// the role (the loop shape: no hint), and mixed with another alphabet
+    /// scope in grants separated by Unicode whitespace: the hint is exactly
+    /// the reference model's first unlocking scope in configuration order.
+    #[test]
+    fn step_up_scope_alphabet_matches_reference_resolution() -> anyhow::Result<()> {
+        // Given viewer < ops < root and each alphabet scope next to `mcp:read`.
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+            RoleConfig::new(
+                "ops",
+                vec!["echo".into(), "admin_only".into()],
+                vec!["*".into()],
+            ),
+            RoleConfig::new(
+                "root",
+                vec!["echo".into(), "admin_only".into(), "root_only".into()],
+                vec!["*".into()],
+            ),
+        ]));
+        let alphabet = step_up_scope_alphabet();
+        let read = "mcp:read";
+        let calls =
+            ["echo", "admin_only", "root_only"].map(|tool| serde_json::json!({"name": tool}));
+        let batches: Vec<Vec<&serde_json::Value>> = calls
+            .iter()
+            .map(|params| vec![params])
+            .chain([calls.iter().collect()])
+            .collect();
+        let mut pinned = 0_usize;
+        let spellings = || alphabet.iter().map(String::as_str);
+        for (scope, other) in spellings().zip(spellings().cycle().skip(1)) {
+            for (mappings, claim, pin) in [
+                (
+                    vec![(scope, "ops"), (read, "viewer")],
+                    read.to_owned(),
+                    Some(Some(scope)),
+                ),
+                (
+                    vec![(scope, "viewer"), (read, "ops")],
+                    scope.to_owned(),
+                    Some(None),
+                ),
+                (
+                    vec![(other, "root"), (scope, "viewer"), (read, "ops")],
+                    format!("{read}\u{3000}{scope}"),
+                    None,
+                ),
+                (
+                    vec![(scope, "viewer"), (other, "root"), (read, "ops")],
+                    format!("\u{a0}{other}\u{2003}{read}\t"),
+                    None,
+                ),
+            ] {
+                let challenge = step_up_challenge(&mappings);
+                let granted: Vec<&str> = claim.split_whitespace().collect();
+                let resolve = |held: &[&str]| {
+                    mappings
+                        .iter()
+                        .find(|(mapped, _)| held.contains(mapped))
+                        .map(|(_, role)| *role)
+                };
+                let current = resolve(&granted).context("the claim resolves")?;
+                let mut identity = step_up_identity();
+                identity.role = current.into();
+                identity.granted_scopes =
+                    Some(granted.iter().map(|held| (*held).to_owned()).collect());
+                for batch in &batches {
+                    // When the hint is selected for the batch.
+                    let hint = challenge.unlocking_scope(&policy, &identity, batch);
+                    // Then it is the first configured scope that is not held
+                    // and whose addition changes the role to one that passes.
+                    let expected = mappings.iter().map(|(mapped, _)| *mapped).find(|mapped| {
+                        let mut union = granted.clone();
+                        union.push(mapped);
+                        !granted.contains(mapped)
+                            && resolve(&union).is_some_and(|role| {
+                                role != current
+                                    && batch.iter().all(|params| {
+                                        evaluate_tool_call(&policy, role, params).is_ok()
+                                    })
+                            })
+                    });
+                    assert_eq!(hint, expected, "{mappings:?} {claim:?} {batch:?}");
+                    if let (Some(pinned_hint), [params]) = (pin, batch.as_slice())
+                        && params.get("name") == Some(&serde_json::json!("admin_only"))
+                    {
+                        assert_eq!(hint, pinned_hint, "pin {mappings:?} {claim:?}");
+                        pinned += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            pinned,
+            2 * alphabet.len(),
+            "every alphabet scope is pinned twice"
+        );
+        Ok(())
+    }
+
     /// Middleware passes non post.
     #[tokio::test]
     async fn middleware_passes_non_post() -> anyhow::Result<()> {
@@ -4256,6 +6029,7 @@ mod tests {
 
     fn global_deny_identity() -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "admin".into(),
@@ -4319,6 +6093,7 @@ mod tests {
     async fn middleware_allows_permitted_tool() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4343,6 +6118,7 @@ mod tests {
     async fn middleware_denies_unpermitted_tool() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4367,6 +6143,7 @@ mod tests {
     async fn middleware_passes_non_tool_call_post() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4397,6 +6174,7 @@ mod tests {
     async fn middleware_enforces_argument_allowlist() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "dev".into(),
             role: "restricted-exec".into(),
@@ -4458,6 +6236,7 @@ mod tests {
     async fn middleware_batch_all_allowed_passes() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4496,6 +6275,7 @@ mod tests {
     async fn middleware_batch_with_denied_call_rejects_entire_batch() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
@@ -4534,6 +6314,7 @@ mod tests {
     async fn middleware_batch_mixed_allowed_and_denied_rejects() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "dev".into(),
             role: "restricted-exec".into(),
@@ -4688,6 +6469,7 @@ mod tests {
     async fn deny_path_uses_explicit_identity_not_task_local() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "alice-the-auditor".into(),
             role: "viewer".into(),
@@ -4712,6 +6494,7 @@ mod tests {
 
     fn restricted_exec_identity() -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "carol".into(),
             role: "restricted-exec".into(),
@@ -4843,6 +6626,7 @@ mod tests {
         // ops's allow list so the call should not be rejected by RBAC.
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "olivia".into(),
             role: "ops".into(),
@@ -4972,6 +6756,7 @@ mod tests {
 
     fn viewer_identity() -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             method: AuthMethod::BearerToken,
             name: "viewer-1".into(),
             role: "viewer".into(),
@@ -5173,6 +6958,342 @@ mod tests {
         Ok(())
     }
 
+    fn evaluator_policy(strict: bool) -> RbacPolicy {
+        let mut config = RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["t".into()], vec!["dev-*".into()])
+                .with_argument_allowlists(vec![
+                    ArgumentAllowlist::new_required("t", "x", vec!["ok".into()])
+                        .with_deny_unknown_arguments(strict),
+                ]),
+        ]);
+        config.redaction_salt = Some(SecretString::from("task-4-fixture"));
+        RbacPolicy::new(&config)
+    }
+
+    async fn assert_evaluator_denial(
+        input: (bool, &str, serde_json::Value),
+        expected: ToolDenial,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let (strict, role, args) = input;
+        let policy = evaluator_policy(strict);
+        let params = serde_json::json!({"name": "t", "arguments": args});
+        assert_eq!(evaluate_tool_call(&policy, role, &params), Err(expected));
+        let (denial, response) =
+            enforce_tool_policy(&policy, "alice", role, &params, &DenyLogFields::default())
+                .context("call must deny")?;
+        assert_eq!(denial.error(role).client_message(), message);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes().as_ref(),
+            message.as_bytes()
+        );
+        Ok(())
+    }
+
+    /// Host shape denial precedes role and argument checks.
+    #[tokio::test]
+    async fn evaluate_tool_call_non_string_host() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "unknown", serde_json::json!({"host": ["bad"]})),
+            ToolDenial::NonStringHost {
+                tool: "t".into(),
+                value_type: "array",
+            },
+            "argument 'host' must be a string for tool 't'",
+        )
+        .await
+    }
+
+    /// Role denial retains the host and exact wire message.
+    #[tokio::test]
+    async fn evaluate_tool_call_role_denied() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "unknown", serde_json::json!({"host": "dev-1"})),
+            ToolDenial::RoleDenied {
+                tool: "t".into(),
+                host: Some("dev-1".into()),
+            },
+            "t denied for role 'unknown'",
+        )
+        .await
+    }
+
+    /// Strict unknown arguments precede missing requirements.
+    #[tokio::test]
+    async fn evaluate_tool_call_strict_unknown_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (true, "viewer", serde_json::json!({"z": true})),
+            ToolDenial::StrictUnknownArgument {
+                tool: "t".into(),
+                argument: "z".into(),
+            },
+            "argument 'z' is not permitted for tool 't'",
+        )
+        .await
+    }
+
+    /// Strict structured denial precedes the value allowlist.
+    #[tokio::test]
+    async fn evaluate_tool_call_strict_structured_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (true, "viewer", serde_json::json!({"x": {"nested": true}})),
+            ToolDenial::StrictStructuredArgument {
+                tool: "t".into(),
+                argument: "x".into(),
+                value_type: "object",
+            },
+            "argument 'x' must not be an object or array for tool 't'",
+        )
+        .await
+    }
+
+    /// Non-string allowlisted arguments fail closed.
+    #[tokio::test]
+    async fn evaluate_tool_call_non_string_allowlisted_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "viewer", serde_json::json!({"x": true})),
+            ToolDenial::NonStringAllowlistedArgument {
+                tool: "t".into(),
+                argument: "x".into(),
+                value_type: "bool",
+            },
+            "argument 'x' must be a string for tool 't'",
+        )
+        .await
+    }
+
+    /// Disallowed values retain their redacted correlation and exact 403 text.
+    #[tokio::test]
+    async fn evaluate_tool_call_argument_not_allowed() -> anyhow::Result<()> {
+        let policy = evaluator_policy(false);
+        let params = serde_json::json!({"name": "t", "arguments": {"x": "bad"}});
+        assert!(matches!(
+            evaluate_tool_call(&policy, "viewer", &params),
+            Err(ToolDenial::ArgumentNotAllowed {
+                tool: _,
+                argument: _,
+                arg_hmac: _
+            })
+        ));
+        assert_evaluator_denial(
+            (false, "viewer", serde_json::json!({"x": "bad"})),
+            ToolDenial::ArgumentNotAllowed {
+                tool: "t".into(),
+                argument: "x".into(),
+                arg_hmac: "66d0b40b".into(),
+            },
+            "argument 'x' value not in allowlist for tool 't'",
+        )
+        .await
+    }
+
+    /// Missing required arguments retain their exact denial message.
+    #[tokio::test]
+    async fn evaluate_tool_call_missing_required_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "viewer", serde_json::json!({})),
+            ToolDenial::MissingRequiredArgument {
+                tool: "t".into(),
+                argument: "x".into(),
+            },
+            "argument 'x' is required for tool 't'",
+        )
+        .await
+    }
+
+    // Frozen pre-refactor inline verdict, intentionally independent of the evaluator.
+    fn old_inline_tool_verdict(policy: &RbacPolicy, role: &str, params: &JsonValue) -> bool {
+        let tool = params.get("name").and_then(JsonValue::as_str).unwrap_or("");
+        let host = params.get("arguments").and_then(|args| args.get("host"));
+        if host.is_some_and(|value| !value.is_string()) {
+            return false;
+        }
+        let decision = host.and_then(JsonValue::as_str).map_or_else(
+            || policy.check_operation(role, tool),
+            |value| policy.check(role, tool, value),
+        );
+        if decision == RbacDecision::Deny {
+            return false;
+        }
+        let args = params.get("arguments").and_then(JsonValue::as_object);
+        let strict = policy.strict_argument_names(role, tool);
+        if let Some(arguments) = args {
+            for (key, value) in arguments {
+                if strict.as_ref().is_some_and(|permitted| {
+                    !permitted.contains(&key.as_str()) || value.is_object() || value.is_array()
+                }) {
+                    return false;
+                }
+                if policy.has_argument_allowlist(role, tool, key)
+                    && !value
+                        .as_str()
+                        .is_some_and(|text| policy.argument_allowed(role, tool, key, text))
+                {
+                    return false;
+                }
+            }
+        }
+        policy.missing_required_argument(role, tool, args).is_none()
+    }
+
+    /// The evaluator matches pre-refactor verdicts for malformed and oversized inputs.
+    #[tokio::test]
+    async fn evaluate_tool_call_matches_old_inline_matrix() -> anyhow::Result<()> {
+        for strict in [false, true] {
+            let policy = evaluator_policy(strict);
+            for role in ["viewer", "unknown", ""] {
+                for tool in ["t", "other", ""] {
+                    for args in [
+                        serde_json::json!({"x": "ok"}),
+                        serde_json::json!({"x": "bad"}),
+                        serde_json::json!({"x": "ok extra"}),
+                        serde_json::json!({"x": "\""}),
+                        serde_json::json!({"x": "bad".repeat(100_000)}),
+                        serde_json::json!({"x": {"nested": [true]}}),
+                        serde_json::json!({"x": ["ok"]}),
+                        serde_json::json!({"x": null}),
+                        serde_json::json!({"x": 42_u32}),
+                        serde_json::json!({"x": true}),
+                        serde_json::json!({"x": "ok", "z": true}),
+                        serde_json::json!({"host": "prod-1", "x": "ok"}),
+                        serde_json::json!({"host": "dev-1", "x": "ok"}),
+                        serde_json::json!({"host": null, "x": "ok"}),
+                        serde_json::json!({"host": ["dev-1"], "x": "ok"}),
+                        serde_json::json!({"host": {"nested": true}, "x": "ok"}),
+                        serde_json::json!({"host": true, "x": "ok"}),
+                        serde_json::json!({"host": 42_u32, "x": "ok"}),
+                        serde_json::json!({}),
+                        serde_json::json!(null),
+                        serde_json::json!("not-an-object"),
+                    ] {
+                        let params = serde_json::json!({"name": tool, "arguments": args});
+                        assert_eq!(
+                            evaluate_tool_call(&policy, role, &params).is_ok(),
+                            old_inline_tool_verdict(&policy, role, &params),
+                            "verdict drift: strict={strict} role={role} tool={tool}",
+                        );
+                    }
+                    let params = serde_json::json!({"name": tool});
+                    assert_eq!(
+                        evaluate_tool_call(&policy, role, &params).is_ok(),
+                        old_inline_tool_verdict(&policy, role, &params)
+                    );
+                }
+            }
+        }
+        let policy = evaluator_policy(false);
+        for params in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"name": true}),
+        ] {
+            assert_eq!(
+                evaluate_tool_call(&policy, "viewer", &params).is_ok(),
+                old_inline_tool_verdict(&policy, "viewer", &params)
+            );
+        }
+        let (_, response) = enforce_tool_policy(
+            &policy,
+            "alice",
+            "viewer",
+            &serde_json::json!({"name": "t"}),
+            &DenyLogFields::default(),
+        )
+        .context("missing argument denies")?;
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes().as_ref(),
+            b"argument 'x' is required for tool 't'"
+        );
+        Ok(())
+    }
+
+    /// Denial logs and responses match the captured pre-refactor bytes.
+    #[tokio::test]
+    async fn evaluate_tool_call_preserves_deny_surface() -> anyhow::Result<()> {
+        let fields = DenyLogFields {
+            client_ip: Some("198.51.100.4".parse()?),
+            peer_ip: Some("10.0.0.1".parse()?),
+            request_id: Some(Arc::from("task-4")),
+        };
+        for (role, strict, args, event, message) in [
+            (
+                "viewer",
+                false,
+                serde_json::json!({"host": ["bad"]}),
+                "non-string host argument rejected user=alice role=viewer tool=\"t\" value_type=\"array\"",
+                "argument 'host' must be a string for tool 't'",
+            ),
+            (
+                "unknown",
+                false,
+                serde_json::json!({"host": "dev-1"}),
+                "RBAC denied user=alice role=unknown tool=\"t\" host=\"dev-1\"",
+                "t denied for role 'unknown'",
+            ),
+            (
+                "viewer",
+                true,
+                serde_json::json!({"z": true}),
+                "unknown argument rejected by strict allowlist user=alice role=viewer tool=\"t\" argument=\"z\"",
+                "argument 'z' is not permitted for tool 't'",
+            ),
+            (
+                "viewer",
+                true,
+                serde_json::json!({"x": {"nested": true}}),
+                "structured argument rejected by strict allowlist user=alice role=viewer tool=\"t\" argument=\"x\" value_type=\"object\"",
+                "argument 'x' must not be an object or array for tool 't'",
+            ),
+            (
+                "viewer",
+                false,
+                serde_json::json!({"x": true}),
+                "non-string argument rejected by allowlist user=alice role=viewer tool=\"t\" argument=\"x\" value_type=\"bool\"",
+                "argument 'x' must be a string for tool 't'",
+            ),
+            (
+                "viewer",
+                false,
+                serde_json::json!({"x": "bad"}),
+                "argument not in allowlist user=alice role=viewer tool=\"t\" argument=\"x\" arg_hmac=66d0b40b",
+                "argument 'x' value not in allowlist for tool 't'",
+            ),
+            (
+                "viewer",
+                false,
+                serde_json::json!({}),
+                "required argument missing user=alice role=viewer tool=\"t\" argument=\"x\"",
+                "argument 'x' is required for tool 't'",
+            ),
+        ] {
+            let policy = evaluator_policy(strict);
+            let params = serde_json::json!({"name": "t", "arguments": args});
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let (_, response) = subscriber::with_default(subscriber, || {
+                enforce_tool_policy(&policy, "alice", role, &params, &fields)
+            })
+            .context("fixture must deny")?;
+            assert_eq!(
+                logs.contents(),
+                format!(
+                    " WARN rmcp_server_kit::rbac: {event} client_ip=198.51.100.4 peer_ip=10.0.0.1 request_id=\"task-4\"\n"
+                )
+            );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.into_body().collect().await?.to_bytes().as_ref(),
+                message.as_bytes()
+            );
+        }
+        Ok(())
+    }
+
     /// Strategy for an arbitrary JSON value, bounded in depth and size.
     fn prop_json_value_strategy() -> impl Strategy<Value = JsonValue> {
         let leaf = prop_oneof![
@@ -5250,6 +7371,80 @@ mod tests {
                 "denied tool {:?} must stay denied",
                 tool
             );
+        }
+    }
+
+    /// Config order beats token order: the earlier mapping wins even when the
+    /// token lists the later scope first.
+    #[test]
+    fn first_matching_scope_role_config_order_beats_token_order() -> anyhow::Result<()> {
+        let mappings = [("a", "role-a"), ("b", "role-b")];
+        let granted = ["b", "a"];
+        let got = first_matching_scope_role(mappings.iter().copied(), &granted);
+        anyhow::ensure!(got == Some("role-a"), "unexpected role: {got:?}");
+        Ok(())
+    }
+
+    /// A granted set with no configured scope yields `None`.
+    #[test]
+    fn first_matching_scope_role_no_match_is_none() -> anyhow::Result<()> {
+        let mappings = [("a", "role-a"), ("b", "role-b")];
+        let granted = ["c", "A"];
+        let got = first_matching_scope_role(mappings.iter().copied(), &granted);
+        anyhow::ensure!(got.is_none(), "unexpected role: {got:?}");
+        Ok(())
+    }
+
+    /// An empty granted set yields `None`.
+    #[test]
+    fn first_matching_scope_role_empty_granted_is_none() -> anyhow::Result<()> {
+        let mappings = [("a", "role-a")];
+        let got = first_matching_scope_role(mappings.iter().copied(), &[]);
+        anyhow::ensure!(got.is_none(), "unexpected role: {got:?}");
+        Ok(())
+    }
+
+    /// The first scope hit wins even when its configured role string is empty.
+    #[test]
+    fn first_matching_scope_role_returns_empty_role_for_first_hit() -> anyhow::Result<()> {
+        let first = [("a", ""), ("b", "rb")];
+        let got_first = first_matching_scope_role(first.iter().copied(), &["a", "b"]);
+        anyhow::ensure!(got_first == Some(""), "unexpected role: {got_first:?}");
+        let second = [("b", "rb"), ("a", "")];
+        let got_second = first_matching_scope_role(second.iter().copied(), &["a"]);
+        anyhow::ensure!(got_second == Some(""), "unexpected role: {got_second:?}");
+        Ok(())
+    }
+
+    /// FROZEN COPY of the pre-refactor inline loop from `JwksCache::resolve_role`
+    /// (differential oracle; never update it to follow the implementation).
+    fn frozen_old_inline_scope_role<'mapping>(
+        mappings: &'mapping [(String, String)],
+        token_scopes: &[&str],
+    ) -> Option<&'mapping str> {
+        mappings
+            .iter()
+            .find(|mapping| token_scopes.contains(&mapping.0.as_str()))
+            .map(|mapping| mapping.1.as_str())
+    }
+
+    proptest! {
+        /// The shared helper equals the frozen old inline loop for arbitrary
+        /// (including empty, duplicate, case-differing, whitespace) scopes.
+        #[test]
+        fn first_matching_scope_role_matches_frozen_inline_loop(
+            mappings in collection::vec(("[a-cA-C :]{0,3}", "[r-t]{0,2}"), 0..8),
+            granted in collection::vec("[a-cA-C :]{0,3}", 0..200),
+        ) {
+            let granted_refs: Vec<&str> = granted.iter().map(String::as_str).collect();
+            let expected = frozen_old_inline_scope_role(&mappings, &granted_refs);
+            let actual = first_matching_scope_role(
+                mappings
+                    .iter()
+                    .map(|(scope, role)| (scope.as_str(), role.as_str())),
+                &granted_refs,
+            );
+            prop_assert_eq!(actual, expected);
         }
     }
 }

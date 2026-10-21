@@ -38,7 +38,7 @@ cargo +nightly-2026-10-03 fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo test --all-features --test docs_citations
-lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
+lychee --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md
 cargo deny check
 cargo audit
 cargo vet --locked

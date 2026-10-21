@@ -74,6 +74,17 @@ mindmap
         JWKS key cap (fail-closed default 256)
         Discovery endpoints
         OAuth proxy routes
+        ProxyMode passthrough or authorization_server
+        Opt-ins challenge_scopes, insufficient_scope_challenge
+        Opt-ins additional_audiences, accept_resource_audience
+      oauth_as.rs feature=oauth
+        authorization_server proxy mode
+        register, authorize, consent, callback, token
+        Stateless, every value sealed
+        Re-stamps iss with its own issuer
+      oauth_seal.rs feature=oauth
+        Sealer, HMAC-SHA256 key per purpose
+        sealing_secret plus sealing_secret_previous
       ssrf.rs
         Per-hop SSRF guard
         scheme/userinfo/IP-literal blocks
@@ -126,6 +137,8 @@ mindmap
         /readyz
         /metrics feature=metrics
         /.well-known/oauth-* feature=oauth
+        /register /authorize /token feature=oauth proxy
+        /oauth/consent /oauth/callback authorization_server mode
       Admin gated
         /admin/*
       Authenticated
@@ -296,11 +309,11 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as `TlsListener`<br/>src/transport.rs:3657
+    participant TLS as `TlsListener`<br/>src/transport.rs:3838
     participant R as axum Router
-    participant O as `origin_check_middleware`<br/>src/transport.rs:5160
-    participant H as `security_headers_middleware`<br/>src/transport.rs:4373
-    participant A as `auth_middleware`<br/>src/auth.rs:2713
+    participant O as `origin_check_middleware`<br/>src/transport.rs:5379
+    participant H as `security_headers_middleware`<br/>src/transport.rs:4555
+    participant A as `auth_middleware`<br/>src/auth.rs:2782
     participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
@@ -332,17 +345,17 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph Admin["Admin / operator"]
-        RH[`ReloadHandle`<br/>src/transport.rs:2003]
+        RH[`ReloadHandle`<br/>src/transport.rs:2019]
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
-        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1751)]
+        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1762)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
         MTL[mTLS `AuthIdentity`<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:76]
     end
 
     subgraph Hot["Request-time consumers"]
-        AM[`auth_middleware`<br/>src/auth.rs:2713]
+        AM[`auth_middleware`<br/>src/auth.rs:2782]
         BM[`rbac_middleware`<br/>src/rbac.rs:1354]
         TL["Task-locals<br/>`current_role` / `current_identity`<br/>`current_token` / `current_sub`<br/>src/rbac.rs:158-220"]
         TH[`HookedHandler`<br/>src/tool_hooks.rs:335]
@@ -373,6 +386,8 @@ graph TD
     rbac[rbac.rs<br/>policy + task-locals + rate limit]
     bl[bounded_limiter.rs<br/>memory-bounded keyed limiter]
     oauth["oauth.rs<br/>JWT + JWKS<br/>(feature=oauth)"]
+    oauthas["oauth_as.rs<br/>authorization_server proxy<br/>(feature=oauth)"]
+    seal["oauth_seal.rs<br/>sealed values<br/>(feature=oauth)"]
     ssrf[ssrf.rs<br/>per-hop SSRF guard]
     mtlsr[mtls_revocation.rs<br/>CRL fetcher + verifier]
     admin[admin.rs<br/>/admin/*]
@@ -398,6 +413,8 @@ graph TD
     transport --> auth
     transport --> rbac
     transport --> oauth
+    transport --> oauthas
+    transport --> seal
     transport --> mtlsr
     transport --> admin
     transport --> hooks
@@ -414,6 +431,8 @@ graph TD
     oauth --> error
     oauth --> auth
     oauth --> ssrf
+    oauthas --> oauth
+    oauthas --> seal
     mtlsr --> ssrf
     mtlsr --> error
     admin --> auth
@@ -429,17 +448,19 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3014, `McpServerConfig` L481, `ReloadHandle` ~L2003              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5505                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2331; security headers, peer-addr normalization, request logging, and origin checks are wired there |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3657                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5160, `security_headers_middleware` ~L4373       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4191                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1749, `auth_middleware` L2713              |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3105, `McpServerConfig` L482, `ReloadHandle` ~L2019              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5739                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2347; security headers, peer-addr normalization, request logging, and origin checks are wired there |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3838                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5379, `security_headers_middleware` ~L4555       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4372                                                      |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1760, `auth_middleware` L2782              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2744, `JWKS_REFRESH_COOLDOWN` ~L2928, `select_jwks_key` L3584 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3161, `JWKS_REFRESH_COOLDOWN` ~L3352, `select_jwks_key` L4053 |
+| OAuth proxy `authorization_server` mode | `src/oauth_as.rs` (feature `oauth`)  | `install_routes` L182, `register` L394, `callback` L864, `token` L1074       |
+| Sealed proxy values               | `src/oauth_seal.rs` (feature `oauth`)    | `Sealer` L83, `SealKind` L23, `MAX_SEALED_LEN` L19                            |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L330, `DynamicClientCertVerifier` L1745, `bootstrap_fetch` L2172       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L335                                                          |
@@ -449,7 +470,7 @@ graph TD
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
 | Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L46, `IntoResponse` L170                                           |
 | Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L507                                                           |
-| Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
+| Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`, `oauth_proxy_as_demo.rs` |
 
 ---
 

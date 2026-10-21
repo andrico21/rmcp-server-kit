@@ -91,6 +91,15 @@ an rmcp bump changes the surface:
   defaults and security-header policy; confirm the crate's documented posture
   still holds and no new `ProtocolVersion` changes initialization rules
   (`negotiate_initialize`, per-request metadata requirements).
+- [ ] Run the RBAC/rmcp parser differential, one command at a time:
+  `cargo test --all-features --lib rbac::tests::rbac_and_rmcp_agree_on_every_dispatched_tool_call`,
+  `cargo test --all-features --lib rbac::tests::differential_invariant_holds_for_duplicated_keys`
+  and
+  `cargo test --all-features --test e2e rbac_parser_differential_never_dispatches_an_uninspected_tool`.
+  A pinned-expectation failure means rmcp now parses that row differently:
+  re-derive the row's expected outcome from the new rmcp source. An invariant
+  failure means rmcp would dispatch a tool call that RBAC did not inspect: treat
+  it as an RBAC bypass and fix it before the bump merges.
 - [ ] `cargo test --all-features` (covers the wrapper transparency tests).
 
 ## 4. Deprecation drift

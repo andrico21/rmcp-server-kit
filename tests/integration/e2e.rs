@@ -34,7 +34,7 @@ mod tests {
     use alloc::{collections::VecDeque, sync::Arc};
     use core::{
         fmt,
-        future::ready,
+        future::{pending, ready},
         net::SocketAddr,
         num::NonZeroUsize,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -103,6 +103,322 @@ mod tests {
 
     #[derive(Clone)]
     struct TestHandler;
+
+    #[derive(Clone)]
+    struct NestedHeaderToolHandler;
+
+    impl ServerHandler for NestedHeaderToolHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            if name != "route" {
+                return None;
+            }
+            let schema = serde_json::json!({"type":"object","properties":{"target":{
+                "type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"}}
+            }}});
+            schema
+                .as_object()
+                .map(|object| Tool::new("route", "route", Arc::new(object.clone())))
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            ready(Ok(ListToolsResult::with_all_items(
+                self.get_tool("route").into_iter().collect(),
+            )))
+        }
+
+        fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            ready(Ok(CallToolResult::success(vec![]).into()))
+        }
+    }
+
+    /// Pins nested parameter headers through the hook and RBAC-context wrappers.
+    #[tokio::test]
+    async fn nested_param_header_is_enforced_through_both_wrappers() -> anyhow::Result<()> {
+        use rmcp_server_kit::tool_hooks::{ToolHooks, with_hooks};
+
+        // Given: both kit wrappers surround a handler with a nested header schema.
+        let hooks = Arc::new(ToolHooks::new());
+        let base = spawn_server_with(config_on_port(0), move || {
+            with_hooks(NestedHeaderToolHandler, Arc::clone(&hooks))
+        })
+        .await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let cases = [
+            (
+                Some("eu"),
+                serde_json::json!({"target":{"region":"eu"}}),
+                200,
+                None,
+            ),
+            (
+                None,
+                serde_json::json!({"target":{"region":"eu"}}),
+                400,
+                Some("missing Mcp-Param-Region header"),
+            ),
+            (
+                Some("us"),
+                serde_json::json!({"target":{"region":"eu"}}),
+                400,
+                Some("does not match body value"),
+            ),
+            (None, serde_json::json!({}), 200, None),
+        ];
+        let mut observed = Vec::new();
+        // When: matching, missing, mismatching, and absent nested arguments cross HTTP.
+        for (header, arguments, expected, message) in cases {
+            let request = client
+                .post(format!("{}/mcp", base.base))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", "tools/call")
+                .header("Mcp-Name", "route");
+            let request_with_header = match header {
+                Some(value) => request.header("Mcp-Param-Region", value),
+                None => request,
+            };
+            let response = request_with_header
+                .json(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":1_u32, "method":"tools/call",
+                    "params":{"name":"route","arguments":arguments,"_meta":{
+                        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities":{}
+                    }}
+                }))
+                .send()
+                .await?;
+            let status = response.status();
+            let body = mcp_response_json(response).await?;
+            observed.push((status, body, expected, message));
+        }
+        // Then: every outcome follows the schema supplied through both wrappers.
+        for (status, body, expected, message) in observed {
+            assert_eq!(status, expected, "status={status}, body={body}");
+            match message {
+                Some(fragment) => assert!(
+                    body.pointer("/error/message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| text.contains(fragment)),
+                    "status={status}, body={body}"
+                ),
+                None => assert!(body.get("result").is_some(), "status={status}, body={body}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct RecordingToolHandler {
+        called: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct CancellableToolHandler {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        started: Arc<Notify>,
+    }
+
+    impl ServerHandler for CancellableToolHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        #[expect(
+            clippy::integer_division_remainder_used,
+            reason = "external macro: tokio::select"
+        )]
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, rmcp::ErrorData> {
+            if request.name == "wait" {
+                self.events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push("started");
+                self.started.notify_one();
+                tokio::select! {
+                    biased;
+                    () = context.ct.cancelled() => {
+                        self.events.lock().unwrap_or_else(PoisonError::into_inner).push("cancelled");
+                        return Err(rmcp::ErrorData::internal_error("cancelled", None));
+                    }
+                    () = sleep(Duration::from_secs(30)) => {
+                        self.events.lock().unwrap_or_else(PoisonError::into_inner).push("timeout");
+                    }
+                }
+            }
+            if request.name == "quick" {
+                self.events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push("quick");
+            }
+            Ok(CallToolResult::success(vec![]).into())
+        }
+    }
+
+    async fn wait_for_handler_cancellation(
+        events: &StdMutex<Vec<&'static str>>,
+    ) -> anyhow::Result<()> {
+        let observed = timeout(Duration::from_secs(10), async {
+            while !events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&"cancelled")
+            {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let snapshot = events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        observed
+            .with_context(|| format!("missing cancelled event within 10s; events={snapshot:?}"))?;
+        Ok(())
+    }
+
+    /// Pins legacy notification cancellation while retaining the same usable session.
+    #[tokio::test]
+    async fn legacy_session_cancellation_reaches_the_handler() -> anyhow::Result<()> {
+        // Given: a wait tool is in flight on an initialized legacy session.
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let started = Arc::new(Notify::new());
+        let handler = CancellableToolHandler {
+            events: Arc::clone(&events),
+            started: Arc::clone(&started),
+        };
+        let base = spawn_server_with(config_on_port(0), move || handler.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(40))
+            .build()?;
+        let session = mcp_initialize_with_bearer(&client, &base.base, None).await?;
+        let call = tokio::spawn({
+            let call_client = client.clone();
+            let url = format!("{}/mcp", base.base);
+            let call_session = session.clone();
+            async move {
+                let response = call_client.post(url).header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream").header("mcp-session-id", call_session)
+                    .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait"}}"#).send().await?;
+                let body = response.text().await?;
+                Ok::<_, reqwest::Error>(body)
+            }
+        });
+        timeout(Duration::from_secs(10), started.notified())
+            .await
+            .context("wait tool did not start")?;
+        // When: the client cancels request 2 without closing its session.
+        let cancellation_response = client.post(format!("{}/mcp", base.base)).header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream").header("mcp-session-id", &session)
+            .body(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"test"}}"#).send().await?;
+        assert_eq!(cancellation_response.status(), 202);
+        // Then: the handler sees cancellation and the session still serves quick calls.
+        wait_for_handler_cancellation(&events).await?;
+        let response = client
+            .post(format!("{}/mcp", base.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .body(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quick"}}"#)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let body = mcp_response_json(response).await?;
+        assert!(body.get("result").is_some(), "quick call: {body}");
+        call.abort();
+        let snapshot = events.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!snapshot.contains(&"timeout"), "events={snapshot:?}");
+        drop(snapshot);
+        Ok(())
+    }
+
+    /// Pins handler cancellation when a negotiated stateless client disconnects.
+    #[tokio::test]
+    async fn stateless_2026_disconnect_cancels_the_handler() -> anyhow::Result<()> {
+        // Given: a metadata-bearing stateless wait call has reached the handler.
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let started = Arc::new(Notify::new());
+        let handler = CancellableToolHandler {
+            events: Arc::clone(&events),
+            started: Arc::clone(&started),
+        };
+        let base = spawn_server_with(config_on_port(0), move || handler.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(40))
+            .build()?;
+        let call = tokio::spawn({
+            let call_client = client.clone();
+            let url = format!("{}/mcp", base.base);
+            async move {
+                let response = call_client.post(url).header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("MCP-Protocol-Version", "2026-07-28").header("Mcp-Method", "tools/call").header("Mcp-Name", "wait")
+                    .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#).send().await?;
+                pending::<()>().await;
+                Ok::<_, reqwest::Error>(response)
+            }
+        });
+        timeout(Duration::from_secs(10), started.notified())
+            .await
+            .context("stateless wait tool did not start")?;
+        // When: dropping the pending HTTP request or unread response disconnects the client.
+        call.abort();
+        let joined = call.await;
+        assert!(
+            joined.is_err_and(|error| error.is_cancelled()),
+            "client task must be aborted"
+        );
+        // Then: the handler observes cancellation before another stateless request succeeds.
+        wait_for_handler_cancellation(&events).await?;
+        let response = client.post(format!("{}/mcp", base.base)).header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28").header("Mcp-Method", "tools/call").header("Mcp-Name", "quick")
+            .body(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quick","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#).send().await?;
+        assert_eq!(response.status(), 200);
+        let body = mcp_response_json(response).await?;
+        assert!(body.get("result").is_some(), "quick call: {body}");
+        Ok(())
+    }
+
+    impl ServerHandler for RecordingToolHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            self.called
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.name.into_owned());
+            ready(Ok(CallToolResult::success(vec![]).into()))
+        }
+    }
 
     impl ServerHandler for TestHandler {
         fn get_info(&self) -> RmcpServerConfig {
@@ -1200,6 +1516,72 @@ mod tests {
             body.get("result").is_some() || body.get("error").is_some(),
             "{context}: JSON-RPC response must carry result or error: {body}"
         );
+        Ok(())
+    }
+
+    /// Proves malformed parser inputs never dispatch a tool RBAC did not inspect.
+    #[tokio::test]
+    async fn rbac_parser_differential_never_dispatches_an_uninspected_tool() -> anyhow::Result<()> {
+        // Given: an authenticated session permits only the control tool.
+        let (token, hash) = generate_api_key()?;
+        let called = Arc::new(StdMutex::new(Vec::new()));
+        let handler = RecordingToolHandler {
+            called: Arc::clone(&called),
+        };
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("ops", vec!["allowed_tool".into()], vec!["*".into()]),
+        ])));
+        let cfg = config_on_port(0)
+            .with_auth(test_auth_config(vec![ApiKeyEntry::new(
+                "ops-key", hash, "ops",
+            )]))
+            .with_rbac(policy);
+        let base = spawn_server_with(cfg, move || handler.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let session = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+        let bodies = [
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"denied_tool"},"params":{"name":"allowed_tool"}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"denied_tool","name":"allowed_tool"}}"#,
+            r#"{"jsonrpc":"2.0","id":3.0,"method":"tools/call","params":{"name":"denied_tool"}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"allowed_tool"}}"#,
+        ];
+        // When: duplicate fields, a floating id, and the valid control reach the real router.
+        for (index, body) in bodies.into_iter().enumerate() {
+            let response = client
+                .post(format!("{}/mcp", base.base))
+                .bearer_auth(&token)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .body(body)
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            // Then: malformed requests cannot succeed, and only the control is dispatched.
+            match index {
+                0 | 1 => assert!(
+                    !(status == 200 && text.contains("\"result\"")),
+                    "case {index}: {status} {text}"
+                ),
+                2 => assert_eq!(
+                    status, 403,
+                    "float-id denied call: status={status}, body={text}"
+                ),
+                3 => {
+                    assert_eq!(status, 200, "control: status={status}, body={text}");
+                    assert!(
+                        text.contains("\"result\""),
+                        "control must return result: status={status}, body={text}"
+                    );
+                }
+                _ => anyhow::bail!("unexpected parser differential case"),
+            }
+        }
+        let observed = called.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(*observed, vec!["allowed_tool"]);
         Ok(())
     }
 
@@ -3304,6 +3686,1459 @@ mod tests {
         Ok(())
     }
 
+    /// With `challenge_scopes = ["mcp:read"]` and
+    /// `omit_error_on_missing_credential = true`, a request without credentials
+    /// gets the RFC 6750 3.1 bare challenge plus the scope hint, a malformed
+    /// token keeps its `error` parameters after the hint, and neither status
+    /// nor body changes.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn challenge_scope_and_bare_missing_credential() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let (_pem, jwks_body) = generate_oauth_test_keypair("challenge-kid")?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
+            "issuer": "https://idp.challenge.test/realms/challenge",
+            "audience": "mcp-challenge",
+            "jwks_uri": format!("http://localhost:{}/jwks.json", jwks.port()),
+            "allow_http_oauth_urls": true,
+            "ssrf_allowlist": {
+                "hosts": ["localhost"],
+                "cidrs": ["127.0.0.0/8"]
+            },
+            "scopes": [{"scope": "mcp:read", "role": "viewer"}],
+            "challenge_scopes": ["mcp:read"],
+            "omit_error_on_missing_credential": true
+        }))
+        .context("oauth config deserialization")?;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        let port = free_port().await?;
+        let base = spawn_server(
+            config_on_port(port)
+                .with_auth(auth)
+                .with_public_url(format!("http://127.0.0.1:{port}")),
+        )
+        .await?;
+        let url = format!("http://127.0.0.1:{port}/.well-known/oauth-protected-resource/mcp");
+        let client = reqwest::Client::new();
+
+        for (bearer, challenge, body) in [
+            (
+                None,
+                format!(r#"Bearer resource_metadata="{url}", scope="mcp:read""#),
+                "unauthorized: missing credential",
+            ),
+            (
+                Some("a.b.c"),
+                format!(
+                    r#"Bearer resource_metadata="{url}", scope="mcp:read", error="invalid_token", error_description="token is invalid""#
+                ),
+                "unauthorized: invalid credential",
+            ),
+        ] {
+            let unauthenticated = client
+                .post(format!("{base}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            let request = match bearer {
+                Some(token) => unauthenticated.header("authorization", format!("Bearer {token}")),
+                None => unauthenticated,
+            };
+            let resp = request
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0.0.1"}}}"#)
+                .send()
+                .await
+                .context("POST /mcp")?;
+
+            assert_eq!(resp.status(), 401, "{bearer:?}");
+            let challenges: Vec<&str> = resp
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .map(|value| value.to_str())
+                .collect::<Result<_, _>>()
+                .context("challenge is visible ASCII")?;
+            assert_eq!(challenges, [challenge.as_str()], "{bearer:?}");
+            assert_eq!(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+                "{bearer:?}"
+            );
+            assert_eq!(resp.text().await?, body, "{bearer:?}");
+        }
+        Ok(())
+    }
+
+    /// Step-up names a scope that unlocks the call without changing the denial body.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_names_unlocking_scope() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given a read-only token and an admin-first scope mapping.
+        let kid = "step-up-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let token = mint_oauth_test_token(&pem, kid)?;
+        for enabled in [true, false] {
+            let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
+                "issuer": "https://auth.test.local",
+                "audience": "https://mcp.test.local/mcp",
+                "jwks_uri": format!("http://localhost:{}/jwks.json", jwks.port()),
+                "allow_http_oauth_urls": true,
+                "ssrf_allowlist": {"hosts": ["localhost"], "cidrs": ["127.0.0.0/8"]},
+                "scopes": [{"scope": "mcp:admin", "role": "ops"}, {"scope": "mcp:read", "role": "viewer"}],
+                "insufficient_scope_challenge": enabled
+            }))?;
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+                RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
+            ])));
+            let port = free_port().await?;
+            let base = spawn_server(
+                config_on_port(port)
+                    .with_auth(auth)
+                    .with_rbac(policy)
+                    .with_public_url(format!("http://127.0.0.1:{port}")),
+            )
+            .await?;
+
+            // When the caller requests a tool forbidden to its current role.
+            let response = reqwest::Client::new().post(format!("{base}/mcp"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1_u32, "method": "tools/call", "params": {"name": "admin_only", "arguments": {}}}))
+                .send().await?;
+
+            // Then only the opt-in header differs; access remains denied.
+            assert_eq!(response.status(), 403);
+            let expected = enabled.then(|| format!(r#"Bearer error="insufficient_scope", scope="mcp:admin", resource_metadata="http://127.0.0.1:{port}/.well-known/oauth-protected-resource/mcp", error_description="additional scope required""#));
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all("www-authenticate")
+                    .iter()
+                    .map(|value| value.to_str())
+                    .collect::<Result<Vec<_>, _>>()?,
+                expected.as_deref().into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                response.text().await?,
+                "admin_only denied for role 'viewer'"
+            );
+        }
+        Ok(())
+    }
+
+    /// OAuth settings for the step-up mapping-order scenarios.
+    #[cfg(feature = "oauth")]
+    fn step_up_auth(
+        jwks_port: u16,
+        scopes: &serde_json::Value,
+        enabled: bool,
+    ) -> anyhow::Result<AuthConfig> {
+        let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
+            "issuer": "https://auth.test.local",
+            "audience": "https://mcp.test.local/mcp",
+            "jwks_uri": format!("http://localhost:{jwks_port}/jwks.json"),
+            "allow_http_oauth_urls": true,
+            "ssrf_allowlist": {"hosts": ["localhost"], "cidrs": ["127.0.0.0/8"]},
+            "scopes": scopes,
+            "insufficient_scope_challenge": enabled
+        }))?;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        Ok(auth)
+    }
+
+    /// Roles whose names prefix each other, plus a strictly widening chain.
+    #[cfg(feature = "oauth")]
+    fn step_up_e2e_policy() -> Arc<RbacPolicy> {
+        let star = || vec!["*".to_owned()];
+        Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], star()),
+            RoleConfig::new(
+                "viewer-plus",
+                vec!["echo".into(), "admin_only".into()],
+                star(),
+            ),
+            RoleConfig::new("ops-ro", vec!["echo".into()], star()),
+            RoleConfig::new("ops", vec!["echo".into(), "admin_only".into()], star()),
+            RoleConfig::new(
+                "root",
+                vec!["echo".into(), "admin_only".into(), "root_only".into()],
+                star(),
+            ),
+        ])))
+    }
+
+    /// Knob-on versus knob-off comparison of one mapping-order scenario.
+    #[cfg(feature = "oauth")]
+    struct StepUpOrderCase {
+        /// `oauth.scopes` exactly as configured, in order.
+        scopes: serde_json::Value,
+        /// Tool the `mcp:read` token's role is denied.
+        tool: &'static str,
+        /// Role the real JWT resolution assigns to the `mcp:read` token.
+        role: &'static str,
+        /// Whether the server advertises an absolute `public_url`.
+        public_url: bool,
+        /// Scope the knob-on challenge must name, or `None` for a bare 403.
+        hint: Option<&'static str>,
+    }
+
+    /// Mapping lists whose config order differs from sorted order, with a
+    /// duplicate scope, more than two entries, and prefix-related role names.
+    #[cfg(feature = "oauth")]
+    fn step_up_order_cases() -> Vec<StepUpOrderCase> {
+        let map = |scope: &str, role: &str| serde_json::json!({"scope": scope, "role": role});
+        let case = |scopes: Vec<serde_json::Value>, tool, role, public_url, hint| StepUpOrderCase {
+            scopes: serde_json::Value::Array(scopes),
+            tool,
+            role,
+            public_url,
+            hint,
+        };
+        vec![
+            // Read first: adding mcp:admin still resolves to viewer, so no hint.
+            case(
+                vec![map("mcp:read", "viewer"), map("mcp:admin", "ops")],
+                "admin_only",
+                "viewer",
+                true,
+                None,
+            ),
+            // Duplicate scope: the first mcp:admin mapping (ops) wins, never root.
+            case(
+                vec![
+                    map("mcp:admin", "ops"),
+                    map("mcp:admin", "root"),
+                    map("mcp:read", "viewer"),
+                ],
+                "root_only",
+                "viewer",
+                false,
+                None,
+            ),
+            // Config order, not alphabetical order, picks the hint.
+            case(
+                vec![
+                    map("mcp:zeta", "ops"),
+                    map("mcp:alpha", "root"),
+                    map("mcp:read", "viewer"),
+                ],
+                "admin_only",
+                "viewer",
+                true,
+                Some("mcp:zeta"),
+            ),
+            // Only the third of four mappings unlocks the call.
+            case(
+                vec![
+                    map("mcp:x", "ops-ro"),
+                    map("mcp:y", "ops-ro"),
+                    map("mcp:admin", "ops"),
+                    map("mcp:read", "viewer"),
+                ],
+                "admin_only",
+                "viewer",
+                false,
+                Some("mcp:admin"),
+            ),
+            // The current role is a longer name than the unlocking role.
+            case(
+                vec![map("mcp:admin", "ops"), map("mcp:read", "ops-ro")],
+                "admin_only",
+                "ops-ro",
+                true,
+                Some("mcp:admin"),
+            ),
+            // The unlocking role is a longer name than the current role.
+            case(
+                vec![map("mcp:plus", "viewer-plus"), map("mcp:read", "viewer")],
+                "admin_only",
+                "viewer",
+                false,
+                Some("mcp:plus"),
+            ),
+        ]
+    }
+
+    /// Status, step-up challenge, every other header except `date`, and body.
+    #[cfg(feature = "oauth")]
+    type StepUpOutcome = (
+        reqwest::StatusCode,
+        Option<String>,
+        Vec<(String, String)>,
+        String,
+    );
+
+    /// Calls `tool` on a fresh `config` server with `token`, after checking
+    /// that its unauthenticated 401 never carries a scope hint.
+    #[cfg(feature = "oauth")]
+    async fn step_up_outcome(
+        config: McpServerConfig,
+        token: &str,
+        tool: &str,
+    ) -> anyhow::Result<StepUpOutcome> {
+        let base = spawn_server(config).await?;
+        let client = reqwest::Client::new();
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1_u32, "method": "tools/call", "params": {"name": tool, "arguments": {}}});
+        let unauthenticated = client
+            .post(format!("{base}/mcp"))
+            .json(&call)
+            .send()
+            .await?;
+        assert_eq!(unauthenticated.status(), 401);
+        for value in unauthenticated.headers().get_all("www-authenticate") {
+            assert!(!value.to_str()?.contains("insufficient_scope"), "{value:?}");
+        }
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(token)
+            .json(&call)
+            .send()
+            .await?;
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        assert_eq!(
+            response
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .count(),
+            usize::from(challenge.is_some()),
+            "a hinted 403 carries exactly one challenge field"
+        );
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| *name != "date" && *name != "www-authenticate")
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        headers.sort();
+        Ok((status, challenge, headers, response.text().await?))
+    }
+
+    /// `serve()` resolves hints from the configured mapping list as written:
+    /// order, duplicate scopes and prefix-related role names are preserved.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_follows_configured_mapping_order() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given an `mcp:read` token, real JWKS validation and every order case.
+        let kid = "step-up-order-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let token = mint_oauth_test_token(&pem, kid)?;
+        for case in step_up_order_cases() {
+            let port = free_port().await?;
+            let origin = format!("http://127.0.0.1:{port}");
+            // The trailing slash must not leak into the advertised metadata URL.
+            let public_url = case.public_url.then(|| format!("{origin}/"));
+            let mut outcomes = Vec::new();
+            for enabled in [true, false] {
+                let mut config = config_on_port(0)
+                    .with_auth(step_up_auth(jwks.port(), &case.scopes, enabled)?)
+                    .with_rbac(step_up_e2e_policy());
+                if let Some(url) = &public_url {
+                    config = config.with_public_url(url.clone());
+                }
+                // When the token's current role is denied the tool.
+                outcomes.push(step_up_outcome(config, &token, case.tool).await?);
+            }
+            // Then the knob only adds the configured-order hint to the same 403.
+            let metadata = if case.public_url {
+                format!("{origin}/.well-known/oauth-protected-resource/mcp")
+            } else {
+                "/.well-known/oauth-protected-resource".to_owned()
+            };
+            let expected = case.hint.map(|scope| format!(r#"Bearer error="insufficient_scope", scope="{scope}", resource_metadata="{metadata}", error_description="additional scope required""#));
+            let [
+                (on_status, on_challenge, on_headers, on_body),
+                (off_status, off_challenge, off_headers, off_body),
+            ] = outcomes.as_slice()
+            else {
+                anyhow::bail!("expected two outcomes, got {}", outcomes.len());
+            };
+            let label = format!("{} {}", case.scopes, case.tool);
+            assert_eq!(*on_status, 403, "{label}");
+            assert_eq!(*off_status, 403, "{label}");
+            assert_eq!(*on_challenge, expected, "{label}");
+            assert_eq!(*off_challenge, None, "{label}");
+            assert_eq!(on_headers, off_headers, "{label}");
+            assert_eq!(
+                *on_body,
+                format!("{} denied for role '{}'", case.tool, case.role),
+                "{label}"
+            );
+            assert_eq!(off_body, on_body, "{label}");
+        }
+        Ok(())
+    }
+
+    /// Role table that both the matrix server policy and its oracle read:
+    /// role name, allowed tools, and host globs.
+    #[cfg(feature = "oauth")]
+    const STEP_UP_MATRIX_ROLES: [(&str, &[&str], &[&str]); 7] = [
+        ("viewer", &["echo"], &["*"]),
+        ("viewer-plus", &["echo", "admin_only"], &["*"]),
+        ("ops-ro", &["echo"], &["*"]),
+        ("ops", &["echo", "admin_only"], &["*"]),
+        ("root", &["echo", "admin_only", "root_only"], &["*"]),
+        ("prod-admin", &["admin_only"], &["prod-*"]),
+        ("solo-admin", &["admin_only"], &["*"]),
+    ];
+
+    /// One matrix tool call: the tool name and an optional string `host`.
+    #[cfg(feature = "oauth")]
+    type StepUpMatrixCall = (&'static str, Option<&'static str>);
+
+    /// One real-server matrix configuration: tool calls sent as a batch in
+    /// both orientations, with the hint pinned for each orientation.
+    #[cfg(feature = "oauth")]
+    struct StepUpMatrixCase {
+        /// `oauth.scopes` in configuration order.
+        mappings: Vec<(&'static str, &'static str)>,
+        /// The token's `scope` claim.
+        token_scope: &'static str,
+        /// Calls of the batch in order; the other orientation is reversed.
+        calls: Vec<StepUpMatrixCall>,
+        /// Expected knob-on hint for the batch and for its reverse.
+        pins: [Option<&'static str>; 2],
+    }
+
+    /// Orders, duplicates, prefix roles, empty-role mappings held by the token,
+    /// and batches that only a later candidate (or no candidate) fully unlocks.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_cases() -> Vec<StepUpMatrixCase> {
+        let case = |mappings, token_scope, calls: [&'static str; 2], pins| StepUpMatrixCase {
+            mappings,
+            token_scope,
+            calls: calls.map(|tool| (tool, None)).to_vec(),
+            pins,
+        };
+        let (admin, read, root) = (
+            ("mcp:admin", "ops"),
+            ("mcp:read", "viewer"),
+            ("mcp:root", "root"),
+        );
+        let blank = ("mcp:blank", "");
+        let (ops_ro_x, ops_ro_y) = (("mcp:x", "ops-ro"), ("mcp:y", "ops-ro"));
+        let echo_admin = ["echo", "admin_only"];
+        let admin_root = ["admin_only", "root_only"];
+        let both = |scope| [Some(scope), Some(scope)];
+        let none = [None, None];
+        let mut cases = vec![
+            case(vec![admin, read], "mcp:read", echo_admin, both("mcp:admin")),
+            case(vec![read, admin], "mcp:read", echo_admin, none),
+            case(
+                vec![blank, admin, read],
+                "mcp:blank mcp:read",
+                echo_admin,
+                none,
+            ),
+            case(
+                vec![blank, admin, read],
+                "mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![admin, blank, read],
+                "mcp:blank mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![admin, root, read],
+                "mcp:read",
+                admin_root,
+                both("mcp:root"),
+            ),
+            case(vec![admin, read], "mcp:read", ["admin_only", "nope"], none),
+            case(
+                vec![("mcp:zeta", "ops"), ("mcp:alpha", "root"), read],
+                "mcp:read",
+                echo_admin,
+                both("mcp:zeta"),
+            ),
+            case(
+                vec![admin, ("mcp:admin", "root"), read],
+                "mcp:read",
+                admin_root,
+                none,
+            ),
+            case(
+                vec![admin, ("mcp:read", "ops-ro")],
+                "mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![("mcp:plus", "viewer-plus"), read],
+                "mcp:read",
+                ["admin_only", "echo"],
+                both("mcp:plus"),
+            ),
+            case(
+                vec![ops_ro_x, ops_ro_y, admin, read],
+                "mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![root, admin, read],
+                "mcp:read mcp:admin",
+                admin_root,
+                both("mcp:root"),
+            ),
+            case(vec![admin, read], "mcp:admin", ["echo", "root_only"], none),
+            case(
+                vec![ops_ro_x, root, read],
+                "mcp:read",
+                ["echo", "root_only"],
+                both("mcp:root"),
+            ),
+            case(
+                vec![("MCP:ADMIN", "root"), admin, read],
+                "mcp:read",
+                admin_root,
+                both("MCP:ADMIN"),
+            ),
+        ];
+        cases.extend(step_up_matrix_host_and_long_cases());
+        cases
+    }
+
+    /// Three unlocking candidates, non-nested candidate roles, host-restricted
+    /// roles with string hosts in both cases and absent hosts, and batches of
+    /// four to eight calls.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_host_and_long_cases() -> Vec<StepUpMatrixCase> {
+        let case = |mappings, token_scope, calls, pins| StepUpMatrixCase {
+            mappings,
+            token_scope,
+            calls,
+            pins,
+        };
+        let (admin, read, root) = (
+            ("mcp:admin", "ops"),
+            ("mcp:read", "viewer"),
+            ("mcp:root", "root"),
+        );
+        let (prod, solo) = (("mcp:prod", "prod-admin"), ("mcp:solo", "solo-admin"));
+        let on = |host| ("admin_only", Some(host));
+        let (echo, admin_call) = (("echo", None), ("admin_only", None));
+        let both = |scope| [Some(scope), Some(scope)];
+        let none = [None, None];
+        let prod_hosts: Vec<StepUpMatrixCall> = ["prod-1", "prod-2", "PROD-3", "prod-4"]
+            .into_iter()
+            .chain(["prod-5", "prod-6", "prod-7"])
+            .map(on)
+            .collect();
+        let mut prod_then_dev = prod_hosts.clone();
+        prod_then_dev.push(on("dev-1"));
+        vec![
+            case(
+                vec![("mcp:a", "ops"), ("mcp:b", "root"), ("mcp:c", "root"), read],
+                "mcp:read",
+                vec![echo, admin_call],
+                both("mcp:a"),
+            ),
+            case(vec![solo, read], "mcp:read", vec![echo, admin_call], none),
+            case(
+                vec![solo, admin, read],
+                "mcp:read",
+                vec![echo, admin_call],
+                both("mcp:admin"),
+            ),
+            case(
+                vec![prod, read],
+                "mcp:read",
+                vec![on("dev-1"), on("prod-1")],
+                none,
+            ),
+            case(
+                vec![prod, read],
+                "mcp:read",
+                vec![on("prod-1"), on("PROD-2")],
+                both("mcp:prod"),
+            ),
+            case(
+                vec![prod, read],
+                "mcp:read",
+                vec![on("prod-1"), admin_call],
+                both("mcp:prod"),
+            ),
+            case(
+                vec![prod, root, read],
+                "mcp:read",
+                vec![on("dev-1"), on("prod-1")],
+                both("mcp:root"),
+            ),
+            case(
+                vec![admin, prod],
+                "mcp:prod",
+                vec![on("dev-1"), on("prod-1")],
+                both("mcp:admin"),
+            ),
+            case(
+                vec![prod, admin],
+                "mcp:prod",
+                vec![on("dev-1"), on("prod-1")],
+                none,
+            ),
+            case(
+                vec![admin, read],
+                "mcp:read",
+                vec![admin_call, admin_call, admin_call, ("nope", None)],
+                none,
+            ),
+            case(
+                vec![admin, read],
+                "mcp:read",
+                vec![echo, admin_call, echo, admin_call, on("dev-9")],
+                both("mcp:admin"),
+            ),
+            case(vec![prod, read], "mcp:read", prod_then_dev, none),
+            case(vec![prod, read], "mcp:read", prod_hosts, both("mcp:prod")),
+        ]
+    }
+
+    /// Independent host glob rule: `*` matches any host, `prefix*` matches by
+    /// prefix, anything else matches exactly, all ASCII-case-insensitively.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_host_matches(glob: &str, host: &str) -> bool {
+        let (pattern, name) = (glob.to_ascii_lowercase(), host.to_ascii_lowercase());
+        pattern
+            .strip_suffix('*')
+            .map_or(pattern == name, |prefix| name.starts_with(prefix))
+    }
+
+    /// Whether `role` may make `call` per [`STEP_UP_MATRIX_ROLES`]: the tool
+    /// is allowed and a string host, when present, matches a host glob.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_allows(role: &str, (tool, host): StepUpMatrixCall) -> bool {
+        STEP_UP_MATRIX_ROLES.iter().any(|(name, tools, globs)| {
+            *name == role
+                && tools.contains(&tool)
+                && host.is_none_or(|requested| {
+                    globs
+                        .iter()
+                        .any(|glob| step_up_matrix_host_matches(glob, requested))
+                })
+        })
+    }
+
+    /// Real `resolve_role` semantics: the first mapping in configuration
+    /// order whose scope is granted wins, whatever the token order.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_resolve(
+        mappings: &[(&'static str, &'static str)],
+        granted: &[&str],
+    ) -> Option<&'static str> {
+        mappings
+            .iter()
+            .find(|(scope, _)| granted.contains(scope))
+            .map(|(_, role)| *role)
+    }
+
+    /// Independent oracle: the resolved role, the first denied tool, and the
+    /// first configured scope whose addition changes the role to one that
+    /// passes every call of the batch.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_oracle(
+        case: &StepUpMatrixCase,
+        batch: &[StepUpMatrixCall],
+    ) -> anyhow::Result<(&'static str, Option<&'static str>, Option<&'static str>)> {
+        let granted: Vec<&str> = case.token_scope.split_whitespace().collect();
+        let current = step_up_matrix_resolve(&case.mappings, &granted)
+            .context("the token scope must resolve to a role")?;
+        let denied = batch
+            .iter()
+            .copied()
+            .find(|call| !step_up_matrix_allows(current, *call))
+            .map(|(tool, _host)| tool);
+        let hint = denied.and_then(|_| {
+            case.mappings.iter().map(|(scope, _)| *scope).find(|scope| {
+                let mut union = granted.clone();
+                union.push(*scope);
+                step_up_matrix_resolve(&case.mappings, &union).is_some_and(|role| {
+                    role != current && batch.iter().all(|call| step_up_matrix_allows(role, *call))
+                })
+            })
+        });
+        Ok((current, denied, hint))
+    }
+
+    /// A signed `mcp` token carrying `scope`.
+    #[cfg(feature = "oauth")]
+    fn mint_scoped_oauth_test_token(pem: &str, kid: &str, scope: &str) -> anyhow::Result<String> {
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+            .context("encoding key from PEM")?;
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://auth.test.local",
+            "aud": "https://mcp.test.local/mcp",
+            "sub": "step-up-matrix",
+            "scope": scope,
+            "exp": now.saturating_add(3600),
+            "iat": now
+        });
+        jsonwebtoken::encode(&header, &claims, &key).context("JWT encoding")
+    }
+
+    /// Status, every challenge field, every other header except `date`, and body.
+    #[cfg(feature = "oauth")]
+    type StepUpBatchOutcome = (
+        reqwest::StatusCode,
+        Vec<String>,
+        Vec<(String, String)>,
+        String,
+    );
+
+    /// Sends `batch` as a JSON-RPC batch of `tools/call` requests.
+    #[cfg(feature = "oauth")]
+    async fn step_up_batch_outcome(
+        base: &str,
+        token: &str,
+        batch: &[StepUpMatrixCall],
+    ) -> anyhow::Result<StepUpBatchOutcome> {
+        let body: Vec<serde_json::Value> = batch
+            .iter()
+            .zip(1_u32..)
+            .map(|((tool, host), id)| {
+                let arguments = host.map_or_else(
+                    || serde_json::json!({}),
+                    |name| serde_json::json!({"host": name}),
+                );
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": tool, "arguments": arguments}})
+            })
+            .collect();
+        let response = reqwest::Client::new()
+            .post(format!("{base}/mcp"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let challenges = response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(|value| value.to_str().map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| *name != "date" && *name != "www-authenticate")
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        headers.sort();
+        Ok((status, challenges, headers, response.text().await?))
+    }
+
+    /// Runs `cases` against real servers: every configuration, both batch
+    /// orientations and both knob states must agree with the independent
+    /// oracle, and the knob only ever adds one challenge field to an
+    /// otherwise identical 403. One server per configuration and knob state.
+    #[cfg(feature = "oauth")]
+    async fn step_up_matrix_check(cases: &[StepUpMatrixCase]) -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given real JWKS validation and a policy built from the oracle's
+        // role table.
+        let kid = "step-up-matrix-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(
+            STEP_UP_MATRIX_ROLES
+                .iter()
+                .map(|(role, tools, hosts)| {
+                    RoleConfig::new(
+                        *role,
+                        tools.iter().map(|tool| (*tool).to_owned()).collect(),
+                        hosts.iter().map(|host| (*host).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+        )));
+        for case in cases {
+            let token = mint_scoped_oauth_test_token(&pem, kid, case.token_scope)?;
+            let scopes: Vec<serde_json::Value> = case
+                .mappings
+                .iter()
+                .map(|(scope, role)| serde_json::json!({"scope": scope, "role": role}))
+                .collect();
+            let reversed: Vec<StepUpMatrixCall> = case.calls.iter().rev().copied().collect();
+            let batches = [case.calls.clone(), reversed];
+            let mut outcomes = Vec::new();
+            for enabled in [true, false] {
+                let base = spawn_server(
+                    config_on_port(0)
+                        .with_auth(step_up_auth(
+                            jwks.port(),
+                            &serde_json::Value::Array(scopes.clone()),
+                            enabled,
+                        )?)
+                        .with_rbac(Arc::clone(&policy)),
+                )
+                .await?;
+                // When both batch orientations reach the same server.
+                for batch in &batches {
+                    outcomes.push(step_up_batch_outcome(&base.to_string(), &token, batch).await?);
+                }
+            }
+            let [on_ab, on_ba, off_ab, off_ba] = outcomes.as_slice() else {
+                anyhow::bail!("expected four outcomes, got {}", outcomes.len());
+            };
+            // Then each outcome matches the oracle and the pinned hint, and
+            // knob on and off differ only by that single challenge field.
+            for ((batch, pin), (on, off)) in batches
+                .iter()
+                .zip(case.pins)
+                .zip([(on_ab, off_ab), (on_ba, off_ba)])
+            {
+                let label = format!("{:?} {:?} {batch:?}", case.mappings, case.token_scope);
+                let (current, first_denied, hint) = step_up_matrix_oracle(case, batch)?;
+                assert_eq!(hint, pin, "oracle disagrees with the pin: {label}");
+                let denied = first_denied.context("every matrix batch is denied")?;
+                let expected = hint.map(|scope| format!(r#"Bearer error="insufficient_scope", scope="{scope}", resource_metadata="/.well-known/oauth-protected-resource", error_description="additional scope required""#));
+                let (on_status, on_challenges, on_headers, on_body) = on;
+                let (off_status, off_challenges, off_headers, off_body) = off;
+                assert_eq!(*on_status, 403, "{label}");
+                assert_eq!(
+                    *on_body,
+                    format!("{denied} denied for role '{current}'"),
+                    "{label}"
+                );
+                assert_eq!(
+                    *on_challenges,
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "{label}"
+                );
+                assert!(off_challenges.is_empty(), "{label}: {off_challenges:?}");
+                assert_eq!(off_status, on_status, "{label}");
+                assert_eq!(off_headers, on_headers, "{label}");
+                assert_eq!(off_body, on_body, "{label}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Real-server matrix: every configuration, both batch orientations and
+    /// both knob states agree with an independent oracle built from the real
+    /// role resolution rule and the policy table, and the knob only ever adds
+    /// one challenge field to an otherwise identical 403.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_matrix_matches_independent_oracle() -> anyhow::Result<()>
+    {
+        // Given every `mcp:<word>`-shaped matrix configuration.
+        let cases = step_up_matrix_cases();
+        // When and Then: each configuration agrees with the oracle.
+        step_up_matrix_check(&cases).await?;
+        assert!(cases.len() >= 29, "{} configurations", cases.len());
+        assert!(
+            cases.iter().any(|case| case.calls.len() >= 8),
+            "an eight-call batch is covered"
+        );
+        Ok(())
+    }
+
+    /// A 200-byte scope token (namespace prefix plus 49 `long` words).
+    #[cfg(feature = "oauth")]
+    const STEP_UP_LONG_SCOPE: &str = concat!(
+        "mcp:",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "long",
+    );
+
+    /// Scope spellings real authorization servers use, all valid RFC 6750
+    /// scope tokens: un-namespaced, empty or leading namespace, nested
+    /// namespaces, dots, slashes, URLs, dashes and underscores, upper and
+    /// mixed case, digits, a 200-byte token, `~ % +` and the remaining
+    /// punctuation, and a scope spelled like a role name.
+    #[cfg(feature = "oauth")]
+    const STEP_UP_SCOPE_ALPHABET: [&str; 20] = [
+        "read",
+        "admin",
+        "mcp:",
+        ":read",
+        "a:b:c",
+        "mcp.read",
+        "api/read",
+        "https://example.test/scope/read",
+        "mcp:read-only",
+        "mcp_admin",
+        "READ",
+        "Mcp:Admin",
+        "mcp:v2",
+        "scope42",
+        STEP_UP_LONG_SCOPE,
+        "mcp:~a%2B+b",
+        "!#$&'()*,;<=>?@[]^`{|}",
+        "ops",
+        "viewer",
+        "urn:example:mcp:tools.admin",
+    ];
+
+    /// For every alphabet scope `s` next to `mcp:read`: `s` first and
+    /// unlocking is the hint; `s` first and held keeps the role, so no hint
+    /// (the step-up loop shape). Then hand-pinned mixes of alphabet scopes,
+    /// case variants of one word, role-name scopes and tokens separated by
+    /// Unicode whitespace.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_alphabet_cases() -> Vec<StepUpMatrixCase> {
+        let case = |mappings, token_scope, calls: [&'static str; 2], pins| StepUpMatrixCase {
+            mappings,
+            token_scope,
+            calls: calls.map(|tool| (tool, None)).to_vec(),
+            pins,
+        };
+        let echo_admin = ["echo", "admin_only"];
+        let admin_root = ["admin_only", "root_only"];
+        let both = |scope| [Some(scope), Some(scope)];
+        let none = [None, None];
+        let url = "https://example.test/scope/read";
+        let mut cases: Vec<StepUpMatrixCase> = STEP_UP_SCOPE_ALPHABET
+            .into_iter()
+            .flat_map(|scope| {
+                [
+                    case(
+                        vec![(scope, "ops"), ("mcp:read", "viewer")],
+                        "mcp:read",
+                        echo_admin,
+                        both(scope),
+                    ),
+                    case(
+                        vec![(scope, "viewer"), ("mcp:read", "ops")],
+                        scope,
+                        echo_admin,
+                        none,
+                    ),
+                ]
+            })
+            .collect();
+        cases.extend([
+            case(
+                vec![(url, "root"), ("api/read", "viewer"), ("mcp:", "ops")],
+                "read\u{3000}mcp:\u{a0}api/read",
+                echo_admin,
+                both(url),
+            ),
+            case(
+                vec![("api/read", "viewer"), ("mcp:", "ops"), (url, "root")],
+                "read\u{3000}mcp:\u{a0}api/read",
+                echo_admin,
+                none,
+            ),
+            case(
+                vec![("READ", "root"), ("read", "viewer")],
+                "read",
+                admin_root,
+                both("READ"),
+            ),
+            case(
+                vec![("read", "viewer"), ("READ", "ops")],
+                "READ\u{2003}Read",
+                admin_root,
+                none,
+            ),
+            case(
+                vec![("viewer", "ops"), ("ops", "viewer")],
+                "ops",
+                echo_admin,
+                both("viewer"),
+            ),
+            case(
+                vec![("ops", "viewer"), ("viewer", "ops")],
+                "ops\tmcp:read",
+                echo_admin,
+                none,
+            ),
+            case(
+                vec![
+                    ("a:b:c", "ops"),
+                    (STEP_UP_LONG_SCOPE, "root"),
+                    (":read", "viewer"),
+                ],
+                "\u{2003}:read\n",
+                admin_root,
+                both(STEP_UP_LONG_SCOPE),
+            ),
+            case(
+                vec![
+                    ("mcp.read", "ops"),
+                    ("mcp:~a%2B+b", "root"),
+                    ("mcp:", "viewer"),
+                ],
+                "mcp:\u{3000}other",
+                admin_root,
+                both("mcp:~a%2B+b"),
+            ),
+            case(
+                vec![("mcp:", "viewer"), ("mcp:~a%2B+b", "root")],
+                "mcp:\u{85}mcp:~a%2B+b",
+                admin_root,
+                none,
+            ),
+        ]);
+        cases
+    }
+
+    /// The real-server matrix over the scope alphabet: for every alphabet
+    /// scope the knob-on hint is the oracle's first unlocking scope in
+    /// configuration order, and knob off is a bare 403. Fixtures built only
+    /// from `mcp:<word>` scopes cannot catch a simulation that loses or
+    /// rewrites mappings or granted scopes of another shape.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_scope_alphabet_matches_independent_oracle()
+    -> anyhow::Result<()> {
+        // Given every alphabet configuration.
+        let cases = step_up_matrix_alphabet_cases();
+        // When and Then: each configuration agrees with the oracle.
+        step_up_matrix_check(&cases).await?;
+        assert_eq!(STEP_UP_LONG_SCOPE.len(), 200, "the long scope is 200 bytes");
+        assert!(
+            cases.len() >= 2 * STEP_UP_SCOPE_ALPHABET.len() + 9,
+            "{} configurations",
+            cases.len()
+        );
+        Ok(())
+    }
+
+    /// The quoted `resource_metadata` parameter of every `WWW-Authenticate` field.
+    #[cfg(feature = "oauth")]
+    fn resource_metadata_params(response: &reqwest::Response) -> anyhow::Result<Vec<String>> {
+        response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(|value| {
+                let (_, rest) = value
+                    .to_str()?
+                    .split_once("resource_metadata=\"")
+                    .context("challenge carries resource_metadata")?;
+                let (url, _) = rest.split_once('"').context("closing quote")?;
+                Ok(url.to_owned())
+            })
+            .collect()
+    }
+
+    /// With a mixed-case `public_url` the step-up challenge advertises the
+    /// 401 challenge's `resource_metadata` byte for byte, next to the
+    /// case-preserving metadata `resource`, and with the knob on an allowed
+    /// `tools/list` carries no `WWW-Authenticate` field at all.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_reuses_the_401_metadata_url_verbatim()
+    -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given real JWKS validation, the knob on, and a public_url whose
+        // host and path carry upper-case letters.
+        let kid = "step-up-case-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let public_url = "http://MCP.Example.test:8443/Tenant";
+        let scopes = serde_json::json!([
+            {"scope": "mcp:admin", "role": "ops"},
+            {"scope": "mcp:read", "role": "viewer"}
+        ]);
+        let base = spawn_server(
+            config_on_port(0)
+                .with_auth(step_up_auth(jwks.port(), &scopes, true)?)
+                .with_rbac(step_up_e2e_policy())
+                .with_public_url(public_url),
+        )
+        .await?;
+        let token = mint_scoped_oauth_test_token(&pem, kid, "mcp:read")?;
+        let client = reqwest::Client::new();
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1_u32, "method": "tools/call", "params": {"name": "admin_only", "arguments": {}}});
+
+        // When the same denied call arrives without and with the token, and
+        // the token then lists tools in an initialized session.
+        let unauthenticated = client
+            .post(format!("{base}/mcp"))
+            .json(&call)
+            .send()
+            .await?;
+        let denied = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&token)
+            .json(&call)
+            .send()
+            .await?;
+        let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+        let listed = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .send()
+            .await?;
+        let prm: serde_json::Value = client
+            .get(format!("{base}/.well-known/oauth-protected-resource/mcp"))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        // Then both challenges name the same case-preserving metadata URL.
+        let metadata = format!("{public_url}/.well-known/oauth-protected-resource/mcp");
+        assert_eq!(unauthenticated.status(), 401);
+        assert_eq!(
+            resource_metadata_params(&unauthenticated)?,
+            [metadata.as_str()]
+        );
+        assert_eq!(denied.status(), 403);
+        assert_eq!(resource_metadata_params(&denied)?, [metadata.as_str()]);
+        assert_eq!(
+            prm.get("resource").and_then(serde_json::Value::as_str),
+            Some(format!("{public_url}/mcp").as_str())
+        );
+        // And the allowed listing is never decorated.
+        assert_eq!(listed.status(), 200);
+        assert_eq!(
+            listed.headers().get_all("www-authenticate").iter().count(),
+            0
+        );
+        Ok(())
+    }
+
+    /// `iss` of every audience-widening token and the configured issuer.
+    #[cfg(feature = "oauth")]
+    const AUDIENCE_ISSUER: &str = "https://idp.audience.test/realms/audience";
+
+    /// Mock IdP serving a fresh signing key for the audience-widening tests.
+    #[cfg(feature = "oauth")]
+    struct AudienceIdp {
+        /// The dual-stack JWKS mock; kept alive for the test's duration.
+        jwks: DualStackMock,
+        /// PKCS#8 PEM of the signing key.
+        pem: String,
+    }
+
+    #[cfg(feature = "oauth")]
+    impl AudienceIdp {
+        /// `kid` of the signing key.
+        const KID: &'static str = "audience-kid";
+
+        /// Starts the JWKS mock.
+        async fn start() -> anyhow::Result<Self> {
+            use wiremock::{Mock, ResponseTemplate, matchers};
+
+            let (pem, jwks_body) = generate_oauth_test_keypair(Self::KID)?;
+            let jwks = DualStackMock::start().await?;
+            jwks.mount(|| {
+                Mock::given(matchers::method("GET"))
+                    .and(matchers::path("/jwks.json"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+            })
+            .await;
+            Ok(Self { jwks, pem })
+        }
+
+        /// Direct-mode OAuth config with audience `mcp-audience` plus `extra`
+        /// top-level keys.
+        fn oauth(&self, extra: &serde_json::Value) -> anyhow::Result<OAuthConfig> {
+            let mut json = serde_json::json!({
+                "issuer": AUDIENCE_ISSUER,
+                "audience": "mcp-audience",
+                "jwks_uri": format!("http://localhost:{}/jwks.json", self.jwks.port()),
+                "allow_http_oauth_urls": true,
+                "ssrf_allowlist": {
+                    "hosts": ["localhost"],
+                    "cidrs": ["127.0.0.0/8"]
+                },
+                "scopes": [{"scope": "mcp:read", "role": "viewer"}]
+            });
+            let object = json
+                .as_object_mut()
+                .context("oauth document is an object")?;
+            for (key, value) in extra
+                .as_object()
+                .context("extra oauth keys are an object")?
+            {
+                drop(object.insert(key.clone(), value.clone()));
+            }
+            serde_json::from_value(json).context("oauth config deserialization")
+        }
+
+        /// A valid `mcp:read` token whose claims carry `aud` and, when given,
+        /// `azp`.
+        fn token(&self, aud: &serde_json::Value, azp: Option<&str>) -> anyhow::Result<String> {
+            let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(self.pem.as_bytes())
+                .context("encoding key from PEM")?;
+            let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            header.kid = Some(Self::KID.into());
+            let now = jsonwebtoken::get_current_timestamp();
+            let mut claims = serde_json::json!({
+                "iss": AUDIENCE_ISSUER,
+                "aud": aud,
+                "sub": "audience-user",
+                "scope": "mcp:read",
+                "exp": now.saturating_add(3600),
+                "iat": now
+            });
+            if let Some(authorized_party) = azp {
+                drop(
+                    claims
+                        .as_object_mut()
+                        .context("claims are an object")?
+                        .insert("azp".to_owned(), serde_json::Value::from(authorized_party)),
+                );
+            }
+            jsonwebtoken::encode(&header, &claims, &encoding_key).context("JWT encoding")
+        }
+    }
+
+    /// Spawns an OAuth-only server whose `public_url` is its own origin and
+    /// returns it with that origin.
+    #[cfg(feature = "oauth")]
+    async fn spawn_audience_server(oauth: OAuthConfig) -> anyhow::Result<(ServerHarness, String)> {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        let port = free_port().await?;
+        let public_url = format!("http://127.0.0.1:{port}");
+        let server = spawn_server(
+            config_on_port(port)
+                .with_auth(auth)
+                .with_public_url(public_url.clone()),
+        )
+        .await?;
+        Ok((server, public_url))
+    }
+
+    /// Initializes a session with `token`, then returns the `tools/list`
+    /// status and the number of listed tools.
+    #[cfg(feature = "oauth")]
+    async fn tools_list_with_token(base: &str, token: &str) -> anyhow::Result<(u16, usize)> {
+        let client = reqwest::Client::new();
+        let session_id = mcp_initialize_with_bearer(&client, base, Some(token)).await?;
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .send()
+            .await
+            .context("tools/list request")?;
+        let status = resp.status().as_u16();
+        let body = mcp_response_json(resp).await?;
+        let tools = body
+            .get("result")
+            .and_then(|result| result.get("tools"))
+            .and_then(serde_json::Value::as_array)
+            .context("tools/list result carries a tools array")?;
+        Ok((status, tools.len()))
+    }
+
+    /// With `accept_resource_audience = true` and `public_url` set, a token
+    /// whose `aud` is `{public_url}/mcp` (alone or inside an array)
+    /// authenticates and lists tools; near misses of that URL, another
+    /// resource, and an azp-only match on it stay rejected with 401 under the
+    /// default strict mode.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn resource_audience_accepted_when_opted_in() -> anyhow::Result<()> {
+        let idp = AudienceIdp::start().await?;
+        let (server, public_url) = spawn_audience_server(
+            idp.oauth(&serde_json::json!({ "accept_resource_audience": true }))?,
+        )
+        .await?;
+        let resource = format!("{public_url}/mcp");
+
+        for aud in [
+            serde_json::json!(resource),
+            serde_json::json!(["https://other.example/mcp", resource]),
+        ] {
+            let token = idp.token(&aud, None)?;
+            assert_eq!(
+                tools_list_with_token(&server.base, &token).await?,
+                (200, 0),
+                "aud={aud}"
+            );
+        }
+
+        let port = public_url.rsplit(':').next().context("public_url port")?;
+        let client = reqwest::Client::new();
+        let mut rejected = 0_usize;
+        for (aud, azp) in [
+            (format!("{resource}/"), None),
+            (public_url.clone(), None),
+            (format!("http://localhost:{port}/mcp"), None),
+            (format!("https://127.0.0.1:{port}/mcp"), None),
+            (format!("http://user@127.0.0.1:{port}/mcp"), None),
+            (format!("HTTP://127.0.0.1:{port}/MCP"), None),
+            ("https://other.example/mcp".to_owned(), None),
+            (
+                "https://other.example/mcp".to_owned(),
+                Some(resource.as_str()),
+            ),
+        ] {
+            let token = idp.token(&serde_json::json!(aud), azp)?;
+            assert_eq!(
+                initialize_status(&client, &server.base, &token).await?,
+                401,
+                "aud={aud} azp={azp:?}"
+            );
+            rejected = rejected.saturating_add(1);
+        }
+        assert_eq!(rejected, 8);
+        Ok(())
+    }
+
+    /// With `additional_audiences = ["https://alt.example/mcp"]`, a token for
+    /// that audience authenticates and lists tools, the configured
+    /// `audience` still does, and the server's own resource URL is not
+    /// implicitly accepted (`accept_resource_audience` is off).
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn additional_audience_accepted_when_listed() -> anyhow::Result<()> {
+        let idp = AudienceIdp::start().await?;
+        let (server, public_url) = spawn_audience_server(
+            idp.oauth(&serde_json::json!({ "additional_audiences": ["https://alt.example/mcp"] }))?,
+        )
+        .await?;
+
+        for aud in ["https://alt.example/mcp", "mcp-audience"] {
+            let token = idp.token(&serde_json::json!(aud), None)?;
+            assert_eq!(
+                tools_list_with_token(&server.base, &token).await?,
+                (200, 0),
+                "aud={aud}"
+            );
+        }
+
+        let client = reqwest::Client::new();
+        for aud in [
+            format!("{public_url}/mcp"),
+            "https://alt.example/mcp/".to_owned(),
+        ] {
+            let token = idp.token(&serde_json::json!(aud), None)?;
+            assert_eq!(
+                initialize_status(&client, &server.base, &token).await?,
+                401,
+                "aud={aud}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The PRM `resource` and the accepted resource audience are one value.
+    ///
+    /// With `public_url` on a host other than the bind host and the knob on,
+    /// both PRM locations advertise `{public_url}/mcp`, and a token whose
+    /// `aud` is exactly that advertised string authenticates, while a token
+    /// for a resource derived from the bind address is rejected.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn prm_resource_equals_accepted_resource_audience() -> anyhow::Result<()> {
+        let idp = AudienceIdp::start().await?;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(idp.oauth(&serde_json::json!({ "accept_resource_audience": true }))?);
+        let port = free_port().await?;
+        let public_url = "https://mcp.example.test";
+        let server = spawn_server(
+            config_on_port(port)
+                .with_auth(auth)
+                .with_public_url(public_url),
+        )
+        .await?;
+        let client = reqwest::Client::new();
+
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ] {
+            let prm: serde_json::Value = client
+                .get(format!("{}{path}", server.base))
+                .send()
+                .await
+                .context("PRM request")?
+                .json()
+                .await
+                .context("PRM body")?;
+            assert_eq!(
+                prm.get("resource").and_then(serde_json::Value::as_str),
+                Some("https://mcp.example.test/mcp"),
+                "{path}"
+            );
+        }
+
+        let token = idp.token(&serde_json::json!("https://mcp.example.test/mcp"), None)?;
+        assert_eq!(tools_list_with_token(&server.base, &token).await?, (200, 0));
+        let bind_token = idp.token(&serde_json::json!(format!("{}/mcp", server.base)), None)?;
+        assert_eq!(
+            initialize_status(&client, &server.base, &bind_token).await?,
+            401
+        );
+        Ok(())
+    }
+
     // ==========================================================================
     // BUG-NEW: shutdown timeout double-signal regression test
     // ==========================================================================
@@ -4234,5 +6069,1767 @@ mod tests {
             .context("server task panicked")?
             .context("server shutdown returned an error")?;
         Ok(())
+    }
+
+    // ==========================================================================
+    // Compat oracle: the 3.20.0 wire behaviour of an unchanged config
+    // ==========================================================================
+
+    /// Byte-level oracle for the wire behaviour an operator observes with an
+    /// unchanged 3.20.0 config (no post-3.20.0 knob set anywhere).
+    ///
+    /// Every expected value below was captured from the unmodified 3.20.0
+    /// tree and pasted verbatim; only the ephemeral ports are interpolated. A
+    /// failing test here means a wire change for an unchanged config: fix the
+    /// change, never the snapshot.
+    #[cfg(feature = "oauth")]
+    mod compat_3_20 {
+        use alloc::collections::BTreeMap;
+        use std::sync::LazyLock;
+
+        use reqwest::redirect::Policy;
+        use rmcp_server_kit::transport::SecurityHeadersConfig;
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        use super::*;
+
+        /// `kid` of the mock IdP signing key.
+        const KID: &str = "compat-kid";
+        /// `issuer` of the OAuth config and `iss` of every minted token.
+        const ISSUER: &str = "https://idp.compat.test/realms/compat";
+        /// The single configured `audience`.
+        const AUDIENCE: &str = "mcp-compat";
+        /// Raw JSON the mock IdP `/token` endpoint answers with.
+        const UPSTREAM_TOKEN_BODY: &str = r#"{"access_token":"upstream-at","token_type":"Bearer","expires_in":300,"scope":"mcp:read"}"#;
+        /// MCP `initialize` request body used for every `POST /mcp` probe.
+        const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"compat","version":"0.0.1"}}}"#;
+        /// RFC 7636 appendix B `code_challenge` (43 characters).
+        const CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        /// RFC 7636 appendix B `code_verifier`.
+        const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        /// `redirect_uri` every proxy probe sends, form-encoded.
+        const REDIRECT_URI_ENCODED: &str = "http%3A%2F%2F127.0.0.1%3A9%2Fcb";
+        /// 401 body for a request without any credential.
+        const MISSING_CREDENTIAL: &str = "unauthorized: missing credential";
+        /// 401 body for a credential that fails validation.
+        const INVALID_CREDENTIAL: &str = "unauthorized: invalid credential";
+        /// 401 body for an expired token.
+        const EXPIRED_CREDENTIAL: &str = "unauthorized: expired credential";
+        /// JSON body of the router fallback and of every unmounted route.
+        const NOT_FOUND_BODY: &str =
+            r#"{"error":"not_found","error_description":"The requested endpoint does not exist"}"#;
+        /// JSON body of the passthrough `/register` stub for the probe request.
+        const REGISTER_BODY: &str = r#"{"client_id":"static-client","client_name":"compat","redirect_uris":["http://127.0.0.1:9/cb"],"token_endpoint_auth_method":"none"}"#;
+        /// `content-type` of every plain-text 401/403 body.
+        const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+        /// The 11 security headers 3.20.0 puts on every plaintext response.
+        /// Kept local (not shared with [`default_security_header_values`]) so
+        /// an edit to a shared helper can never silently move the oracle.
+        const DEFAULT_SECURITY_HEADERS: [(&str, &str); 11] = [
+            ("cache-control", "no-store, max-age=0"),
+            (
+                "content-security-policy",
+                "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+            ),
+            ("cross-origin-embedder-policy", "require-corp"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+            (
+                "permissions-policy",
+                "accelerometer=(), camera=(), geolocation=(), microphone=()",
+            ),
+            ("referrer-policy", "no-referrer"),
+            ("x-content-type-options", "nosniff"),
+            ("x-dns-prefetch-control", "off"),
+            ("x-frame-options", "deny"),
+            ("x-permitted-cross-domain-policies", "none"),
+        ];
+        /// C15 operator `Content-Security-Policy` override.
+        const C15_CSP: &str = "default-src 'none'; sandbox";
+        /// C15 operator `Referrer-Policy` override.
+        const C15_REFERRER_POLICY: &str = "strict-origin";
+        /// C15 operator `Cache-Control` override.
+        const C15_CACHE_CONTROL: &str = "no-store";
+        /// The security headers with the three C15 overrides applied.
+        const C15_SECURITY_HEADERS: [(&str, &str); 11] = [
+            ("cache-control", C15_CACHE_CONTROL),
+            ("content-security-policy", C15_CSP),
+            ("cross-origin-embedder-policy", "require-corp"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+            (
+                "permissions-policy",
+                "accelerometer=(), camera=(), geolocation=(), microphone=()",
+            ),
+            ("referrer-policy", C15_REFERRER_POLICY),
+            ("x-content-type-options", "nosniff"),
+            ("x-dns-prefetch-control", "off"),
+            ("x-frame-options", "deny"),
+            ("x-permitted-cross-domain-policies", "none"),
+        ];
+
+        /// One RSA keypair for the whole module: generating a 2048-bit key in
+        /// an unoptimized build costs seconds, and no scenario needs its own.
+        static KEYPAIR: LazyLock<Result<(String, serde_json::Value), String>> =
+            LazyLock::new(|| generate_oauth_test_keypair(KID).map_err(|err| format!("{err:#}")));
+
+        /// The exact response an unchanged config produces: status, every
+        /// header except `date` (each name's values in `HeaderMap::get_all`
+        /// order) and the raw body bytes.
+        struct WireSnapshot {
+            /// HTTP status code.
+            status: u16,
+            /// Every `(name, value)` pair except `date`; a repeated name lists
+            /// its values in wire order.
+            headers: Vec<(&'static str, String)>,
+            /// Raw body; every captured body is ASCII.
+            body: String,
+        }
+
+        impl WireSnapshot {
+            /// A snapshot with `status`, `body` and no headers yet.
+            fn new(status: u16, body: &str) -> Self {
+                Self {
+                    status,
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                }
+            }
+
+            /// Appends literal header pairs in order.
+            fn headers(mut self, pairs: &[(&'static str, &str)]) -> Self {
+                self.headers
+                    .extend(pairs.iter().map(|&(name, value)| (name, value.to_owned())));
+                self
+            }
+
+            /// Appends one header whose value is built at run time.
+            fn header(mut self, name: &'static str, value: String) -> Self {
+                self.headers.push((name, value));
+                self
+            }
+
+            /// Appends `content-length` computed from the expected body, for
+            /// bodies that embed an ephemeral port.
+            fn content_length(self) -> Self {
+                let length = self.body.len().to_string();
+                self.header("content-length", length)
+            }
+        }
+
+        /// Groups `headers` by name, keeping each name's values in
+        /// `HeaderMap::get_all` order. `date` is excluded: it carries the
+        /// wall-clock time of the response, the only non-deterministic header
+        /// these scenarios produce.
+        fn header_multimap(headers: &HeaderMap) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+            let mut grouped = BTreeMap::new();
+            for name in headers.keys() {
+                if name.as_str() == "date" {
+                    continue;
+                }
+                let mut values = Vec::new();
+                for value in headers.get_all(name) {
+                    values.push(
+                        value
+                            .to_str()
+                            .with_context(|| format!("header {name} is visible ASCII"))?
+                            .to_owned(),
+                    );
+                }
+                drop(grouped.insert(name.as_str().to_owned(), values));
+            }
+            Ok(grouped)
+        }
+
+        /// Renders a response for the assertion messages.
+        fn render(status: u16, headers: &BTreeMap<String, Vec<String>>, body: &[u8]) -> String {
+            let header_lines: String = headers
+                .iter()
+                .flat_map(|(name, values)| {
+                    values.iter().map(move |value| format!("{name}: {value}\n"))
+                })
+                .collect();
+            format!(
+                "status: {status}\n{header_lines}body: {}",
+                String::from_utf8_lossy(body)
+            )
+        }
+
+        /// Asserts that `resp` matches `expected` exactly: status, the complete
+        /// header multimap except `date`, and the raw body bytes.
+        async fn assert_wire_eq(
+            resp: reqwest::Response,
+            expected: &WireSnapshot,
+        ) -> anyhow::Result<()> {
+            let status = resp.status().as_u16();
+            let headers = header_multimap(resp.headers())?;
+            let body = resp.bytes().await.context("read response body")?;
+            let mut expected_headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (name, value) in &expected.headers {
+                expected_headers
+                    .entry((*name).to_owned())
+                    .or_default()
+                    .push(value.clone());
+            }
+            let actual = render(status, &headers, &body);
+            let wanted = render(expected.status, &expected_headers, expected.body.as_bytes());
+            assert_eq!(
+                status, expected.status,
+                "status drifted\nactual:\n{actual}\nexpected:\n{wanted}"
+            );
+            assert_eq!(
+                headers, expected_headers,
+                "headers drifted\nactual:\n{actual}\nexpected:\n{wanted}"
+            );
+            assert_eq!(
+                body.as_ref(),
+                expected.body.as_bytes(),
+                "body drifted\nactual:\n{actual}\nexpected:\n{wanted}"
+            );
+            Ok(())
+        }
+
+        /// Mock upstream IdP: serves the JWKS and a fixed `/token` answer on
+        /// both loopback addresses.
+        struct CompatIdp {
+            /// The dual-stack wiremock server.
+            mock: DualStackMock,
+        }
+
+        impl CompatIdp {
+            /// Starts the mock and mounts `/jwks.json` and `/token`.
+            async fn start() -> anyhow::Result<Self> {
+                let (_pem, jwks_body) = KEYPAIR
+                    .as_ref()
+                    .map_err(|err| anyhow::anyhow!("keypair generation: {err}"))?;
+                let mock = DualStackMock::start().await?;
+                mock.mount(|| {
+                    Mock::given(matchers::method("GET"))
+                        .and(matchers::path("/jwks.json"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body))
+                })
+                .await;
+                mock.mount(|| {
+                    Mock::given(matchers::method("POST"))
+                        .and(matchers::path("/token"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_raw(UPSTREAM_TOKEN_BODY, "application/json"),
+                        )
+                })
+                .await;
+                Ok(Self { mock })
+            }
+
+            /// `http://localhost:<port><path>` on the mock.
+            fn url(&self, path: &str) -> String {
+                format!("http://localhost:{}{path}", self.mock.port())
+            }
+
+            /// Mints an RS256 token signed by the mock key with `claims`.
+            fn token(claims: &serde_json::Value) -> anyhow::Result<String> {
+                let (pem, _jwks) = KEYPAIR
+                    .as_ref()
+                    .map_err(|err| anyhow::anyhow!("keypair generation: {err}"))?;
+                let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+                    .context("encoding key from PEM")?;
+                let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+                header.kid = Some(KID.into());
+                jsonwebtoken::encode(&header, claims, &encoding_key).context("JWT encoding")
+            }
+
+            /// Bodies of every `POST /token` the mock received, on either
+            /// loopback address.
+            async fn token_request_bodies(&self) -> anyhow::Result<Vec<String>> {
+                let mut bodies = Vec::new();
+                for server in [Some(&self.mock.v4), self.mock.v6.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let requests = server
+                        .received_requests()
+                        .await
+                        .context("request recording must be enabled")?;
+                    for request in requests.iter().filter(|req| req.url.path() == "/token") {
+                        bodies.push(
+                            String::from_utf8(request.body.clone())
+                                .context("upstream token body is UTF-8")?,
+                        );
+                    }
+                }
+                Ok(bodies)
+            }
+        }
+
+        /// Token claims with the configured issuer, a fresh `iat`, and the
+        /// given audience, scope and expiry offset in seconds from now.
+        fn claims(aud: &str, scope: &str, exp_offset: i64) -> serde_json::Value {
+            let now = jsonwebtoken::get_current_timestamp();
+            serde_json::json!({
+                "iss": ISSUER,
+                "aud": aud,
+                "sub": "compat-user",
+                "scope": scope,
+                "exp": now.saturating_add_signed(exp_offset),
+                "iat": now
+            })
+        }
+
+        /// The 3.20.0-shaped OAuth document: direct mode (no `proxy` table).
+        fn oauth_direct_json(idp: &CompatIdp) -> serde_json::Value {
+            serde_json::json!({
+                "issuer": ISSUER,
+                "audience": AUDIENCE,
+                "jwks_uri": idp.url("/jwks.json"),
+                "allow_http_oauth_urls": true,
+                "ssrf_allowlist": {
+                    "hosts": ["localhost"],
+                    "cidrs": ["127.0.0.0/8"]
+                },
+                "scopes": [
+                    {"scope": "mcp:admin", "role": "ops"},
+                    {"scope": "mcp:read", "role": "viewer"}
+                ]
+            })
+        }
+
+        /// Direct-mode OAuth config.
+        fn oauth_direct(idp: &CompatIdp) -> anyhow::Result<OAuthConfig> {
+            serde_json::from_value(oauth_direct_json(idp)).context("oauth config deserialization")
+        }
+
+        /// Direct-mode OAuth config plus a passthrough `proxy` table.
+        fn oauth_proxy(idp: &CompatIdp) -> anyhow::Result<OAuthConfig> {
+            let mut json = oauth_direct_json(idp);
+            let proxy = serde_json::json!({
+                "authorize_url": idp.url("/authorize"),
+                "token_url": idp.url("/token"),
+                "client_id": "static-client"
+            });
+            let previous = json
+                .as_object_mut()
+                .context("oauth document is an object")?
+                .insert("proxy".to_owned(), proxy);
+            anyhow::ensure!(previous.is_none(), "proxy key was already set");
+            serde_json::from_value(json).context("oauth config deserialization")
+        }
+
+        /// `viewer` may call only `echo`; `ops` may call every tool.
+        fn compat_rbac() -> Arc<RbacPolicy> {
+            Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+                RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
+            ])))
+        }
+
+        /// The server's own origin, `http://127.0.0.1:<port>`.
+        fn origin(port: u16) -> String {
+            format!("http://127.0.0.1:{port}")
+        }
+
+        /// OAuth server config with `oauth` as the only auth source and
+        /// [`compat_rbac`], without `public_url`.
+        fn oauth_server_config(port: u16, oauth: OAuthConfig) -> McpServerConfig {
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            config_on_port(port)
+                .with_auth(auth)
+                .with_rbac(compat_rbac())
+        }
+
+        /// Like [`spawn_server`], but binds the listener before building the
+        /// config so `build` can name the real port (e.g. in `public_url`).
+        async fn spawn_on_known_port<B>(build: B) -> anyhow::Result<(ServerHarness, u16)>
+        where
+            B: FnOnce(u16) -> anyhow::Result<McpServerConfig>,
+        {
+            drop(ring::default_provider().install_default());
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let bound: SocketAddr = listener.local_addr()?;
+            let port = bound.port();
+            let validated = build(port)?.validate().context("test config valid")?;
+            let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+            let shutdown = CancellationToken::new();
+            let shutdown_for_server = shutdown.clone();
+            let join = tokio::spawn(async move {
+                serve_with_listener(
+                    listener,
+                    validated,
+                    || TestHandler,
+                    Some(ready_tx),
+                    Some(shutdown_for_server),
+                )
+                .await
+            });
+            let signalled = timeout(Duration::from_secs(30), ready_rx)
+                .await
+                .context("server did not signal readiness within 30s")?
+                .context("server task aborted before readiness signal")?;
+            assert_eq!(
+                signalled, bound,
+                "ready_tx address mismatched the pre-bound listener"
+            );
+            Ok((
+                ServerHarness {
+                    base: format!("http://{bound}"),
+                    shutdown,
+                    join: Some(join),
+                },
+                port,
+            ))
+        }
+
+        /// Spawns the OAuth + passthrough-proxy server with `public_url` set
+        /// to its own origin.
+        async fn spawn_proxy_server(idp: &CompatIdp) -> anyhow::Result<(ServerHarness, u16)> {
+            let oauth = oauth_proxy(idp)?;
+            spawn_on_known_port(|port| {
+                Ok(oauth_server_config(port, oauth).with_public_url(origin(port)))
+            })
+            .await
+        }
+
+        /// A client that never follows redirects, so a 302 is observed as-is.
+        fn client() -> anyhow::Result<reqwest::Client> {
+            reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .context("build reqwest client")
+        }
+
+        /// `POST /mcp` with [`INITIALIZE_BODY`] and an optional bearer.
+        async fn post_initialize(
+            client: &reqwest::Client,
+            base: &str,
+            bearer: Option<&str>,
+        ) -> anyhow::Result<reqwest::Response> {
+            let request = client
+                .post(format!("{base}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            let authed = match bearer {
+                Some(token) => request.header("authorization", format!("Bearer {token}")),
+                None => request,
+            };
+            authed
+                .body(INITIALIZE_BODY)
+                .send()
+                .await
+                .context("POST /mcp")
+        }
+
+        /// `GET /authorize` with a full PKCE authorization request.
+        async fn get_authorize(
+            client: &reqwest::Client,
+            base: &str,
+            port: u16,
+        ) -> anyhow::Result<reqwest::Response> {
+            let url = format!(
+                "{base}/authorize?response_type=code&client_id=anything&redirect_uri={REDIRECT_URI_ENCODED}&state=s1&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256&scope=mcp%3Aread&resource=http%3A%2F%2F127.0.0.1%3A{port}%2Fmcp"
+            );
+            client.get(url).send().await.context("GET /authorize")
+        }
+
+        /// `POST /register` with a minimal RFC 7591 registration.
+        async fn post_register(
+            client: &reqwest::Client,
+            base: &str,
+        ) -> anyhow::Result<reqwest::Response> {
+            client
+                .post(format!("{base}/register"))
+                .header("content-type", "application/json")
+                .body(r#"{"redirect_uris":["http://127.0.0.1:9/cb"],"client_name":"compat"}"#)
+                .send()
+                .await
+                .context("POST /register")
+        }
+
+        /// `GET {base}{path}`.
+        async fn get_path(
+            client: &reqwest::Client,
+            base: &str,
+            path: &str,
+        ) -> anyhow::Result<reqwest::Response> {
+            client
+                .get(format!("{base}{path}"))
+                .send()
+                .await
+                .with_context(|| format!("GET {path}"))
+        }
+
+        /// The upstream `Location` the passthrough `/authorize` answers with.
+        fn upstream_authorize_location(idp: &CompatIdp, port: u16) -> String {
+            idp.url(&format!(
+                "/authorize?response_type=code&redirect_uri={REDIRECT_URI_ENCODED}&state=s1&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256&scope=mcp%3Aread&resource=http%3A%2F%2F127.0.0.1%3A{port}%2Fmcp&client_id=static-client"
+            ))
+        }
+
+        /// RFC 9728 metadata body naming `authorization_server` and the
+        /// resource `http://127.0.0.1:<port>/mcp`.
+        fn protected_resource_body(authorization_server: &str, port: u16) -> String {
+            format!(
+                r#"{{"authorization_servers":["{authorization_server}"],"bearer_methods_supported":["header"],"resource":"{}/mcp","scopes_supported":["mcp:admin","mcp:read"]}}"#,
+                origin(port)
+            )
+        }
+
+        /// The absolute `resource_metadata` challenge parameter for `port`.
+        fn resource_metadata(port: u16) -> String {
+            format!(
+                r#"resource_metadata="{}/.well-known/oauth-protected-resource/mcp""#,
+                origin(port)
+            )
+        }
+
+        /// The default-headers 200 JSON snapshot of a metadata document.
+        fn json_200(body: &str) -> WireSnapshot {
+            WireSnapshot::new(200, body)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[("content-type", "application/json"), ("vary", "origin")])
+                .content_length()
+        }
+
+        /// The 404 snapshot of the router fallback and of an unmounted route.
+        fn not_found() -> WireSnapshot {
+            WireSnapshot::new(404, NOT_FOUND_BODY)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "81"),
+                    ("content-type", "application/json"),
+                ])
+        }
+
+        /// The default-headers OAuth 401 snapshot with `challenge` as the
+        /// `WWW-Authenticate` value.
+        fn oauth_401(challenge: String, body: &str) -> WireSnapshot {
+            WireSnapshot::new(401, body)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    ("vary", "origin"),
+                ])
+                .header("www-authenticate", challenge)
+        }
+
+        /// C1: both protected-resource metadata routes of the proxy config.
+        #[tokio::test]
+        async fn c1_protected_resource_metadata() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let client = client()?;
+            let expected = json_200(&protected_resource_body(&origin(port), port));
+
+            let suffixed = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource/mcp",
+            )
+            .await?;
+            assert_wire_eq(suffixed, &expected).await?;
+            let root = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource",
+            )
+            .await?;
+            assert_wire_eq(root, &expected).await?;
+            Ok(())
+        }
+
+        /// C2: authorization-server metadata of the proxy config, without the
+        /// RFC 9207 `iss` parameter flag.
+        #[tokio::test]
+        async fn c2_authorization_server_metadata() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let client = client()?;
+            let own = origin(port);
+            let body = format!(
+                r#"{{"authorization_endpoint":"{own}/authorize","code_challenge_methods_supported":["S256"],"grant_types_supported":["authorization_code","refresh_token"],"issuer":"{own}","registration_endpoint":"{own}/register","response_types_supported":["code"],"scopes_supported":["mcp:admin","mcp:read"],"token_endpoint":"{own}/token","token_endpoint_auth_methods_supported":["none"]}}"#
+            );
+
+            let resp = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-authorization-server",
+            )
+            .await?;
+            assert_wire_eq(resp, &json_200(&body)).await?;
+            let doc: serde_json::Value = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-authorization-server",
+            )
+            .await?
+            .json()
+            .await?;
+            assert!(
+                doc.get("authorization_response_iss_parameter_supported")
+                    .is_none(),
+                "3.20.0 never advertises authorization_response_iss_parameter_supported"
+            );
+            Ok(())
+        }
+
+        /// C3: `POST /mcp` without credentials.
+        #[tokio::test]
+        async fn c3_missing_credentials_challenge() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                    resource_metadata(port)
+                ),
+                MISSING_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, None).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C4: `POST /mcp` with a malformed JWT.
+        #[tokio::test]
+        async fn c4_malformed_jwt_challenge() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_token", error_description="token is invalid""#,
+                    resource_metadata(port)
+                ),
+                INVALID_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, Some("a.b.c")).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C5: a valid `mcp:read` token calling a tool its role may not call
+        /// gets a bare 403 without `WWW-Authenticate`.
+        #[tokio::test]
+        async fn c5_rbac_deny_is_bare_403() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+            let token = CompatIdp::token(&claims(AUDIENCE, "mcp:read", 3600))?;
+            let expected = WireSnapshot::new(403, "admin_only denied for role 'viewer'")
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "35"),
+                    ("content-type", TEXT_PLAIN),
+                    ("vary", "origin"),
+                ]);
+
+            let resp = client()?
+                .post(format!("{}/mcp", server.base))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(tool_call_body("admin_only", &serde_json::json!({})))
+                .send()
+                .await?;
+            assert!(
+                resp.headers().get("www-authenticate").is_none(),
+                "3.20.0 RBAC deny carries no WWW-Authenticate"
+            );
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C6: a token whose `aud` is the server's own resource URL instead of
+        /// the configured audience is rejected (no implicit audience widening).
+        #[tokio::test]
+        async fn c6_resource_url_audience_rejected() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let resource = format!("{}/mcp", origin(port));
+            let token = CompatIdp::token(&claims(&resource, "mcp:read", 3600))?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_token", error_description="token is invalid""#,
+                    resource_metadata(port)
+                ),
+                INVALID_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, Some(&token)).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C7: passthrough `/authorize` redirects to the upstream with the
+        /// client id swapped.
+        #[tokio::test]
+        async fn c7_authorize_redirect() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let expected = WireSnapshot::new(302, "")
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[("content-length", "0"), ("vary", "origin")])
+                .header("location", upstream_authorize_location(&idp, port));
+
+            let resp = get_authorize(&client()?, &server.base, port).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C8: passthrough `/register` stub response.
+        #[tokio::test]
+        async fn c8_register_stub() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+            let expected = WireSnapshot::new(200, REGISTER_BODY)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "130"),
+                    ("content-type", "application/json"),
+                    ("pragma", "no-cache"),
+                    ("vary", "Authorization"),
+                    ("vary", "origin"),
+                ]);
+
+            let resp = post_register(&client()?, &server.base).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C9: passthrough `/token` forwards an exact form body upstream and
+        /// relays the upstream JSON verbatim.
+        #[tokio::test]
+        async fn c9_token_passthrough() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+            let expected = WireSnapshot::new(200, UPSTREAM_TOKEN_BODY)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "88"),
+                    ("content-type", "application/json"),
+                    ("pragma", "no-cache"),
+                    ("vary", "Authorization"),
+                    ("vary", "origin"),
+                ]);
+
+            let resp = client()?
+                .post(format!("{}/token", server.base))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(format!(
+                    "grant_type=authorization_code&code=c1&redirect_uri={REDIRECT_URI_ENCODED}&code_verifier={CODE_VERIFIER}&client_id=anything"
+                ))
+                .send()
+                .await?;
+            assert_wire_eq(resp, &expected).await?;
+            assert_eq!(
+                idp.token_request_bodies().await?,
+                vec![format!(
+                    "grant_type=authorization_code&code=c1&redirect_uri={REDIRECT_URI_ENCODED}&code_verifier={CODE_VERIFIER}&client_id=static-client"
+                )],
+                "the upstream must receive exactly one request with this exact form body"
+            );
+            Ok(())
+        }
+
+        /// C10: API-key-only server (no OAuth), `POST /mcp` without
+        /// credentials.
+        #[tokio::test]
+        async fn c10_api_key_missing_credentials_challenge() -> anyhow::Result<()> {
+            let (_token, hash) = generate_api_key()?;
+            let (server, _port) =
+                spawn_on_known_port(|port| {
+                    Ok(config_on_port(port).with_auth(AuthConfig::with_keys(vec![
+                        ApiKeyEntry::new("compat-key", hash, "ops"),
+                    ])))
+                })
+                .await?;
+            let expected = WireSnapshot::new(401, MISSING_CREDENTIAL)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    (
+                        "www-authenticate",
+                        r#"Bearer error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                    ),
+                ]);
+
+            let resp = post_initialize(&client()?, &server.base, None).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C11: OAuth direct mode (no `proxy` table, `public_url` set): both
+        /// metadata routes, and the proxy routes stay unmounted.
+        #[tokio::test]
+        async fn c11_direct_mode_routes() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let oauth = oauth_direct(&idp)?;
+            let (server, port) = spawn_on_known_port(|port| {
+                Ok(oauth_server_config(port, oauth).with_public_url(origin(port)))
+            })
+            .await?;
+            let client = client()?;
+            let metadata = json_200(&protected_resource_body(ISSUER, port));
+
+            let suffixed = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource/mcp",
+            )
+            .await?;
+            assert_wire_eq(suffixed, &metadata).await?;
+            let root = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource",
+            )
+            .await?;
+            assert_wire_eq(root, &metadata).await?;
+            let as_meta = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-authorization-server",
+            )
+            .await?;
+            assert_wire_eq(as_meta, &not_found()).await?;
+            let authorize = get_path(&client, &server.base, "/authorize").await?;
+            assert_wire_eq(authorize, &not_found()).await?;
+            Ok(())
+        }
+
+        /// C12: OAuth direct mode without `public_url`: the challenge carries
+        /// a relative `resource_metadata` and the metadata derives `resource`
+        /// from the bind address.
+        #[tokio::test]
+        async fn c12_direct_mode_without_public_url() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let oauth = oauth_direct(&idp)?;
+            let (server, port) =
+                spawn_on_known_port(|port| Ok(oauth_server_config(port, oauth))).await?;
+            let client = client()?;
+            let challenge_expected = WireSnapshot::new(401, MISSING_CREDENTIAL)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    (
+                        "www-authenticate",
+                        r#"Bearer resource_metadata="/.well-known/oauth-protected-resource", error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                    ),
+                ]);
+            let metadata_expected = WireSnapshot::new(200, &protected_resource_body(ISSUER, port))
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[("content-type", "application/json")])
+                .content_length();
+
+            let challenge = post_initialize(&client, &server.base, None).await?;
+            assert_wire_eq(challenge, &challenge_expected).await?;
+            let metadata = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource",
+            )
+            .await?;
+            assert_wire_eq(metadata, &metadata_expected).await?;
+            Ok(())
+        }
+
+        /// C13: an expired token.
+        #[tokio::test]
+        async fn c13_expired_jwt_challenge() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let token = CompatIdp::token(&claims(AUDIENCE, "mcp:read", -3600))?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_token", error_description="token is expired""#,
+                    resource_metadata(port)
+                ),
+                EXPIRED_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, Some(&token)).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C14: an unknown path hits the router fallback.
+        #[tokio::test]
+        async fn c14_unknown_path_fallback() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+
+            let resp = get_path(&client()?, &server.base, "/does-not-exist").await?;
+            assert_wire_eq(resp, &not_found()).await?;
+            Ok(())
+        }
+
+        /// C15: operator `security_headers` overrides apply unchanged to the
+        /// 401 challenge, the `/authorize` redirect and the `/register` stub.
+        #[tokio::test]
+        async fn c15_security_header_overrides() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let oauth = oauth_proxy(&idp)?;
+            let mut overrides = SecurityHeadersConfig::default();
+            overrides.content_security_policy = Some(C15_CSP.to_owned());
+            overrides.referrer_policy = Some(C15_REFERRER_POLICY.to_owned());
+            overrides.cache_control = Some(C15_CACHE_CONTROL.to_owned());
+            let (server, port) = spawn_on_known_port(|port| {
+                Ok(oauth_server_config(port, oauth)
+                    .with_public_url(origin(port))
+                    .with_security_headers(overrides))
+            })
+            .await?;
+            let client = client()?;
+            let challenge_expected = WireSnapshot::new(401, MISSING_CREDENTIAL)
+                .headers(&C15_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    ("vary", "origin"),
+                ])
+                .header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer {}, error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                        resource_metadata(port)
+                    ),
+                );
+            let authorize_expected = WireSnapshot::new(302, "")
+                .headers(&C15_SECURITY_HEADERS)
+                .headers(&[("content-length", "0"), ("vary", "origin")])
+                .header("location", upstream_authorize_location(&idp, port));
+            let register_expected = WireSnapshot::new(200, REGISTER_BODY)
+                .headers(&C15_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "130"),
+                    ("content-type", "application/json"),
+                    ("pragma", "no-cache"),
+                    ("vary", "Authorization"),
+                    ("vary", "origin"),
+                ]);
+
+            let challenge = post_initialize(&client, &server.base, None).await?;
+            assert_wire_eq(challenge, &challenge_expected).await?;
+            let authorize = get_authorize(&client, &server.base, port).await?;
+            assert_wire_eq(authorize, &authorize_expected).await?;
+            let register = post_register(&client, &server.base).await?;
+            assert_wire_eq(register, &register_expected).await?;
+            Ok(())
+        }
+    }
+
+    // ==========================================================================
+    // Keycloak 26.6 token shape: ES384, `at+jwt`, array `aud`, role claims
+    // ==========================================================================
+
+    /// Pins acceptance of access tokens shaped like the ones a Keycloak 26.6
+    /// realm issues: an ES384 signature, the RFC 9068 header `typ: at+jwt`,
+    /// an array `aud` plus `azp`, and roles under `realm_access.roles`,
+    /// `resource_access.<client>.roles` and `groups`.
+    ///
+    /// Every value is a generic placeholder. Each accepted token is paired
+    /// with a tampered-signature twin and an expired twin that the same
+    /// server rejects, so no 200 below is vacuous; each rejection is paired
+    /// with an acceptance that differs only in the property under test.
+    #[cfg(feature = "oauth")]
+    mod keycloak_26_token_shape {
+        use std::sync::LazyLock;
+
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        use super::*;
+
+        /// `kid` of the ES384 realm key.
+        const EC_KID: &str = "kc-es384";
+        /// `kid` of the RS256 realm key served next to it in K8.
+        const RSA_KID: &str = "kc-rs256";
+        /// Client id of the MCP client: the configured `audience` and `azp`.
+        const CLIENT_ID: &str = "mcp-example";
+        /// Path of the realm JWKS on the mock IdP.
+        const CERTS_PATH: &str = "/realms/example/protocol/openid-connect/certs";
+        /// The role claim K1 and K4-K8 map.
+        const REALM_ROLES: &str = "realm_access.roles";
+        /// The realm role K1 and K4-K8 map to `viewer`.
+        const REALM_ROLE: &str = "mcp-users";
+        /// An audience alias configured through `additional_audiences`.
+        const ALIAS: &str = "mcp-example-alias";
+        /// Bytes per P-384 affine coordinate.
+        const P384_COORDINATE_LEN: usize = 48;
+        /// Seconds an expired twin lies in the past, beyond the 60 s leeway.
+        const EXPIRED_BY: u64 = 600;
+        /// MCP `initialize` request body.
+        const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"keycloak-shape","version":"0.0.1"}}}"#;
+        /// MCP `tools/list` request body.
+        const TOOLS_LIST_BODY: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        /// Accepted: `initialize` 200, then `tools/list` 200 in that session.
+        const ACCEPTED: (u16, Option<u16>) = (200, Some(200));
+        /// Rejected: `initialize` 401 and no session to list tools in.
+        const REJECTED: (u16, Option<u16>) = (401, None);
+        /// `error_description` of every rejection except expiry.
+        const DESC_INVALID: &str = "token is invalid";
+        /// `error_description` of an expired token.
+        const DESC_EXPIRED: &str = "token is expired";
+
+        /// The exact challenge for a server at `base`: Bearer, the
+        /// protected-resource metadata URL, `error="invalid_token"` and
+        /// `description`.
+        fn invalid_token_challenge(base: &str, description: &str) -> String {
+            format!(
+                r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="{description}""#
+            )
+        }
+
+        /// The module's ES384 realm key.
+        struct EcKey {
+            /// PKCS#8 PEM of the P-384 private key.
+            pem: String,
+            /// Public JWK (`kty = EC`, `crv = P-384`) as Keycloak publishes it.
+            jwk: serde_json::Value,
+        }
+
+        /// One P-384 key for the whole module.
+        static EC_KEY: LazyLock<Result<EcKey, String>> =
+            LazyLock::new(|| generate_es384_key().map_err(|err| format!("{err:#}")));
+
+        /// One RSA key for K8: 2048-bit generation in an unoptimized build
+        /// costs seconds.
+        static RSA_KEY: LazyLock<Result<(String, serde_json::Value), String>> =
+            LazyLock::new(|| {
+                generate_oauth_test_keypair(RSA_KID).map_err(|err| format!("{err:#}"))
+            });
+
+        /// Generates a P-384 key and its JWK from the uncompressed public
+        /// point `0x04 || X(48) || Y(48)`.
+        fn generate_es384_key() -> anyhow::Result<EcKey> {
+            let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+                .context("P-384 key generation")?;
+            let Some((&0x04, coordinates)) = key_pair.public_key_raw().split_first() else {
+                anyhow::bail!("P-384 public key is not an uncompressed point");
+            };
+            let (x, y) = coordinates
+                .split_at_checked(P384_COORDINATE_LEN)
+                .context("P-384 point carries a 48-byte X")?;
+            anyhow::ensure!(
+                y.len() == P384_COORDINATE_LEN,
+                "P-384 point carries a 48-byte Y"
+            );
+            Ok(EcKey {
+                pem: key_pair.serialize_pem(),
+                jwk: serde_json::json!({
+                    "kty": "EC",
+                    "crv": "P-384",
+                    "x": URL_SAFE_NO_PAD.encode(x),
+                    "y": URL_SAFE_NO_PAD.encode(y),
+                    "kid": EC_KID,
+                    "alg": "ES384",
+                    "use": "sig"
+                }),
+            })
+        }
+
+        /// The shared ES384 key.
+        fn ec_key() -> anyhow::Result<&'static EcKey> {
+            EC_KEY
+                .as_ref()
+                .map_err(|err| anyhow::anyhow!("P-384 key generation: {err}"))
+        }
+
+        /// The shared RSA key: PKCS#8 PEM and its JWKS document.
+        fn rsa_key() -> anyhow::Result<&'static (String, serde_json::Value)> {
+            RSA_KEY
+                .as_ref()
+                .map_err(|err| anyhow::anyhow!("RSA key generation: {err}"))
+        }
+
+        /// Which realm key signs a token, with which header shape.
+        #[derive(Clone, Copy, Debug)]
+        enum Signer {
+            /// ES384 with the RFC 9068 header `typ: at+jwt`, as Keycloak
+            /// 26.6 issues for a client with RFC 9068 tokens enabled.
+            Es384AtJwt,
+            /// RS256 with the classic header `typ: JWT`.
+            Rs256Jwt,
+        }
+
+        impl Signer {
+            /// Signs `claims` with `kid` set to this signer's realm key.
+            fn sign(self, claims: &serde_json::Value) -> anyhow::Result<String> {
+                let (header, key) = match self {
+                    Self::Es384AtJwt => {
+                        let mut header = jsonwebtoken::Header::new(Algorithm::ES384);
+                        header.kid = Some(EC_KID.into());
+                        header.typ = Some("at+jwt".into());
+                        let key = jsonwebtoken::EncodingKey::from_ec_pem(ec_key()?.pem.as_bytes())
+                            .context("EC encoding key from PEM")?;
+                        (header, key)
+                    }
+                    Self::Rs256Jwt => {
+                        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+                        header.kid = Some(RSA_KID.into());
+                        header.typ = Some("JWT".into());
+                        let key = jsonwebtoken::EncodingKey::from_rsa_pem(rsa_key()?.0.as_bytes())
+                            .context("RSA encoding key from PEM")?;
+                        (header, key)
+                    }
+                };
+                jsonwebtoken::encode(&header, claims, &key).context("JWT encoding")
+            }
+        }
+
+        /// Mock Keycloak realm serving its JWKS on both loopback addresses.
+        struct KeycloakIdp {
+            /// The dual-stack wiremock server.
+            mock: DualStackMock,
+        }
+
+        impl KeycloakIdp {
+            /// Starts a realm whose JWKS holds exactly `keys`.
+            async fn start(keys: Vec<serde_json::Value>) -> anyhow::Result<Self> {
+                let body = serde_json::json!({ "keys": keys });
+                let mock = DualStackMock::start().await?;
+                mock.mount(|| {
+                    Mock::given(matchers::method("GET"))
+                        .and(matchers::path(CERTS_PATH))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+                })
+                .await;
+                Ok(Self { mock })
+            }
+
+            /// Starts a realm whose JWKS holds only the ES384 key.
+            async fn es384() -> anyhow::Result<Self> {
+                Self::start(vec![ec_key()?.jwk.clone()]).await
+            }
+
+            /// `iss` of every token and the configured `issuer`.
+            fn issuer(&self) -> String {
+                format!("http://localhost:{}/realms/example", self.mock.port())
+            }
+
+            /// OAuth config: audience [`CLIENT_ID`], default (`strict`)
+            /// audience mode, default `allowed_algorithms`, `role_claim =`
+            /// [`REALM_ROLES`] mapping [`REALM_ROLE`] to `viewer`; each
+            /// top-level key of `overrides` replaces the default.
+            fn oauth(&self, overrides: &serde_json::Value) -> anyhow::Result<OAuthConfig> {
+                let mut json = serde_json::json!({
+                    "issuer": self.issuer(),
+                    "audience": CLIENT_ID,
+                    "jwks_uri": format!("http://localhost:{}{CERTS_PATH}", self.mock.port()),
+                    "allow_http_oauth_urls": true,
+                    "ssrf_allowlist": {
+                        "hosts": ["localhost"],
+                        "cidrs": ["127.0.0.0/8"]
+                    },
+                    "role_claim": REALM_ROLES,
+                    "role_mappings": [{"claim_value": REALM_ROLE, "role": "viewer"}]
+                });
+                let object = json
+                    .as_object_mut()
+                    .context("oauth document is an object")?;
+                for (key, value) in overrides
+                    .as_object()
+                    .context("oauth overrides are an object")?
+                {
+                    drop(object.insert(key.clone(), value.clone()));
+                }
+                serde_json::from_value(json).context("oauth config deserialization")
+            }
+
+            /// Claims modelled on a Keycloak 26.6 access token for
+            /// [`CLIENT_ID`], expiring 180 s from now.
+            fn claims(&self) -> serde_json::Value {
+                let now = jsonwebtoken::get_current_timestamp();
+                serde_json::json!({
+                    "exp": now.saturating_add(180),
+                    "iat": now,
+                    "auth_time": now,
+                    "jti": "00000000-0000-4000-8000-000000000001",
+                    "iss": self.issuer(),
+                    "aud": [CLIENT_ID, "other-service", "account"],
+                    "sub": "00000000-0000-4000-8000-000000000002",
+                    "typ": "Bearer",
+                    "azp": CLIENT_ID,
+                    "sid": "00000000-0000-4000-8000-000000000003",
+                    "scope": "openid profile email",
+                    "realm_access": {"roles": [REALM_ROLE]},
+                    "resource_access": {"mcp-example": {"roles": ["tool-admin"]}},
+                    "groups": ["mcp-operators"]
+                })
+            }
+        }
+
+        /// `claims` with the top-level `key` set to `value`.
+        fn with_claim(
+            mut claims: serde_json::Value,
+            key: &str,
+            value: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            drop(
+                claims
+                    .as_object_mut()
+                    .context("claims are an object")?
+                    .insert(key.to_owned(), value),
+            );
+            Ok(claims)
+        }
+
+        /// `viewer` may call only `echo`.
+        fn viewer_rbac() -> Arc<RbacPolicy> {
+            Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+            ])))
+        }
+
+        /// Spawns an OAuth-only server through `serve_with_listener` on an
+        /// ephemeral port with `public_url = http://127.0.0.1:<port>` (equal
+        /// to the harness `base`) and [`viewer_rbac`].
+        async fn spawn_keycloak_server(oauth: OAuthConfig) -> anyhow::Result<ServerHarness> {
+            drop(ring::default_provider().install_default());
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let bound: SocketAddr = listener.local_addr()?;
+            let public_url = format!("http://{bound}");
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            let validated = config_on_port(bound.port())
+                .with_auth(auth)
+                .with_rbac(viewer_rbac())
+                .with_public_url(public_url.clone())
+                .validate()
+                .context("test config valid")?;
+            let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+            let shutdown = CancellationToken::new();
+            let shutdown_for_server = shutdown.clone();
+            let join = tokio::spawn(async move {
+                serve_with_listener(
+                    listener,
+                    validated,
+                    || TestHandler,
+                    Some(ready_tx),
+                    Some(shutdown_for_server),
+                )
+                .await
+            });
+            let signalled = timeout(Duration::from_secs(30), ready_rx)
+                .await
+                .context("server did not signal readiness within 30s")?
+                .context("server task aborted before readiness signal")?;
+            assert_eq!(
+                signalled, bound,
+                "ready_tx address mismatched the pre-bound listener"
+            );
+            Ok(ServerHarness {
+                base: public_url,
+                shutdown,
+                join: Some(join),
+            })
+        }
+
+        /// A `POST /mcp` carrying `token` as the bearer.
+        fn mcp_request(
+            client: &reqwest::Client,
+            base: &str,
+            token: &str,
+        ) -> reqwest::RequestBuilder {
+            client
+                .post(format!("{base}/mcp"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+        }
+
+        /// MCP `initialize` with `token`, then `tools/list` in the returned
+        /// session: the two statuses (`None` when no session was issued). A
+        /// 200 listing must carry a `result.tools` array.
+        async fn outcome(base: &str, token: &str) -> anyhow::Result<(u16, Option<u16>)> {
+            let client = reqwest::Client::new();
+            let init = mcp_request(&client, base, token)
+                .body(INITIALIZE_BODY)
+                .send()
+                .await
+                .context("initialize request")?;
+            let init_status = init.status().as_u16();
+            let Some(session_header) = init.headers().get("mcp-session-id") else {
+                return Ok((init_status, None));
+            };
+            let session = session_header
+                .to_str()
+                .context("session id is ASCII")?
+                .to_owned();
+            let list = mcp_request(&client, base, token)
+                .header("mcp-session-id", session)
+                .body(TOOLS_LIST_BODY)
+                .send()
+                .await
+                .context("tools/list request")?;
+            let list_status = list.status().as_u16();
+            if list_status == 200 {
+                let body = mcp_response_json(list).await?;
+                anyhow::ensure!(
+                    body.get("result")
+                        .and_then(|result| result.get("tools"))
+                        .is_some_and(serde_json::Value::is_array),
+                    "tools/list result carries a tools array: {body}"
+                );
+            }
+            Ok((init_status, Some(list_status)))
+        }
+
+        /// `token` with one bit of its signature flipped; header and payload
+        /// stay byte-identical.
+        fn tamper_signature(token: &str) -> anyhow::Result<String> {
+            let (signed, signature) = token.rsplit_once('.').context("JWT has a signature")?;
+            let mut bytes = URL_SAFE_NO_PAD
+                .decode(signature)
+                .context("JWT signature is base64url")?;
+            let first = bytes.first_mut().context("JWT signature is not empty")?;
+            *first ^= 0x01;
+            Ok(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(bytes)))
+        }
+
+        /// Asserts that `signer` over `claims` is accepted by `base`, and that
+        /// its tampered-signature twin and its expired twin (same header,
+        /// `exp` in the past) are rejected by the same server.
+        async fn assert_accepted(
+            base: &str,
+            signer: Signer,
+            claims: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            let token = signer.sign(claims)?;
+            assert_eq!(
+                outcome(base, &token).await?,
+                ACCEPTED,
+                "{signer:?} token must be accepted: {claims}"
+            );
+            assert_token_rejected(
+                base,
+                &tamper_signature(&token)?,
+                DESC_INVALID,
+                &format!("{signer:?} token with a tampered signature"),
+            )
+            .await?;
+            let now = jsonwebtoken::get_current_timestamp();
+            let expired_exp =
+                with_claim(claims.clone(), "exp", now.saturating_sub(EXPIRED_BY).into())?;
+            let expired = with_claim(
+                expired_exp,
+                "iat",
+                now.saturating_sub(EXPIRED_BY.saturating_mul(2)).into(),
+            )?;
+            assert_token_rejected(
+                base,
+                &signer.sign(&expired)?,
+                DESC_EXPIRED,
+                &format!("{signer:?} token with exp in the past"),
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// The `WWW-Authenticate` challenge of the `initialize` response to
+        /// `token` (`None` when the header is absent).
+        async fn challenge_of(base: &str, token: &str) -> anyhow::Result<Option<String>> {
+            let client = reqwest::Client::new();
+            let init = mcp_request(&client, base, token)
+                .body(INITIALIZE_BODY)
+                .send()
+                .await
+                .context("initialize request")?;
+            init.headers()
+                .get("www-authenticate")
+                .map(|value| value.to_str().map(str::to_owned))
+                .transpose()
+                .context("challenge is ASCII")
+        }
+
+        /// Asserts that `token` is rejected with the status pair
+        /// [`REJECTED`] and the exact Bearer `invalid_token` challenge
+        /// carrying `description`.
+        async fn assert_token_rejected(
+            base: &str,
+            token: &str,
+            description: &str,
+            what: &str,
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                outcome(base, token).await?,
+                REJECTED,
+                "{what}: must be rejected"
+            );
+            assert_eq!(
+                challenge_of(base, token).await?,
+                Some(invalid_token_challenge(base, description)),
+                "{what}: 401 must carry the Bearer invalid_token challenge"
+            );
+            Ok(())
+        }
+
+        /// Asserts that the ES384 `at+jwt` token over `claims` is rejected.
+        async fn assert_rejected(base: &str, claims: &serde_json::Value) -> anyhow::Result<()> {
+            let token = Signer::Es384AtJwt.sign(claims)?;
+            assert_token_rejected(base, &token, DESC_INVALID, &format!("token over {claims}")).await
+        }
+
+        /// A role-bearing claim of the Keycloak token, with the dot path a
+        /// deployment configures as `role_claim` and the realm mapping.
+        #[derive(Clone, Copy, Debug)]
+        enum RoleShape {
+            /// `realm_access.roles`, mapped value `mcp-users`.
+            Realm,
+            /// `resource_access.mcp-example.roles`, mapped value `tool-admin`.
+            Resource,
+            /// `groups`, mapped value `mcp-operators`.
+            Groups,
+        }
+
+        impl RoleShape {
+            /// Every role-bearing claim shape.
+            const ALL: [Self; 3] = [Self::Realm, Self::Resource, Self::Groups];
+
+            /// The configured `role_claim` dot path.
+            const fn role_claim(self) -> &'static str {
+                match self {
+                    Self::Realm => REALM_ROLES,
+                    Self::Resource => "resource_access.mcp-example.roles",
+                    Self::Groups => "groups",
+                }
+            }
+
+            /// The claim value mapped to `viewer` when this is the
+            /// configured `role_claim`.
+            const fn mapped(self) -> &'static str {
+                match self {
+                    Self::Realm => REALM_ROLE,
+                    Self::Resource => "tool-admin",
+                    Self::Groups => "mcp-operators",
+                }
+            }
+
+            /// The top-level claim holding this shape.
+            const fn top_level(self) -> &'static str {
+                match self {
+                    Self::Realm => "realm_access",
+                    Self::Resource => "resource_access",
+                    Self::Groups => "groups",
+                }
+            }
+
+            /// This claim holding exactly `values`, in Keycloak's nesting.
+            fn value(self, values: &[&str]) -> serde_json::Value {
+                match self {
+                    Self::Realm => serde_json::json!({"roles": values}),
+                    Self::Resource => serde_json::json!({
+                        "mcp-example": {"roles": values}
+                    }),
+                    Self::Groups => serde_json::json!(values),
+                }
+            }
+
+            /// `claims` with this claim holding `values`, or removed when
+            /// `values` is `None`.
+            fn set(
+                self,
+                mut claims: serde_json::Value,
+                values: Option<&[&str]>,
+            ) -> anyhow::Result<serde_json::Value> {
+                let Some(held) = values else {
+                    drop(
+                        claims
+                            .as_object_mut()
+                            .context("claims are an object")?
+                            .remove(self.top_level()),
+                    );
+                    return Ok(claims);
+                };
+                with_claim(claims, self.top_level(), self.value(held))
+            }
+        }
+
+        /// A role value no mapping names.
+        const UNMAPPED_ROLE: &str = "unmapped-role";
+
+        /// Spawns a server whose `role_claim` is `configured` and whose only
+        /// mapping sends `configured.mapped()` to `viewer`.
+        async fn spawn_role_server(
+            idp: &KeycloakIdp,
+            configured: RoleShape,
+        ) -> anyhow::Result<ServerHarness> {
+            spawn_keycloak_server(idp.oauth(&serde_json::json!({
+                "role_claim": configured.role_claim(),
+                "role_mappings": [{"claim_value": configured.mapped(), "role": "viewer"}]
+            }))?)
+            .await
+        }
+
+        /// One `role_claim` scenario (K1-K3).
+        struct RoleClaimCase {
+            /// The configured role claim.
+            shape: RoleShape,
+            /// A multi-valued claim with the mapped value last, as Keycloak
+            /// emits when the user holds several roles or groups.
+            mapped_last: &'static [&'static str],
+            /// Values of the configured claim without the mapped value.
+            unmapped: &'static [&'static str],
+        }
+
+        /// Runs a [`RoleClaimCase`]: the base token, then the mapped-last
+        /// variant, are accepted; the unmapped variant gets the existing
+        /// outcome for "no role mapping matches": 401 at authentication
+        /// (`resolve_role` fails, so RBAC never runs). In the unmapped
+        /// variant every OTHER role-bearing claim carries the mapped value,
+        /// so a resolver that reads any claim but the configured one accepts.
+        async fn run_role_claim_case(case: RoleClaimCase) -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_role_server(&idp, case.shape).await?;
+            let claims = idp.claims();
+
+            assert_accepted(&server.base, Signer::Es384AtJwt, &claims).await?;
+            let mapped_last = case.shape.set(claims.clone(), Some(case.mapped_last))?;
+            assert_eq!(
+                outcome(&server.base, &Signer::Es384AtJwt.sign(&mapped_last)?).await?,
+                ACCEPTED,
+                "{}: mapped value after other values must be accepted",
+                case.shape.role_claim()
+            );
+            let mut unmapped = case.shape.set(claims, Some(case.unmapped))?;
+            for other in RoleShape::ALL
+                .into_iter()
+                .filter(|other| other.top_level() != case.shape.top_level())
+            {
+                unmapped = other.set(unmapped, Some(&[case.shape.mapped()]))?;
+            }
+            assert_rejected(&server.base, &unmapped).await
+        }
+
+        /// Cross-claim isolation over every (configured `role_claim`) x
+        /// (other claim carrying the mapped role) combination: the role is
+        /// read only from the configured claim. Per configured claim: the
+        /// positive row (only it carries the mapped role, the others hold
+        /// unrelated values) is accepted; each other claim alone carrying the
+        /// mapped role, over a configured claim that holds an unmapped value
+        /// or is absent, and all other claims carrying it together, are
+        /// rejected with the "no mapping matches" outcome.
+        #[tokio::test]
+        async fn role_read_only_from_configured_claim() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            for configured in RoleShape::ALL {
+                let server = spawn_role_server(&idp, configured).await?;
+                let mapped = [configured.mapped()];
+                let unrelated = [UNMAPPED_ROLE];
+                let others: Vec<RoleShape> = RoleShape::ALL
+                    .into_iter()
+                    .filter(|other| other.top_level() != configured.top_level())
+                    .collect();
+
+                let configured_only = configured.set(idp.claims(), Some(&mapped))?;
+                let positive = others.iter().try_fold(configured_only, |claims, other| {
+                    other.set(claims, Some(&unrelated))
+                })?;
+                assert_eq!(
+                    outcome(&server.base, &Signer::Es384AtJwt.sign(&positive)?).await?,
+                    ACCEPTED,
+                    "{configured:?}: configured claim carrying the mapped role is accepted"
+                );
+
+                for configured_claim in [Some(&unrelated[..]), None] {
+                    let base_claims = configured.set(idp.claims(), configured_claim)?;
+                    for carrier in &others {
+                        let only_carrier =
+                            others
+                                .iter()
+                                .try_fold(base_claims.clone(), |claims, other| {
+                                    let values: &[&str] =
+                                        if other.top_level() == carrier.top_level() {
+                                            &mapped
+                                        } else {
+                                            &unrelated
+                                        };
+                                    other.set(claims, Some(values))
+                                })?;
+                        assert_rejected(&server.base, &only_carrier).await?;
+                    }
+                    let all_others = others.iter().try_fold(base_claims, |claims, other| {
+                        other.set(claims, Some(&mapped))
+                    })?;
+                    assert_rejected(&server.base, &all_others).await?;
+                }
+            }
+            Ok(())
+        }
+
+        /// K1: `role_claim = "realm_access.roles"` mapping `mcp-users` to
+        /// `viewer` accepts the Keycloak-shaped ES384 `at+jwt` token.
+        #[tokio::test]
+        async fn k1_realm_access_roles_accepted() -> anyhow::Result<()> {
+            run_role_claim_case(RoleClaimCase {
+                shape: RoleShape::Realm,
+                mapped_last: &[
+                    "default-roles-example",
+                    "offline_access",
+                    "uma_authorization",
+                    REALM_ROLE,
+                ],
+                unmapped: &["default-roles-example", UNMAPPED_ROLE],
+            })
+            .await
+        }
+
+        /// K2: `role_claim = "groups"` mapping `mcp-operators` to `viewer`
+        /// accepts the token.
+        #[tokio::test]
+        async fn k2_groups_accepted() -> anyhow::Result<()> {
+            run_role_claim_case(RoleClaimCase {
+                shape: RoleShape::Groups,
+                mapped_last: &["other-group", "mcp-operators"],
+                unmapped: &["other-group"],
+            })
+            .await
+        }
+
+        /// K3: `role_claim = "resource_access.mcp-example.roles"` mapping
+        /// `tool-admin` to `viewer` accepts the token; the same role under
+        /// another client does not count.
+        #[tokio::test]
+        async fn k3_resource_access_client_roles_accepted() -> anyhow::Result<()> {
+            run_role_claim_case(RoleClaimCase {
+                shape: RoleShape::Resource,
+                mapped_last: &["tool-reader", "tool-admin"],
+                unmapped: &["tool-reader"],
+            })
+            .await?;
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_role_server(&idp, RoleShape::Resource).await?;
+            let other_client = with_claim(
+                idp.claims(),
+                "resource_access",
+                serde_json::json!({
+                    "mcp-example": {"roles": ["tool-reader"]},
+                    "other-service": {"roles": ["tool-admin"]}
+                }),
+            )?;
+            assert_rejected(&server.base, &other_client).await
+        }
+
+        /// K4: `audience = "mcp-other"` in strict mode rejects the token
+        /// whose array `aud` lacks it, though `azp` and other `aud` entries
+        /// are set (no `azp` or multi-`aud` widening); the same server
+        /// accepts a token whose `aud` names it.
+        #[tokio::test]
+        async fn k4_audience_not_in_aud_rejected() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server =
+                spawn_keycloak_server(idp.oauth(&serde_json::json!({"audience": "mcp-other"}))?)
+                    .await?;
+            let claims = idp.claims();
+
+            assert_rejected(&server.base, &claims).await?;
+            let named = with_claim(claims, "aud", serde_json::json!(["mcp-other", "account"]))?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &named).await
+        }
+
+        /// K5: a token whose `aud` holds only other services while `azp`
+        /// names the client is rejected in strict mode and accepted only
+        /// through the deprecated `azp` fallback of `warn` mode.
+        #[tokio::test]
+        async fn k5_azp_only_audience_strict_rejected_warn_accepted() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let claims = idp.claims();
+            let azp_only = with_claim(
+                claims.clone(),
+                "aud",
+                serde_json::json!(["other-service", "account"]),
+            )?;
+
+            let strict = spawn_keycloak_server(idp.oauth(&serde_json::json!({}))?).await?;
+            assert_rejected(&strict.base, &azp_only).await?;
+            assert_accepted(&strict.base, Signer::Es384AtJwt, &claims).await?;
+
+            let warn = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"audience_validation_mode": "warn"}))?,
+            )
+            .await?;
+            assert_accepted(&warn.base, Signer::Es384AtJwt, &azp_only).await
+        }
+
+        /// K6 (resource URL): `accept_resource_audience = true` accepts a
+        /// token whose only `aud` is `<public_url>/mcp` (an "Included Custom
+        /// Audience" mapper set to the resource URL); an unconfigured alias
+        /// stays rejected.
+        #[tokio::test]
+        async fn k6_resource_url_audience_accepted() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"accept_resource_audience": true}))?,
+            )
+            .await?;
+            let claims = idp.claims();
+            let resource = format!("{}/mcp", server.base);
+
+            let resource_aud = with_claim(claims.clone(), "aud", serde_json::json!([resource]))?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &resource_aud).await?;
+            let alias_aud = with_claim(claims, "aud", serde_json::json!([ALIAS]))?;
+            assert_rejected(&server.base, &alias_aud).await
+        }
+
+        /// K6 (alias): `additional_audiences = ["mcp-example-alias"]` accepts
+        /// a token whose only `aud` is the alias; with the resource-URL knob
+        /// off, `<public_url>/mcp` stays rejected.
+        #[tokio::test]
+        async fn k6_additional_audience_accepted() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"additional_audiences": [ALIAS]}))?,
+            )
+            .await?;
+            let claims = idp.claims();
+            let resource = format!("{}/mcp", server.base);
+
+            let alias_aud = with_claim(claims.clone(), "aud", serde_json::json!([ALIAS]))?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &alias_aud).await?;
+            let resource_aud = with_claim(claims, "aud", serde_json::json!([resource]))?;
+            assert_rejected(&server.base, &resource_aud).await
+        }
+
+        /// K7: `allowed_algorithms = ["ES256"]` rejects the ES384 token that
+        /// a server allowing `ES384` accepts.
+        #[tokio::test]
+        async fn k7_es384_outside_allowed_algorithms_rejected() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let claims = idp.claims();
+
+            let narrowed = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"allowed_algorithms": ["ES256"]}))?,
+            )
+            .await?;
+            assert_rejected(&narrowed.base, &claims).await?;
+
+            let allowed = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"allowed_algorithms": ["ES384"]}))?,
+            )
+            .await?;
+            assert_accepted(&allowed.base, Signer::Es384AtJwt, &claims).await
+        }
+
+        /// K8: against a realm JWKS holding both an RSA and the ES384 key,
+        /// the same claims signed RS256 with `typ: JWT` and signed ES384 with
+        /// `typ: at+jwt` are both accepted: the RFC 9068 `typ` is not
+        /// required (MCP does not mandate it) and not refused.
+        #[tokio::test]
+        async fn k8_rs256_jwt_and_es384_at_jwt_both_accepted() -> anyhow::Result<()> {
+            let rsa_jwk = rsa_key()?
+                .1
+                .get("keys")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|keys| keys.first())
+                .context("RSA JWKS holds one key")?
+                .clone();
+            let idp = KeycloakIdp::start(vec![rsa_jwk, ec_key()?.jwk.clone()]).await?;
+            let server = spawn_keycloak_server(idp.oauth(&serde_json::json!({}))?).await?;
+            let claims = idp.claims();
+
+            assert_accepted(&server.base, Signer::Rs256Jwt, &claims).await?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &claims).await
+        }
     }
 }

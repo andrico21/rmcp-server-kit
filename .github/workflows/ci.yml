@@ -33,7 +33,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Dated nightly (D-14 v): the newest release that passes both this job
       # and the docsrs job below. Move the pin only through the re-vendor +
       # toolchain-bump procedure in RUST_GUIDELINES.md.
@@ -47,11 +47,11 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -62,14 +62,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Remove Homebrew rust shim (macOS arm64 PATH precedence)
         if: runner.os == 'macOS'
         run: |
           brew uninstall --ignore-dependencies rustup rust 2>/dev/null || true
           rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Enable Developer Mode for unprivileged symlinks (Windows)
         if: runner.os == 'Windows'
         run: reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
@@ -92,11 +92,11 @@ jobs:
           - "--features metrics"
           - "--all-features"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build (${{ matrix.features }})
         run: cargo build ${{ matrix.features }}
       # The top-level `clippy` job only lints `--all-features`, so lints that
@@ -124,9 +124,9 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # `--force` and the floor matter together: rust-cache can restore an
       # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
       # would then skip the upgrade. Versions before 0.50 cannot parse the
@@ -143,9 +143,9 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Verify the crate is publishable
         run: cargo publish --dry-run --all-features
 
@@ -156,9 +156,9 @@ jobs:
     # one green run on main (per plan H-T4 / shared bench tooling).
     continue-on-error: true
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run rbac_redaction bench
         run: cargo bench --bench rbac_redaction
       - name: Assert redact_arg < 10µs
@@ -174,12 +174,12 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings --cfg docsrs"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Dated nightly (D-14 v), the same pin as the `fmt` job.
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: nightly-2026-10-03
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo +nightly-2026-10-03 doc --no-deps --all-features
       - name: Verify SECURITY.md documents mTLS revocation [H-S4]
         run: |
@@ -208,9 +208,9 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings --cfg docsrs"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@0e28dd9a7764e5f83064112bb1f24025a14c313c # nightly
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo +nightly doc --no-deps --all-features
 
   rustdoc-stable:
@@ -221,25 +221,25 @@ jobs:
       # stable toolchain (the nightly job above covers `--cfg docsrs`).
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo +stable doc --no-deps --all-features
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
 
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
@@ -258,9 +258,9 @@ jobs:
       RUSTFLAGS: "--cap-lints=warn"
       CARGO_BUILD_WARNINGS: allow
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: rustc --version && cargo --version
       - run: cargo build --all-features
 
@@ -268,9 +268,9 @@ jobs:
     name: Memory bounds (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run BoundedKeyedLimiter memory regression test
         run: cargo test --release --all-features --test limiter_memory -- --ignored --nocapture
 
@@ -278,9 +278,9 @@ jobs:
     name: Validate docs (citations + links)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Verify ARCHITECTURE.md citations resolve
         run: cargo test --all-features --test docs_citations
       - name: Verify vendored guideline checksums
@@ -288,14 +288,14 @@ jobs:
       - name: Check Markdown links (offline)
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
-          args: --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
+          args: --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md
           fail: true
 
   lint-ratchet:
     name: lint-ratchet self-tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed. GitLab
       # deliberately does not run these (image python version unknown; GitHub is
       # the canonical gate).
@@ -306,7 +306,7 @@ jobs:
     name: lint catalog + allow + prose gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed. The
       # count gate and its measurement machinery were retired in task 28 once
       # every `lint-migration:` expectation reached zero; these four gates are
@@ -339,9 +339,9 @@ jobs:
     # on every release. That policy is gone (see docs/RELEASING.md), so the job
     # is now stable enough to gate merges.
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-vet
         run: cargo install cargo-vet --locked
       - name: Run cargo vet
@@ -356,9 +356,9 @@ jobs:
     name: TOML format (taplo)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install taplo
         run: cargo install taplo-cli --locked
       - name: Check TOML formatting
@@ -371,9 +371,9 @@ jobs:
     # Blocking: `cargo machete` passes on main, so an unused dependency is a
     # real regression, not advisory signal.
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
       - name: Detect unused dependencies
@@ -387,9 +387,9 @@ jobs:
     # full dependency unsafe-usage picture.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-geiger
         run: cargo install cargo-geiger --locked
       - name: Run cargo geiger
@@ -420,9 +420,9 @@ jobs:
         # shard instead of erroring.
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
       - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/16)
@@ -628,9 +628,200 @@ jobs:
 
       - name: Upload mutants.out (shard ${{ matrix.shard }}/16)
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: warn
+
+      # Surviving mutants stay advisory. Wall-clock truncation does not: a
+      # truncated shard silently under-reports, which is exactly how this went
+      # unnoticed. Job-level `continue-on-error: true` keeps the workflow green
+      # either way, so this is loud without being release-blocking.
+      - name: Fail the shard if the mutant list was truncated
+        if: always()
+        run: |
+          if [ "${TRUNCATED:-0}" = "1" ]; then
+            echo "shard truncated at the wall-clock cap; increase shard count or budget"
+            exit 1
+          fi
+
+
+  mutants-oauth:
+    name: cargo-mutants (nightly mutation tests, oauth feature)
+    runs-on: ubuntu-latest
+    # Schedule-only / manual: mutation testing is expensive and is not run
+    # on every PR. Triggered nightly via the `schedule` event below or by
+    # manual dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    # Mutation runs only need the build to compile. Deny-level lints make
+    # mutants unviable (a mutant often introduces an unused binding), so cap
+    # lints via `--cap-lints=true` and let warnings through for this job.
+    env:
+      CARGO_BUILD_WARNINGS: allow
+    # Hard-cap each shard well below GitHub's 6h ceiling so it terminates
+    # gracefully (allowing `continue-on-error` to take effect) instead of
+    # being SIGKILLed and marking the entire workflow run as failed.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # NOTE: cargo-mutants shards are ZERO-indexed: valid values for
+        # `--shard k/4` are 0..3. Passing 4/4 silently selects an empty
+        # shard instead of erroring.
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run cargo mutants on the oauth-feature modules (shard ${{ matrix.shard }}/4)
+        # Scope: the two authorization-server modules that are compiled ONLY
+        # with `--features oauth` (src/lib.rs `#[cfg(feature = "oauth")]`).
+        # cargo-mutants does not understand `cfg`: run with default features
+        # (as the `mutants` job does) every mutant here is a false MISSED
+        # because the mutated file is never compiled. Hence this separate job.
+        # Do not merge these files into the `mutants` job.
+        # Measured 2026-10-20 on 90f9722 (warm target, 3 build jobs):
+        #   `cargo mutants --list --features oauth -f src/oauth_as.rs
+        #    -f src/oauth_seal.rs | wc -l`  ->  210 mutants
+        #   `cargo test --features oauth` warm: 264 s (second of two runs)
+        # Shard rule: minutes/shard = ceil(mutants / shards) x 1.44 x (suite s
+        #   / 218), where 1.44 min/mutant at a 218 s default suite comes from
+        #   the `mutants` job budget measurement. 4 shards: 53 x 1.44 x 1.211
+        #   = ~92 min, under the 150 min planning bound and the 170m wall.
+        # Per-test cap: 264 s x 1.2 = 317 s <= 360 s, so the `mutants` job's
+        #   360 s is kept. Re-measure when the oauth suite grows.
+        # Wrap in `timeout` so we exit 0 even if cargo-mutants blows past the
+        # wall-clock budget (job-level `timeout-minutes` SIGKILLs and bypasses
+        # `|| true`); the summariser and the final step report truncation.
+
+        env:
+          MUTANTS_TEST_TIMEOUT: "360"
+
+        run: |
+          set +e
+          timeout 170m cargo mutants --no-shuffle --cap-lints=true \
+            --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 --features oauth \
+            --sharding round-robin --shard ${{ matrix.shard }}/4 \
+            -f src/oauth_as.rs -f src/oauth_seal.rs
+          status=$?
+          set -e
+          # `timeout` (without --preserve-status) reports 124 on wall expiry and
+          # 137 when the child had to be SIGKILLed. Either means the mutant list
+          # was truncated and the untested tail is silently absent from
+          # outcomes.json, which is the failure this job must never hide.
+          # cargo-mutants' own statuses: 0 = clean, 2 = surviving mutants,
+          # 3 = mutants that timed out individually - those keep the job green.
+          # 4 = ExitCode::BaselineFailed (e.g. the baseline test run hitting
+          # `--timeout`) is NOT advisory: it leaves outcomes.json truncated or
+          # absent, which the summariser below treats as a hard error rather
+          # than a green job with near-zero coverage.
+          if [ "$status" = "124" ] || [ "$status" = "137" ]; then
+            echo "TRUNCATED=1" >> "$GITHUB_ENV"
+          else
+            echo "TRUNCATED=0" >> "$GITHUB_ENV"
+          fi
+          echo "MUTANTS_STATUS=$status" >> "$GITHUB_ENV"
+          # Single source of truth for the per-test-run cap: the summariser's
+          # near-cap trend warning reads it back.
+          echo "MUTANTS_TEST_TIMEOUT=$MUTANTS_TEST_TIMEOUT" >> "$GITHUB_ENV"
+          exit 0
+
+      # cargo-mutants writes mutants.json (every mutant it intends to test)
+      # before testing, and fills outcomes.json in incrementally. If the run is
+      # killed at the wall, the untested tail is simply absent from outcomes,
+      # so generated-vs-completed is the only way to see how much was skipped.
+      - name: Summarize mutation results (shard ${{ matrix.shard }}/4)
+        if: always()
+        run: |
+          out=mutants.out
+          # Both counters are mutant-only. `outcomes.json` also carries the
+          # baseline scenario (`"scenario": "Baseline"`), which must be filtered
+          # out: with one mutant untested, the baseline-inclusive count still
+          # equals `generated`, so the alarm below would miss exactly the
+          # single-skip case.
+          generated_raw=$(jq 'length' "$out/mutants.json" 2>/dev/null)
+          completed_raw=$(jq '[.outcomes[]? | select(.scenario != "Baseline")] | length' "$out/outcomes.json" 2>/dev/null)
+          generated=${generated_raw:-0}
+          completed=${completed_raw:-0}
+          # Trend indicators. The baseline test phase is the quantity the
+          # per-run cap exists to cover ("must exceed the FULL suite's
+          # runtime"), and its growth is the suite's fault rather than the
+          # runner's: on the 2026-09-17 nightly, mutant test phases ran
+          # 1.7-2.4x their own shard baseline purely from contention (8 shards
+          # x -j 2), so a max-mutant-test trigger fired on 5 of 8 shards every
+          # night - alarm fatigue, one level down from the failure mode this
+          # job already avoids.
+          baseline_test=$(jq '[.outcomes[] | select(.scenario == "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | first // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
+          max_test=$(jq '[.outcomes[]? | select(.scenario != "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | max // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
+          test_cap="${MUTANTS_TEST_TIMEOUT:-360}"
+          {
+            echo "### cargo-mutants shard ${{ matrix.shard }}/4"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| exit status | ${MUTANTS_STATUS:-unknown} |"
+            echo "| wall-clock truncated | ${TRUNCATED:-unknown} |"
+            echo "| mutants generated | $generated |"
+            echo "| mutants completed | $completed |"
+            echo "| baseline test phase | ${baseline_test}s / ${test_cap}s cap |"
+            echo "| max mutant test phase | ${max_test}s |"
+            # cargo-mutants writes CamelCase summary values in outcomes.json
+            # (MissedMutant / CaughtMutant / Timeout / Unviable); the old loop
+            # compared them against lowercase labels, so this table always
+            # printed 0 for all four. Map label -> value explicitly.
+            for kv in "missed:MissedMutant" "caught:CaughtMutant" "timeout:Timeout" "unviable:Unviable"; do
+              k=${kv%%:*}
+              s=${kv#*:}
+              v=$(jq --arg s "$s" '[.outcomes[]? | select(.scenario != "Baseline") | select(.summary == $s)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
+              echo "| $k | $v |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Advisory statuses (0 clean, 2 missed mutants, 3 timed-out mutants,
+          # 124/137 wall-clock kill) all still write both files. Missing or
+          # unparseable output under any OTHER status - notably 4 =
+          # ExitCode::BaselineFailed, which is not advisory - means the run
+          # never produced results and must not pass silently.
+          status="${MUTANTS_STATUS:-unknown}"
+          if [ -z "$generated_raw" ] || [ -z "$completed_raw" ]; then
+            case "$status" in
+              0 | 2 | 3 | 124 | 137) ;;
+              *)
+                echo "::error::shard ${{ matrix.shard }}/4 left no parseable mutants.out (exit status $status); mutation results were never produced. See the run log."
+                exit 1
+                ;;
+            esac
+          fi
+          # Fail loudly whenever mutants are missing from outcomes.json. This is
+          # deliberately independent of TRUNCATED: a baseline `--timeout` expiry
+          # exits 4 (not 124/137), so it used to leave a green job with
+          # near-zero coverage and no annotation at all.
+          if [ "$completed" -lt "$generated" ]; then
+            echo "::error::shard ${{ matrix.shard }}/4 tested $completed of $generated mutants; $((generated - completed)) are absent from outcomes.json. Mutation coverage is incomplete."
+            exit 1
+          fi
+          if [ "${TRUNCATED:-0}" = "1" ]; then
+            echo "::error::shard ${{ matrix.shard }}/4 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
+          fi
+          # Baseline near-cap warning, deliberately NOT a failure: the cap must
+          # exceed the full suite's runtime, so a baseline creeping toward it is
+          # the actionable signal (raise the cap or make the suite faster) -
+          # while a mutant phase at the cap is already visible as `timeout` in
+          # the table above. Keyed to the baseline, not to the max mutant phase:
+          # see the contention note above. Re-evaluates itself every nightly
+          # instead of waiting for someone to remember to re-measure.
+          if awk -v b="$baseline_test" -v c="$test_cap" 'BEGIN { exit !(b >= 0.9 * c) }'; then
+            echo "::warning::shard ${{ matrix.shard }}/4: baseline test phase ${baseline_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a baseline failure. Raise the cap or make the suite faster."
+          fi
+
+      - name: Upload mutants.out (shard ${{ matrix.shard }}/4)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-oauth-out-${{ matrix.shard }}
           path: mutants.out
           if-no-files-found: warn
 

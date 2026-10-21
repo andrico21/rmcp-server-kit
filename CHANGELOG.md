@@ -11,6 +11,247 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+Opt-in MCP 2026-07-28 authorization features, follow-ups to the rmcp 3.6.0
+lockfile move (tests, docs and one internal change), and dependency
+maintenance. Every new knob defaults to the 3.20.0 behaviour; see
+[`docs/MIGRATION.md`](docs/MIGRATION.md) (no action required) and
+[`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
+
+### Added
+
+- `OAuthConfig::challenge_scopes` (builder `challenge_scopes`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES`, comma-separated):
+  adds `scope="..."` to the `401` `WWW-Authenticate` challenge. Default unset.
+- `OAuthConfig::insufficient_scope_challenge` (builder
+  `insufficient_scope_challenge`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE`): a
+  tool call denied by RBAC gets `403` with
+  `WWW-Authenticate: Bearer error="insufficient_scope"` naming a mapped scope
+  that would unlock the call, found by simulating first-match role
+  resolution; when no scope helps the bare `403` stays. Default `false`.
+- `OAuthConfig::additional_audiences` (builder `additional_audiences`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES`,
+  comma-separated): extra accepted `aud` values. Default empty.
+- `OAuthConfig::accept_resource_audience` (builder
+  `accept_resource_audience`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE`): accept
+  `aud` equal to `{public_url}/mcp` (RFC 8707). Requires `public_url`.
+  Default `false`.
+- `OAuthConfig::omit_error_on_missing_credential` (builder
+  `omit_error_on_missing_credential`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL`):
+  no `error` parameter in the challenge for a request without any
+  credential (RFC 6750 section 3.1). Default `false`.
+- `OAuthProxyConfig::mode` with the new `#[non_exhaustive]` enum
+  `ProxyMode` (`Passthrough`, the default, or `AuthorizationServer`; builder
+  `mode`, env `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE`).
+- `OAuthProxyConfig::sealing_secret` and `sealing_secret_previous` (builders
+  of the same name, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` /
+  `..._SEALING_SECRET_PREVIOUS`, each with a `_FILE` sibling): HMAC keys for
+  the sealed values of `authorization_server` mode, redacted in `Debug` and
+  in the env-override report.
+- `OAuthProxyConfig::consent_ttl` (builder `consent_ttl`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL`): how long a
+  browser remembers consent; unset means 30 days, `"0s"` always asks, at
+  most 400 days.
+- Authorization-server proxy mode (`mode = "authorization_server"`):
+  stateless sealed client registration at `/register`, a per-client consent
+  page at `/authorize` and `/oauth/consent`, a local `/oauth/callback` that
+  re-stamps `iss` with this server's issuer, and `authorization_response_iss_parameter_supported`
+  in the authorization server metadata.
+- Authorization-server proxy callback and token exchange with stateless,
+  client-bound authorization codes and refresh tokens, PKCE verification,
+  refresh-token admin adapters, key rotation and issuer-consistent metadata.
+  Passthrough proxy behavior remains unchanged.
+- Startup validation for the new opt-ins: each rule fires only when its knob
+  is set, and every error names the offending field; the `public_url`,
+  `allowed_origins`, `authorization_servers` and `sealing_secret*` errors also
+  name the env var (both the direct and the `_FILE` variable for the secrets).
+- A startup INFO line, `oauth opt-in features enabled`, logged only when at
+  least one opt-in is enabled, with booleans and counts only.
+- Example `oauth_proxy_as_demo` (`cargo run --example oauth_proxy_as_demo
+  --features oauth`): the `authorization_server` flow against an in-process
+  fake identity provider.
+- Documentation: [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md) (proxy modes,
+  flow dissections, configuration examples, Keycloak settings per mode), new
+  GUIDE field-table rows, Recipe 7 (Keycloak, direct mode with CIMD) and
+  Recipe 8 (OAuth proxy in `authorization_server` mode).
+- Executed configuration examples in
+  [`docs/OAUTH_PROXY.md` section 7](docs/OAUTH_PROXY.md#7-configuration-examples):
+  resource-server cases R1-R8 and proxy cases P1-P7, each with a complete
+  TOML configuration, the environment overrides that apply on top of it, the
+  identity-provider settings and the documented HTTP exchanges, plus two
+  settings matrices (resource-server settings for every case, proxy settings
+  for P1-P7).
+- Integration test target `oauth_cases` (requires `oauth`): serves every case
+  configuration through the real transport on loopback against a fake
+  identity provider and asserts each documented exchange, checks every env
+  block against its case configuration and the GUIDE env-override table, and
+  fails when a settings-matrix cell disagrees with its case.
+- In `authorization_server` mode, `/register` rejects invisible and
+  bidirectional format characters in `client_name` and in redirect URIs
+  (`invalid_client_metadata` / `invalid_redirect_uri`, the character is not
+  echoed), and the consent page renders the name inside a `<bdi>` isolate with
+  the unverified marker outside it; an emoji sequence joined by U+200D is
+  rejected as a documented trade-off.
+- Tests only: RBAC/rmcp parser differential tests. A pinned table and a
+  duplicated-key property test in `src/rbac.rs` compare what RBAC extracts
+  from a `/mcp` body with what rmcp 3.6.0 parses and dispatches, and an e2e
+  test proves that no tool call reaches the handler without RBAC inspecting
+  it. [`docs/RMCP_UPGRADE_CHECKLIST.md`](docs/RMCP_UPGRADE_CHECKLIST.md)
+  section 3 now runs them on every rmcp bump.
+- Tests only: client cancellation on the legacy and 2026-07-28 HTTP paths,
+  a pin that cancelling a request never cancels a task, and nested
+  `Mcp-Param-*` headers enforced through both handler wrappers.
+- Docs only: the handler factory lifetime, nested `Mcp-Param-*` headers and
+  the rmcp 3.6.0 stdio limits in [`docs/GUIDE.md`](docs/GUIDE.md), which
+  scopes rmcp 3.6 clients request in
+  [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md), and case R3 retitled as an
+  audience migration case.
+
+### Changed
+
+- CI only: `actions/checkout` v7.0.1 and `actions/upload-artifact` v7.0.2;
+  `softprops/action-gh-release` v3 and `Swatinem/rust-cache` v2.9.1 re-pinned
+  to their tag commits. Dependabot ignores `dtolnay/rust-toolchain` because it
+  is pinned by branch name and Dependabot rewrites every pin to one commit,
+  dropping the toolchain selected by the branch name (see #63).
+- A startup WARN is logged once when OAuth is configured without
+  `public_url`, because Protected Resource Metadata then advertises a
+  resource derived from the bind address and the `401` challenge carries a
+  relative `resource_metadata` URL. Wire behaviour is unchanged.
+- `security_headers_middleware` honours a page-level `Content-Security-Policy`,
+  `Referrer-Policy: same-origin` and `Cache-Control: no-store` for the new
+  `authorization_server` HTML pages only (consent and error pages). Every
+  other response keeps the operator's header settings.
+- The configured session-binding secret is shared across requests instead of
+  copied for each one. Session and task ids are unchanged.
+- CI only: a new nightly `mutants-oauth` job (GitHub and GitLab) runs cargo-mutants
+  with `--features oauth` over `src/oauth_as.rs` and `src/oauth_seal.rs`, which
+  the default-feature mutants jobs cannot compile. The GitHub default-feature job
+  is unchanged. The GitLab default-feature `mutants` job no longer lists
+  `src/oauth.rs`, which that build cannot compile, and uses the same 360 s
+  per-mutant timeout as GitHub.
+- CI only: the Markdown link checks on GitHub and GitLab also verify heading
+  anchors (`lychee --include-fragments`).
+- Dependency refresh: 16 semver-compatible `Cargo.lock` updates - `tokio`
+  1.53.2 -> 1.54.0, `arc-swap` 1.9.2 -> 1.9.3, `rustls-webpki`
+  0.103.15 -> 0.103.16 and `webpki-root-certs` 1.0.9 -> 1.0.10 (see Security),
+  `async-compression` 0.4.50 -> 0.4.51, `compression-codecs` 0.4.45 -> 0.4.46,
+  `compression-core` 0.4.33 -> 0.4.34, `crc32fast` 1.5.2 -> 1.5.3, `combine`
+  4.6.8 -> 4.6.9, `equivalent` 1.0.2 -> 1.0.3, `libc` 0.2.190 -> 0.2.191,
+  `zerocopy` / `zerocopy-derive` 0.8.62 -> 0.8.63, `cc` 1.8.0 -> 1.9.0,
+  `find-msvc-tools` 0.1.14 -> 0.1.15 and `schannel` 0.1.29 -> 0.1.30. No
+  `Cargo.toml` requirement changed; `rmcp` moves separately (next entry). The
+  `supply-chain/config.toml` cargo-vet exemptions are re-pinned to the 16 new
+  versions; `cargo vet --locked` passes.
+- `rmcp` / `rmcp-macros` 3.5.1 -> 3.6.0 in `Cargo.lock`. The `rmcp = "3"`
+  requirement is unchanged, so downstream builds already accept 3.6.0. The
+  upstream `src/handler/` tree is byte-identical between the two tags (compare
+  `rmcp-v3.5.1...rmcp-v3.6.0`), so the `ServerHandler` surface is unchanged:
+  the delegation guard passes with its method count (29) and classification
+  tables untouched, and `server_handler_methods!` still holds zero
+  `self.inner` references. `StreamableHttpServerConfig` builders and defaults
+  are unchanged. Upstream changes visible through this crate:
+  - On the legacy session lifecycle (a request that does not select the
+    2026-07-28 stateless path), a `/mcp` POST without `Mcp-Session-Id` whose
+    body is neither `initialize` nor `server/discover` now gets
+    `400 Bad Request: Session ID is required` instead of
+    `422 Unexpected message, expect initialize request` (upstream #1377). It
+    is answered by rmcp after this crate's auth and RBAC layers, which do not
+    change.
+  - Every server-to-client request (sampling, roots, elicitation, ping or a
+    custom request) to a peer that negotiated `2026-07-28` or later now fails
+    with `invalid_request` (#1326); before, such requests were allowed from
+    inside a request handler. This crate issues none of them itself.
+  - On the stateless path, a POSTed JSON-RPC response or error now gets
+    HTTP 400 with an `invalid_request` JSON-RPC error instead of
+    `202 Accepted` (#1326).
+  - For a `tools/call` sent with `MCP-Protocol-Version` `2026-07-28` or later,
+    rmcp looks up the tool input schema on every request (one handler from the
+    factory per call) instead of caching the first answer per tool name
+    (#1349), so `Mcp-Param-*` checks follow the current `get_tool` result;
+    nested `x-mcp-header` annotations are accepted (#1359). rmcp 3.6.0 no
+    longer keeps the per-tool-name schema cache (`tool_schemas`), which grew
+    with every tool name a client chose to send.
+  - A JSON-RPC message that carries both `result` and `error`, or a request or
+    notification that carries either, is rejected when parsed (#1283); a
+    request id written as an integral float (`1.0`) is read as that integer
+    (#1346).
+  - `LocalSessionManager` releases its session map lock before it waits on a
+    session worker (#1323), and handlers still running after transport EOF
+    are cancelled (#1333).
+  - `serve_stdio` drops an incoming line longer than 16 MiB (rmcp
+    `DEFAULT_MAX_LINE_LENGTH`, #1049) without a JSON-RPC reply, so that
+    request stays pending until the client times out or cancels it; before,
+    the line was unbounded. A final message with no trailing newline at EOF is
+    dropped too.
+
+  rmcp 3.6.0 keeps `rust-version = "1.88"` and adds `libc` as a Linux-only
+  dependency, which `Cargo.lock` already held. The resolver also re-pointed
+  five lockfile edges without moving any version: `errno`, `rustix`,
+  `rustls-platform-verifier` and `winapi-util` name `windows-sys` 0.52.0
+  instead of 0.61.2 (Windows-only), and `tempfile` (dev-only, through
+  `proptest`) names `getrandom` 0.3.4 instead of 0.4.3. The two cargo-vet
+  exemptions in `supply-chain/config.toml` are re-pinned to 3.6.0;
+  `cargo vet --locked` passes.
+
+  `Cargo.toml` keeps `rmcp = "3"`; 3.6.0 is the tested lockfile resolution,
+  and consumers see these upstream changes when their own resolution reaches
+  rmcp 3.6.0.
+
+### Fixed
+
+- `examples/config_file_server.rs` prints a startup error as text instead of a debug dump and names a config file it cannot read.
+- In `authorization_server` mode a non-canonical `server.public_url` (capitals
+  in the host, an explicit default port such as `:443`, an expanded IPv6
+  literal) is rejected at startup with the canonical form to use, because the
+  advertised issuer must be byte-identical to the authorization server
+  metadata issuer (RFC 8414 section 3.3). Passthrough and direct modes are
+  unchanged. A host that is not a DNS name of letters, digits and hyphens or an
+  IP address literal, such as `https://mcp_example.com` or `https://*.example`,
+  is rejected too.
+- In `authorization_server` mode `/register` and `/authorize` reject every Unicode
+  default-ignorable or invisible character (for example U+3164, U+034F, tag
+  characters and U+2800) in `client_name` and redirect URIs, except the variation
+  selectors that emoji need; the redirect URI and its host are shown inside
+  `<bdi>` isolates; and `/authorize` re-validates the matched redirect URI of an
+  already sealed client. Joined emoji sequences, tag-sequence flags and the
+  Mongolian free variation selectors are rejected as a documented trade-off.
+  A sealed `client_name` that fails these rules, for example one sealed by an
+  older version, is shown as "An unnamed application" on the consent page.
+- The `authorization_server` consent and error pages are readable and tappable
+  on phones: they declare a device-width viewport and carry one constant inline
+  stylesheet (wrapped long names and redirect URIs, Approve and Deny buttons at
+  least 44 by 44 CSS px) that the page `Content-Security-Policy` admits by its
+  SHA-256 hash in a new `style-src` directive; no script, no external resource
+  and no `unsafe-inline`.
+
+### Security
+
+- Bumped `rustls` from 0.23.45 to 0.23.46 to resolve RUSTSEC-2026-0346,
+  RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349; `Cargo.lock` and
+  the `cargo-vet` exemptions are refreshed together.
+- Bumped `rustls-webpki` from 0.103.15 to 0.103.16 (RUSTSEC-2026-0382,
+  certificate verification may accept distrusted intermediates) and
+  `webpki-root-certs` from 1.0.9 to 1.0.10 (RUSTSEC-2026-0383, bundled roots
+  trusted distrusted emSign intermediates; reached through `reqwest`'s
+  `rustls-platform-verifier`). `cargo audit` and `cargo deny check` are clean
+  again. The `rustls-webpki` requirement in `Cargo.toml` is raised from
+  0.103.15 to 0.103.16, so a downstream build cannot resolve the vulnerable
+  version.
+
+### Notes
+
+- A configuration that sets none of the new knobs keeps byte-identical
+  3.20.0 wire behaviour (status, headers, bodies, routes, redirects, upstream
+  request bodies, token acceptance) for this crate's own code, pinned by the
+  `compat_3_20` suite in `tests/integration/e2e.rs`. The only addition is the
+  WARN line above when `public_url` is unset. Behaviour that rmcp itself owns
+  follows the consumer's resolved rmcp version (see the rmcp 3.6.0 entry under
+  Changed).
+
 ## [3.20.0] - 2026-10-13
 
 ### Breaking

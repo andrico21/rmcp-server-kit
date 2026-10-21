@@ -74,6 +74,11 @@ use crate::{
 )]
 #[derive(Clone)]
 #[non_exhaustive]
+#[expect(
+    clippy::partial_pub_fields,
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: AuthIdentity::granted_scopes must stay crate-private authorization context"
+)]
 pub struct AuthIdentity {
     /// Human-readable identity name (e.g. API key label or cert CN).
     pub name: String,
@@ -90,8 +95,14 @@ pub struct AuthIdentity {
     /// JWT `sub` claim (stable user identifier, e.g. Keycloak UUID).
     /// Used for token store keying. `None` for non-JWT auth.
     pub sub: Option<String>,
+    /// Verified token scopes for scope-derived roles; never exposed in Debug.
+    pub(crate) granted_scopes: Option<Arc<[String]>>,
 }
 
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "deliberate: AuthIdentity::fmt omits verified scopes to preserve byte-identical redacted Debug output"
+)]
 impl Debug for AuthIdentity {
     /// Redacts `raw_token` and `sub` to prevent secret leakage via
     /// `format!("{:?}")` or `tracing::debug!(?identity)`.
@@ -1786,6 +1797,45 @@ pub(crate) struct AuthState {
     pub resource_metadata_url: Option<String>,
     /// Per-item client context for `auth failed` logs; startup-only.
     pub log_context: AuthLogContext,
+    /// Opt-in additions to the OAuth `WWW-Authenticate` challenge; the
+    /// default reproduces the 3.20.0 challenge byte for byte.
+    pub challenge: ChallengeConfig,
+}
+
+/// Opt-in parameters of the OAuth `401` `WWW-Authenticate` challenge.
+///
+/// Read only when the challenge advertises `resource_metadata`, i.e. when
+/// OAuth is configured; the API-key / mTLS challenge never changes.
+///
+/// `scope` is emitted inside a quoted string without escaping. That is sound
+/// because every entry of `oauth.challenge_scopes` must be an RFC 6750
+/// `scope-token` (no space, `"`, `\` or control byte), enforced by
+/// `OAuthConfig::validate`, which `McpServerConfig::validate` runs; `serve`
+/// only accepts a `Validated<McpServerConfig>`, so no unvalidated value can
+/// reach this struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) struct ChallengeConfig {
+    /// `scope` parameter value: `oauth.challenge_scopes` joined with a single
+    /// space in configuration order; `None` omits the parameter.
+    pub scope: Option<String>,
+    /// Omit `error` / `error_description` from the challenge sent to a
+    /// request without any credential (RFC 6750 3.1).
+    pub omit_error_on_missing: bool,
+}
+
+#[cfg(feature = "oauth")]
+impl ChallengeConfig {
+    /// Challenge parameters selected by `oauth`.
+    pub(crate) fn from_oauth(oauth: &OAuthConfig) -> Self {
+        Self {
+            scope: oauth
+                .challenge_scopes
+                .as_ref()
+                .map(|scopes| scopes.join(" ")),
+            omit_error_on_missing: oauth.omit_error_on_missing_credential,
+        }
+    }
 }
 
 impl AuthState {
@@ -1996,6 +2046,7 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
     }
 
     Some(AuthIdentity {
+        granted_scopes: None,
         name: resolved_name,
         role: default_role.to_owned(),
         method: AuthMethod::MtlsCertificate,
@@ -2088,6 +2139,7 @@ fn extract_bearer(value: &str) -> Option<&str> {
 pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIdentity> {
     match verify_bearer_token_verdict(token, keys) {
         ApiKeyVerdict::Active { name, role } => Some(AuthIdentity {
+            granted_scopes: None,
             name,
             role,
             method: AuthMethod::BearerToken,
@@ -2242,17 +2294,32 @@ pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError> {
 
 /// Build the `WWW-Authenticate: Bearer ...` challenge value, including the
 /// `resource_metadata` parameter when a metadata URL is available.
+///
+/// With a metadata URL (OAuth configured) the parameters are, in order,
+/// `resource_metadata`, the opt-in `scope`, then `error` /
+/// `error_description` unless `challenge` omits them for a missing
+/// credential. The default [`ChallengeConfig`] yields the 3.20.0 value.
 fn build_www_authenticate_value(
     resource_metadata: Option<&str>,
+    challenge: &ChallengeConfig,
     failure: AuthFailureClass,
 ) -> String {
     let (error, error_description) = failure.bearer_error();
-    if let Some(url) = resource_metadata {
-        return format!(
-            "Bearer resource_metadata=\"{url}\", error=\"{error}\", error_description=\"{error_description}\""
-        );
+    let Some(url) = resource_metadata else {
+        return format!("Bearer error=\"{error}\", error_description=\"{error_description}\"");
+    };
+    let mut params = vec![format!("resource_metadata=\"{url}\"")];
+    if let Some(scope) = &challenge.scope {
+        params.push(format!("scope=\"{scope}\""));
     }
-    format!("Bearer error=\"{error}\", error_description=\"{error_description}\"")
+    let bare_missing =
+        challenge.omit_error_on_missing && failure == AuthFailureClass::MissingCredential;
+    if !bare_missing {
+        params.push(format!(
+            "error=\"{error}\", error_description=\"{error_description}\""
+        ));
+    }
+    format!("Bearer {}", params.join(", "))
 }
 
 /// Human-readable label for an authentication method.
@@ -2452,7 +2519,8 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
             .as_deref()
             .unwrap_or("/.well-known/oauth-protected-resource")
     });
-    let challenge = build_www_authenticate_value(resource_metadata, failure_class);
+    let challenge =
+        build_www_authenticate_value(resource_metadata, &state.challenge, failure_class);
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
@@ -2554,6 +2622,7 @@ async fn authenticate_bearer_identity(
     match verdict {
         Some(ApiKeyVerdict::Active { name, role }) => {
             return Ok(AuthIdentity {
+                granted_scopes: None,
                 name,
                 role,
                 method: AuthMethod::BearerToken,
@@ -3816,6 +3885,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext {
                 fields,
                 fingerprint_salt: credential_fingerprint
@@ -3828,6 +3898,8 @@ mod tests {
         state: Arc<AuthState>,
         req: Request<Body>,
     ) -> anyhow::Result<(StatusCode, String)> {
+        use tracing::{callsite::rebuild_interest_cache, subscriber::NoSubscriber};
+
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -3836,7 +3908,10 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .finish();
         let app = auth_router(state);
+        // See capture_debug_logs_pinned in src/transport.rs for the callsite interest cache race.
+        let _multi_dispatcher_pin = tracing::Dispatch::new(NoSubscriber::default());
         let _guard = set_default(subscriber);
+        rebuild_interest_cache();
         let status = app
             .oneshot(req)
             .await
@@ -3985,6 +4060,7 @@ mod tests {
         );
         let peer: SocketAddr = "10.0.0.20:54321".parse()?;
         let identity = AuthIdentity {
+            granted_scopes: None,
             name: "cn=test-client".into(),
             role: "viewer".into(),
             method: AuthMethod::MtlsCertificate,
@@ -4226,6 +4302,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext {
                 fields,
                 fingerprint_salt: credential_fingerprint
@@ -4917,6 +4994,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(state);
@@ -5059,6 +5137,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         };
         let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>()?);
@@ -5101,6 +5180,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         };
         let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>()?);
@@ -5167,6 +5247,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
@@ -5247,11 +5328,13 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
         let peer: SocketAddr = "10.0.0.20:54321".parse()?;
         let identity = AuthIdentity {
+            granted_scopes: None,
             name: "cn=test-client".into(),
             role: "viewer".into(),
             method: AuthMethod::MtlsCertificate,
@@ -5313,6 +5396,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
@@ -5369,6 +5453,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
@@ -5548,6 +5633,7 @@ mod tests {
     #[test]
     fn auth_identity_debug_redacts_raw_token() -> anyhow::Result<()> {
         let id = AuthIdentity {
+            granted_scopes: None,
             name: "alice".into(),
             role: "admin".into(),
             method: AuthMethod::OAuthJwt,
@@ -5587,6 +5673,7 @@ mod tests {
         // For non-OAuth identities (mTLS / API key) the secret fields are
         // None; redacted Debug output should distinguish that from "present".
         let id = AuthIdentity {
+            granted_scopes: None,
             name: "viewer-key".into(),
             role: "viewer".into(),
             method: AuthMethod::BearerToken,
@@ -5735,6 +5822,312 @@ mod tests {
                 "too many unauthenticated requests from this source"
             )
         );
+        Ok(())
+    }
+
+    /// One `WWW-Authenticate` builder cell: inputs and the expected value.
+    struct ChallengeCell {
+        /// `ChallengeConfig::scope`.
+        scope: Option<&'static str>,
+        /// `ChallengeConfig::omit_error_on_missing`.
+        omit: bool,
+        /// Failure class being challenged.
+        class: AuthFailureClass,
+        /// Exact expected header value.
+        expected: &'static str,
+    }
+
+    /// Every OAuth challenge matrix cell: {scope none/some} x {omit
+    /// false/true} x every failure class, with independent literal values.
+    /// The `(None, false)` rows are the 3.20.0 strings, byte for byte.
+    const CHALLENGE_MATRIX: [ChallengeCell; 20] = [
+        ChallengeCell {
+            scope: None,
+            omit: false,
+            class: AuthFailureClass::MissingCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: false,
+            class: AuthFailureClass::InvalidCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: false,
+            class: AuthFailureClass::ExpiredCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is expired""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: false,
+            class: AuthFailureClass::RateLimited,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="too many failed authentication attempts""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: false,
+            class: AuthFailureClass::PreAuthGate,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="too many unauthenticated requests from this source""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: true,
+            class: AuthFailureClass::MissingCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: true,
+            class: AuthFailureClass::InvalidCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: true,
+            class: AuthFailureClass::ExpiredCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is expired""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: true,
+            class: AuthFailureClass::RateLimited,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="too many failed authentication attempts""#,
+        },
+        ChallengeCell {
+            scope: None,
+            omit: true,
+            class: AuthFailureClass::PreAuthGate,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="too many unauthenticated requests from this source""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: false,
+            class: AuthFailureClass::MissingCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: false,
+            class: AuthFailureClass::InvalidCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_token", error_description="token is invalid""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: false,
+            class: AuthFailureClass::ExpiredCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_token", error_description="token is expired""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: false,
+            class: AuthFailureClass::RateLimited,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_request", error_description="too many failed authentication attempts""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: false,
+            class: AuthFailureClass::PreAuthGate,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_request", error_description="too many unauthenticated requests from this source""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: true,
+            class: AuthFailureClass::MissingCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: true,
+            class: AuthFailureClass::InvalidCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_token", error_description="token is invalid""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: true,
+            class: AuthFailureClass::ExpiredCredential,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_token", error_description="token is expired""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: true,
+            class: AuthFailureClass::RateLimited,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_request", error_description="too many failed authentication attempts""#,
+        },
+        ChallengeCell {
+            scope: Some("mcp:read mcp:write"),
+            omit: true,
+            class: AuthFailureClass::PreAuthGate,
+            expected: r#"Bearer resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write", error="invalid_request", error_description="too many unauthenticated requests from this source""#,
+        },
+    ];
+
+    /// The challenge builder yields the exact value of every
+    /// [`CHALLENGE_MATRIX`] cell with `resource_metadata` advertised (OAuth
+    /// configured).
+    #[test]
+    fn oauth_challenge_matrix_exact_values() -> anyhow::Result<()> {
+        const URL: &str = "https://mcp.example.test/.well-known/oauth-protected-resource/mcp";
+        let mut mismatches = Vec::new();
+        for cell in &CHALLENGE_MATRIX {
+            let challenge = ChallengeConfig {
+                scope: cell.scope.map(str::to_owned),
+                omit_error_on_missing: cell.omit,
+            };
+            let actual = build_www_authenticate_value(Some(URL), &challenge, cell.class);
+            if actual != cell.expected {
+                mismatches.push(format!(
+                    "scope={:?} omit={} class={:?}\n  actual:   {actual}\n  expected: {}",
+                    cell.scope, cell.omit, cell.class, cell.expected
+                ));
+            }
+        }
+        anyhow::ensure!(
+            mismatches.is_empty(),
+            "{} of 20 cells differ:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+        Ok(())
+    }
+
+    /// Without `resource_metadata` (no OAuth) the challenge ignores every
+    /// opt-in: no `scope`, and `error` is kept even for a missing credential.
+    #[test]
+    fn non_oauth_challenge_ignores_challenge_config() -> anyhow::Result<()> {
+        let opted_in = ChallengeConfig {
+            scope: Some("mcp:read".to_owned()),
+            omit_error_on_missing: true,
+        };
+        let cases = [
+            (
+                AuthFailureClass::MissingCredential,
+                r#"Bearer error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+            ),
+            (
+                AuthFailureClass::InvalidCredential,
+                r#"Bearer error="invalid_token", error_description="token is invalid""#,
+            ),
+            (
+                AuthFailureClass::ExpiredCredential,
+                r#"Bearer error="invalid_token", error_description="token is expired""#,
+            ),
+            (
+                AuthFailureClass::RateLimited,
+                r#"Bearer error="invalid_request", error_description="too many failed authentication attempts""#,
+            ),
+            (
+                AuthFailureClass::PreAuthGate,
+                r#"Bearer error="invalid_request", error_description="too many unauthenticated requests from this source""#,
+            ),
+        ];
+        for (class, expected) in cases {
+            for challenge in [&ChallengeConfig::default(), &opted_in] {
+                let actual = build_www_authenticate_value(None, challenge, class);
+                anyhow::ensure!(
+                    actual == expected,
+                    "{class:?} {challenge:?}\n  actual:   {actual}\n  expected: {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A state without a JWKS cache (no OAuth) answers a missing credential
+    /// with the unchanged API-key challenge and body even when the challenge
+    /// opt-ins are set.
+    #[tokio::test]
+    async fn unauthorized_response_without_oauth_never_emits_scope() -> anyhow::Result<()> {
+        let mut state = Arc::into_inner(test_auth_state(vec![])).context("sole state owner")?;
+        state.challenge = ChallengeConfig {
+            scope: Some("mcp:read".to_owned()),
+            omit_error_on_missing: true,
+        };
+
+        let resp = unauthorized_response(&state, AuthFailureClass::MissingCredential);
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(header::WWW_AUTHENTICATE)
+                .context("WWW-Authenticate header must be present")?
+                .to_str()?,
+            r#"Bearer error="invalid_request", error_description="missing bearer token or mTLS client certificate""#
+        );
+        let body = resp.into_body().collect().await?.to_bytes();
+        assert_eq!(body.as_ref(), b"unauthorized: missing credential");
+        Ok(())
+    }
+
+    /// Extreme but valid `challenge_scopes` (every RFC 6750 `NQCHAR` byte in
+    /// one token, 500 scopes, a 4096-byte token) still yield one valid
+    /// header value: no CR/LF, exactly four quoted parameters, and the scope
+    /// parameter carrying the joined list verbatim.
+    #[test]
+    fn challenge_with_extreme_valid_scopes_is_one_valid_header_value() -> anyhow::Result<()> {
+        let every_nqchar: String = (0x21_u8..=0x7E)
+            .filter(|byte| !matches!(byte, b'"' | b'\\'))
+            .map(char::from)
+            .collect();
+        let many: Vec<String> = (0..500_u16).map(|index| format!("scope:{index}")).collect();
+        let long = "a".repeat(4096);
+        for scope in [every_nqchar, many.join(" "), long] {
+            let challenge = ChallengeConfig {
+                scope: Some(scope.clone()),
+                omit_error_on_missing: false,
+            };
+            let value = build_www_authenticate_value(
+                Some("https://mcp.example.test/.well-known/oauth-protected-resource/mcp"),
+                &challenge,
+                AuthFailureClass::InvalidCredential,
+            );
+            let parsed =
+                HeaderValue::from_str(&value).context("challenge is a valid header value")?;
+            assert_eq!(parsed.as_bytes(), value.as_bytes());
+            assert!(!value.contains(['\r', '\n']), "single line: {value}");
+            assert_eq!(
+                value.matches('"').count(),
+                8,
+                "four quoted parameters: {value}"
+            );
+            assert!(
+                value.contains(&format!(", scope=\"{scope}\", error=")),
+                "{value}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `from_oauth` joins `challenge_scopes` with one space in configuration
+    /// order and copies the missing-credential flag; defaults stay off.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_config_from_oauth_joins_scopes_in_config_order() -> anyhow::Result<()> {
+        let builder = || {
+            OAuthConfig::builder(
+                "https://idp.example.test",
+                "mcp",
+                "https://idp.example.test/jwks.json",
+            )
+        };
+        let opted_in = builder()
+            .challenge_scopes(vec!["mcp:write".to_owned(), "mcp:read".to_owned()])
+            .omit_error_on_missing_credential(true)
+            .build();
+
+        let joined = ChallengeConfig::from_oauth(&opted_in);
+        let defaulted = ChallengeConfig::from_oauth(&builder().build());
+
+        anyhow::ensure!(
+            joined
+                == ChallengeConfig {
+                    scope: Some("mcp:write mcp:read".to_owned()),
+                    omit_error_on_missing: true,
+                },
+            "{joined:?}"
+        );
+        anyhow::ensure!(defaulted == ChallengeConfig::default(), "{defaulted:?}");
         Ok(())
     }
 
@@ -5962,6 +6355,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         })
     }
@@ -6225,6 +6619,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));

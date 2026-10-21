@@ -49,6 +49,9 @@ rmcp-server-kit/
 │   ├── bounded_limiter.rs      Memory-bounded keyed rate limiter (used by RBAC per-IP/per-tool limiter)
 │   ├── forwarded.rs            Trusted-forwarder client-IP resolution (XFF / RFC 7239, rightmost-untrusted)
 │   ├── oauth.rs                OAuth 2.1 JWT + JWKS cache (feature = "oauth")
+│   ├── oauth_as.rs             OAuth proxy `authorization_server` mode: register, consent, callback, token (feature = "oauth")
+│   ├── oauth_as/tests/         binding_near_misses.rs - unit tests of oauth_as.rs bindings
+│   ├── oauth_seal.rs           HMAC-SHA256 sealed values (`Sealer`) used by oauth_as.rs (feature = "oauth")
 │   ├── mtls_revocation.rs      CDP-driven CRL fetcher + cache + dynamic ClientCertVerifier
 │   ├── ssrf.rs                 Per-hop SSRF guard for outbound HTTP (JWKS / CRL / OAuth fetches)
 │   ├── admin.rs                Admin diagnostics router (/admin/*)
@@ -81,18 +84,31 @@ rmcp-server-kit/
 │       ├── limiter_memory.rs        (#[ignore]d release RSS gate)
 │       ├── metrics_handle.rs        (feature = "metrics")
 │       ├── metrics_headers.rs       (feature = "metrics")
+│       ├── oauth_as_proxy.rs        (feature = "oauth") `authorization_server` proxy mode end to end
+│       ├── oauth_as_proxy/          submodules of oauth_as_proxy.rs
+│       │   ├── client_name_spoofing.rs  Display-name spoofing characters at registration, name isolation on the consent page
+│       │   ├── page_markup.rs           Start tags and attribute names of served pages, shared by the page tests
+│       │   ├── page_markup_tables.rs    Table tests of the page-markup reader
+│       │   ├── phone_layout.rs          Phone readability and tap targets of the consent and error pages
+│       │   ├── refresh_and_replicas.rs  Refresh client binding and replicas that share one public origin
+│       │   ├── sealed_client_names.rs   Sealed client names that fail the registration rules, shown as unnamed
+│       │   └── wire_rejections.rs       Callback and token rejections observed through the real-listener harness
+│       ├── oauth_cases.rs           (feature = "oauth") executes the documented OAuth cases R1-R8, P1-P7 in docs/OAUTH_PROXY.md
+│       ├── oauth_cases/             grammar, runtime, environment, matrix and catalogue submodules of oauth_cases.rs
 │       ├── oauth_http_client.rs     (features = "oauth", "test-helpers")
 │       ├── origin_validation.rs
 │       └── ssrf_resolver.rs         (features = "oauth", "test-helpers")
 ├── examples/
 │   ├── minimal_server.rs     Minimal runnable example (`cargo run --example minimal_server`)
 │   ├── api_key_rbac.rs       API-key auth + RBAC + argument allowlist example
-│   └── oauth_server.rs       OAuth 2.1 resource server example (requires `--features oauth`)
+│   ├── oauth_server.rs       OAuth 2.1 resource server example (requires `--features oauth`)
+│   └── oauth_proxy_as_demo.rs  `authorization_server` proxy demo with a fake IdP (requires `--features oauth`)
 ├── docs/
 │   ├── GUIDE.md              ★ Consumer-facing guide (architecture, TOML config, examples)
 │   ├── ARCHITECTURE.md       ★ Deep architecture map for agents (file:line citations)
 │   ├── MINDMAP.md            ★ Mermaid mindmap of the project
 │   ├── MIGRATION.md          Version-migration notes
+│   ├── OAUTH_PROXY.md        OAuth proxy modes, flow dissections, knobs, Keycloak settings
 │   ├── RELEASING.md          Release process
 │   ├── rust-guidelines/      Vendored universal guidelines (core + overlays; do not edit)
 │   └── RUST_1_95_NOTES.md    Notes on Rust 1.95 idioms used here
@@ -163,7 +179,7 @@ rmcp-server-kit/
 | MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.99.0 build --all-features` |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
 | Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce`; `dash_gate.py --enforce` |
-| Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
+| Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
 
 **CI definition lives in**:
 
@@ -191,17 +207,18 @@ ephemeral loopback ports.
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
 `crl_trusted_origin`, `delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`,
 `jwks_key_cap`, `jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
-`metrics_headers`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
+`metrics_headers`, `oauth_as_proxy`, `oauth_cases`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
 
 **Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
-target in `Cargo.toml`; ten of them carry `required-features`, so running a
+target in `Cargo.toml`; thirteen of them carry `required-features`, so running a
 gated target without its features now **errors** with "requires the features"
 instead of silently running an empty binary:
 
 - `test-helpers`: `crl_h3_regression`, `crl_map_bounds`, `crl_trusted_origin`
-- `oauth`: `oauth_url_validation`
+- `oauth`: `oauth_url_validation`, `oauth_as_proxy`, `oauth_cases`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
-  `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`
+  `oauth_http_client`, `ssrf_resolver`
+- `oauth`, `oauth-mtls-client` **and** `test-helpers`: `e2e_oauth_mtls`
 - `metrics`: `metrics_handle`, `metrics_headers`
 
 Always use `--all-features` locally; CI additionally runs a feature matrix so
@@ -224,10 +241,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3014)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5505) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:989`) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2003)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3105)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5739) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:990`) | Builder-style config struct                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2019)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | Integration reference                    | [`tests/integration/e2e.rs`](tests/integration/e2e.rs)                | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -237,7 +254,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3657
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3838
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -255,7 +272,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       `origin_check_middleware` src/transport.rs:5160    │  spec: MCP origin validation
+        1. Origin check       `origin_check_middleware` src/transport.rs:5379    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -361,9 +378,15 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3748`)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3929`)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
+| OAuth `401` scope hint / bare missing-credential challenge | `src/auth.rs` - `ChallengeConfig`, `build_www_authenticate_value`; knobs `OAuthConfig::challenge_scopes`, `omit_error_on_missing_credential` |
+| OAuth step-up (`insufficient_scope` `403`)     | `src/rbac.rs` - `ScopeChallenge::unlocking_scope`, `decorate_scope_denial`; knob `OAuthConfig::insufficient_scope_challenge` |
+| Accepted JWT audiences (extra + resource URL)  | `src/oauth.rs` - `check_audience`, `validate_additional_audiences`; knobs `additional_audiences`, `accept_resource_audience`; resource URL built in `build_app_router` (`src/transport.rs`) |
+| OAuth proxy `authorization_server` mode        | `src/oauth_as.rs` - `install_routes`, `register`, `authorize`, `consent`, `callback`, `token`, `unwrap_refresh_token_param`; mode switch in `src/transport.rs` - `install_oauth_proxy_routes`; `ProxyMode` in `src/oauth.rs`; page headers `PageSecurityHeaders`; startup rules in `src/config.rs` - `check_shared_oauth_relations`; long-form docs `docs/OAUTH_PROXY.md` |
+| Sealed values (proxy registrations, consent, state, codes, refresh wrappers) | `src/oauth_seal.rs` - `Sealer`, `SealKind`, `MAX_SEALED_LEN`; keys from `OAuthProxyConfig::sealing_secret` / `sealing_secret_previous` |
+| OAuth opt-in startup logs (missing `public_url` WARN, opt-in INFO) | `src/transport.rs` - `build_app_router`, `log_enabled_oauth_opt_ins` |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
 | Per-tool argument allowlist                    | `src/rbac.rs` - `ArgumentAllowlist`, `argument_allowed` |
 | Per-IP tool rate limit                         | `src/rbac.rs` - `build_tool_rate_limiter`             |
@@ -382,20 +405,21 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4191`) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2003)       |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4372`) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2019)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
 | Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates,dash_gate}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
 | Vendored-guideline index / deviations register         | `RUST_GUIDELINES.md` (index); `docs/rust-guidelines/` (vendored bytes - never edit) |
 | Test tiers / `required-features` wiring                | `Cargo.toml` `[[test]]` tables; `tests/unit/` and `tests/integration/` |
+| Executed OAuth case examples / settings matrices       | `tests/integration/oauth_cases.rs` and `tests/integration/oauth_cases/` - `grammar::parse_cases`, `runtime::run_case`, `library::execute`, `environment::check_env`, `matrix_check::check_matrix`, `knobs::check_knobs`, `catalogue` `EXPECTED_CASES` (extend it with every new case); the cases themselves live in `docs/OAUTH_PROXY.md` section 7 |
 
 ---
 
 ## 10. Common pitfalls (history of bites)
 
-1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `build_app_router` middleware wiring in `src/transport.rs:2331`.
-2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2928`) - invalid JWTs would otherwise DoS the JWKS endpoint.
+1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `build_app_router` middleware wiring in `src/transport.rs:2347`.
+2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:3352`) - invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.
@@ -404,7 +428,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 8. **Warnings are errors, including locally.** `.cargo/config.toml` commits `[build] warnings = "deny"`, so a plain `cargo build` fails on any warning. For a transient work-in-progress check, prefix one command with `CARGO_BUILD_WARNINGS=allow` instead of editing the config (editing it invalidates the shared build cache). The config is excluded from the published package.
 9. **The MSRV job is lint-capped on purpose.** The GitHub `MSRV (1.99.0)` job (and the GitLab `msrv` job) run with `RUSTFLAGS="--cap-lints=warn"` and `CARGO_BUILD_WARNINGS=allow`; they prove the crate *compiles* on `rust-version = "1.99.0"`, not that it is lint-clean. Lint cleanliness is enforced on the latest stable by `clippy` and the feature matrix. Do not "fix" the cap or expect the MSRV job to fail on warnings.
 10. **A feature-gated test target errors instead of skipping.** The `[[test]]` tables carry `required-features`, so `cargo test --test e2e_oauth_mtls` without `--features oauth,test-helpers,oauth-mtls-client` fails with "requires the features" rather than running an empty binary. Locally always use `--all-features`; CI's feature matrix covers the narrower builds.
-11. **The mutants job is schedule-only and lint-capped.** `cargo-mutants` runs from the nightly `schedule` event (not on PRs), with `CARGO_BUILD_WARNINGS: allow` and a 180-minute per-shard cap, because deny-level lints make mutants unviable and a single shard otherwise approaches GitHub's 6-hour ceiling. It is advisory (`continue-on-error`).
+11. **The mutants job is schedule-only and lint-capped.** `cargo-mutants` runs from the nightly `schedule` event (not on PRs), with `CARGO_BUILD_WARNINGS: allow` and a 180-minute per-shard cap, because deny-level lints make mutants unviable and a single shard otherwise approaches GitHub's 6-hour ceiling. It is advisory (`continue-on-error`). The oauth-feature modules `src/oauth_as.rs` and `src/oauth_seal.rs` are covered by the separate `mutants-oauth` job (cargo-mutants ignores `cfg`, so they need `--features oauth`). On GitLab the default-feature `mutants` job covers `src/rbac.rs` and `src/auth.rs` in 4 shards; `src/oauth.rs` is mutation-tested by no job.
 
 ---
 

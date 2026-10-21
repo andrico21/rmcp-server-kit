@@ -30,7 +30,16 @@ You supply a `ServerHandler` implementation; rmcp-server-kit handles everything 
 - [Full Example: Building a Custom MCP Server](#full-example-building-a-custom-mcp-server)
 - [Client Usage Guide](#client-usage-guide)
 - [Recipes](#recipes)
-- [Configuration via TOML](#configuration-via-toml)
+  - [Recipe 1](#recipe-1-oauth-21-resource-server-jwt-validation) - OAuth 2.1 resource server
+  - [Recipe 2](#recipe-2-oauth-proxy--token-exchange--introspection) - OAuth proxy, token exchange, introspection
+  - [Recipe 3](#recipe-3-api-key--rbac--per-tool-argument-allowlist) - API key, RBAC, argument allowlist
+  - [Recipe 4](#recipe-4-mtls-server-client-certificate-authentication) - mTLS server
+  - [Recipe 5](#recipe-5-prometheus-metrics) - Prometheus metrics
+  - [Recipe 6](#recipe-6-tool-hooks-audit--deny--result-size-cap) - Tool hooks
+  - [Recipe 7](#recipe-7-keycloak-direct-mode-with-cimd) - Keycloak, direct mode with CIMD
+  - [Recipe 8](#recipe-8-oauth-proxy-in-authorization_server-mode) - OAuth proxy in `authorization_server` mode
+  - [OAuth proxy modes, flows and Keycloak settings](OAUTH_PROXY.md) - separate guide
+- [Configuration via TOML](#complete-toml-configuration-reference)
 - [Testing Your Server](#testing-your-server)
 
 ---
@@ -249,8 +258,13 @@ where
     F: Fn() -> H + Send + Sync + Clone + 'static,
 ```
 
-Starts the HTTP server. The `handler_factory` is a closure that creates a
-fresh handler for each MCP session. The server:
+Starts the HTTP server. The `handler_factory` is a closure that builds a
+handler. It runs for each new MCP session and, for MCP 2026-07-28 stateless
+requests, for each request. rmcp calls it before it validates the standard
+request headers, so building a handler does not mean a request will be
+dispatched to it. Keep the factory cheap, synchronous and safe to call
+repeatedly; share long-lived state (connection pools, task stores, caches)
+through `Arc` values captured by the closure. The server:
 
 - Binds TCP (or TLS when cert/key provided)
 - Registers `/healthz` (always 200), `/readyz` (custom or mirrors healthz),
@@ -1526,6 +1540,11 @@ role = "viewer"
 | `require_subject` | `bool` | `false` | Reject tokens that lack a `sub` (subject) claim. Leave `false` for client-credentials / machine-to-machine tokens, which legitimately carry no subject. |
 | `authorization_servers` | `Option<Vec<String>>` | _unset_ (topology) | RFC 9728 Protected Resource Metadata `authorization_servers`. **Unset resolves from topology**: the upstream `issuer` when `proxy` is absent, this server's own public URL (from `public_url`) when `proxy` is set. **Set it explicitly when your application mounts its own `/authorize` + `/token` via `with_extra_router` without `proxy`** - the crate cannot detect that case and would otherwise advertise the upstream issuer at a URL that 404s. An empty list omits the claim entirely (RFC 9728 §3.2). Validated at startup: no userinfo, no literal-IP host, scheme per `allow_http_oauth_urls`. See "OAuth discovery metadata" below. |
 | `authorization_server_metadata_issuer` | `Option<String>` | _unset_ (own URL) | RFC 8414 Authorization Server Metadata `issuer`, served by the proxy at `/.well-known/oauth-authorization-server`. **Unset publishes this server's own public URL (from `public_url`)**, as RFC 8414 §3.3 / §6.2 require. Legacy opt-out: set to your upstream `issuer` only when the IdP emits RFC 9207 `iss` and clients validate it. Validated at startup as above. |
+| `challenge_scopes` | `Option<Vec<String>>` | _unset_ | Opt-in. Adds `scope="..."` (entries joined by spaces, in configuration order) to the `401` `WWW-Authenticate` challenge so clients request least privilege first. When set the list must be non-empty, every entry must be an RFC 6750 `scope-token`, duplicates are rejected and `offline_access` is refused. Unset sends no `scope` parameter (3.20.0 behaviour). A default rmcp 3.6 client also requests every Protected Resource Metadata `scopes_supported` entry, so this hint alone does not limit its first request; see [which scopes rmcp 3.6 clients request](OAUTH_PROXY.md#9-scope-ordering-and-step-up). Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES` (comma-separated). |
+| `insufficient_scope_challenge` | `bool` | `false` | Opt-in. A tool call that RBAC denies gets `403` plus `WWW-Authenticate: Bearer error="insufficient_scope", scope="...", resource_metadata="..."` only when one more mapped scope would actually allow it (the role it would resolve to is simulated first); otherwise the bare `403` stays. Requires scope-based roles: `role_claim` unset and a non-empty `scopes` list whose scopes are all RFC 6750 `scope-token`s. See the step-up note below. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE`. |
+| `additional_audiences` | `Vec<String>` | `[]` | Opt-in. Extra `aud` values accepted next to `audience`. Entries must be non-empty, unique and different from `audience`. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES` (comma-separated). |
+| `accept_resource_audience` | `bool` | `false` | Opt-in. Also accept tokens whose `aud` is this server's RFC 8707 resource URL, `{public_url}/mcp`. Requires `public_url`; validation rejects it otherwise. `audience_validation_mode` still decides what happens to tokens for any other resource. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE`. |
+| `omit_error_on_missing_credential` | `bool` | `false` | Opt-in. A request that carries no credential at all gets a `401` challenge without `error` and `error_description`, as RFC 6750 section 3.1 recommends. The default keeps `error="invalid_request"`. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL`. |
 
 On-demand JWKS refresh is shared per cache. If several callers miss or observe
 an expired cache at once, they wait for the same upstream fetch. If one caller
@@ -1577,6 +1596,12 @@ It does **not** scan in token order, and it does not collect every match. Orderi
 significant: list the most specific mapping first. In the example above a token carrying both
 `mcp-admin` and `mcp-viewer` resolves to `admin`, because that mapping is declared first; swapping
 the two blocks would resolve it to `viewer`.
+
+The same order decides step-up with `insufficient_scope_challenge`: a scope is only offered when
+adding it to the token would resolve to a role that allows the denied call, so a narrow scope listed
+before a broader one can make the broader scope useless as a hint. List the most capable mapping
+first; [scope ordering and step-up](OAUTH_PROXY.md#9-scope-ordering-and-step-up) walks through the
+cases.
 
 A token whose claims match no mapping is rejected. See
 [One role per identity](#one-role-per-identity) for how to grant a caller the combined capability
@@ -1827,6 +1852,10 @@ strip_resource_param = false                             # set true for Microsof
 | `require_auth_on_admin_endpoints` | `bool` | `false` | Run the normal authentication middleware before `/introspect` and `/revoke`. **Recommended `true` for new deployments.** Pre-1.6 default of `false` is preserved for backward compatibility. |
 | `allow_unauthenticated_admin_endpoints` | `bool` | `false` | Operator opt-out for the M3 startup check that rejects `expose_admin_endpoints = true` combined with `require_auth_on_admin_endpoints = false`. Set `true` only when an authenticated reverse proxy / ingress screens `/introspect` and `/revoke` itself. Production should leave this `false` and set `require_auth_on_admin_endpoints = true` instead. |
 | `strip_resource_param` | `bool` | `false` | Drop the RFC 8707 `resource` parameter when forwarding `/authorize` and `/token` upstream. Set `true` for **Microsoft Entra ID (Azure AD) v2.0**, which rejects `resource` carried alongside a differing `api://` scope with `AADSTS9010010`; MCP clients send it because the MCP spec requires it. Only `resource` is ever dropped - `state`, `code_challenge`, `code_challenge_method`, `code_verifier`, `redirect_uri`, `nonce`, and `scope` are always forwarded, so this cannot disable PKCE or CSRF protection. `/introspect` and `/revoke` are unaffected. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM`. |
+| `mode` | `ProxyMode` (`"passthrough"` \| `"authorization_server"`) | `"passthrough"` | `"passthrough"` keeps the 3.20.0 proxy. `"authorization_server"` makes this server the authorization server clients see: sealed per-client registration at `/register`, a consent page, a local `/oauth/callback` that re-stamps `iss` with this server's issuer, and refresh tokens bound to the client. It requires `public_url`, `sealing_secret` and an unset `authorization_server_metadata_issuer`; see [`OAUTH_PROXY.md`](OAUTH_PROXY.md) for the flow and every startup rule. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE`. |
+| `sealing_secret` | `Option<SecretString>` | `None` | HMAC key for every sealed value in `authorization_server` mode (registrations, consent, state, codes, refresh wrappers). Required in that mode, at least 32 UTF-8 bytes and not whitespace-only; ignored in passthrough mode. Every replica must share it. Never logged; `Debug` prints it redacted. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` or `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE`. |
+| `sealing_secret_previous` | `Option<SecretString>` | `None` | Previous sealing key, accepted when opening sealed values but never used to seal, so a key rotation does not break in-flight registrations and consent. Same strength rule as `sealing_secret`, and it must differ from it; ignored in passthrough mode. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS` or `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE`. |
+| `consent_ttl` | `Option<String>` (humantime) | `None` (30 days) | How long a browser remembers consent for a client in `authorization_server` mode. `"0s"` shows the consent page every time; the maximum is 400 days. Read only in that mode, but validated whenever set. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL`. |
 
 #### `TokenExchangeConfig` (optional)
 
@@ -2556,6 +2585,43 @@ If you configure only an event store and then test the legacy session-bound path
 through another replica, rmcp still has to recover the session first; add a
 shared `SessionStore` and shared binding secret for that path.
 
+#### Standard request headers and nested x-mcp-header (2026-07-28)
+
+rmcp checks these rules only when a request's `MCP-Protocol-Version` header is
+2026-07-28 or later. Older clients see no change.
+
+- **Request metadata.** Every 2026-07-28 request other than `initialize` must
+  carry `_meta` with `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`.
+- **`Mcp-Method`.** Required on every request except `initialize`, and it must
+  equal the body's `method`. An `initialize` request may omit it, but a value
+  it does supply must still be `initialize`.
+- **`Mcp-Name`.** Required for `tools/call` and `prompts/get` (taken from
+  `params.name`), for `resources/read`, `resources/subscribe` and
+  `resources/unsubscribe` (from `params.uri`), and for `tasks/get`,
+  `tasks/update` and `tasks/cancel` (from `params.taskId`).
+- **`x-mcp-header` placement.** A tool's input schema may put `x-mcp-header`
+  only on a `string`, `integer` or `boolean` property reached from the root
+  through `properties` keys alone, not under `$ref`/`$defs`, `items`, or
+  `allOf`/`anyOf`/`oneOf`. Header names must be unique, compared
+  case-insensitively. An rmcp client drops a listed tool whose annotations
+  break these rules, and the server never checks an annotation outside the
+  `properties` chain.
+- **Nested enforcement.** Since rmcp 3.6.0, annotations on nested properties
+  are enforced for `tools/call`, as top-level ones are. The matching
+  `Mcp-Param-<name>` header is required when the argument is present and
+  rejected when it is absent or null. Its value is compared with the argument
+  after decoding the `=?base64?...?=` form.
+
+A request that breaks any of these rules gets HTTP 400 with a JSON-RPC error
+body. They're integrity checks between headers and body, not authorization:
+RBAC still authorizes `tools/call` on the JSON-RPC body, including any
+argument allowlist.
+
+Nested enforcement depends on rmcp 3.6.0 or later in your resolved dependency
+tree. This crate requires `rmcp = "3"`, so check `Cargo.lock` if you rely on
+it.
+
 ### Customising security headers
 
 By default, rmcp-server-kit emits twelve OWASP security headers on every
@@ -3220,6 +3286,112 @@ let handler_factory = move || with_hooks(MyHandler, Arc::clone(&hooks));
 serve(config.validate()?, handler_factory).await
 ```
 
+### Recipe 7: Keycloak, direct mode with CIMD
+
+No proxy: MCP clients register with Keycloak through a Client ID Metadata
+Document (CIMD) and log in there, and this server only validates the access
+tokens. Requires `oauth`. The opt-ins below are all off by default; each one
+is described in the [`OAuthConfig`](#oauthconfig) field table.
+
+```toml
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example.com"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://keycloak.example.com/realms/my-realm"
+audience = "my-mcp-server"
+jwks_uri = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs"
+# Keycloak with resource indicators puts the resource URL in `aud`:
+# accept https://mcp.example.com/mcp as well as `audience`.
+accept_resource_audience = true
+# Tell clients which scope to request first (401 challenge).
+challenge_scopes = ["mcp:read"]
+# Offer a step-up scope on a 403 when it would unlock the call.
+insufficient_scope_challenge = true
+# RFC 6750 3.1: no `error` when the request carries no credential.
+omit_error_on_missing_credential = true
+
+# Most capable mapping first: first match in configuration order wins.
+[[server.auth.oauth.scopes]]
+scope = "mcp:admin"
+role = "admin"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+```
+
+`public_url` is required here: it is the origin of the resource URL that
+`accept_resource_audience` accepts, and without it validation fails. What to
+set in Keycloak (CIMD, audience mappers, client scopes) is in
+[`OAUTH_PROXY.md`, Keycloak settings for direct mode](OAUTH_PROXY.md#direct-mode);
+the flow itself is dissected in
+[direct mode](OAUTH_PROXY.md#2-flow-dissection-direct-mode).
+
+Complete, tested variants: see cases
+[R1-R8](OAUTH_PROXY.md#settings-matrix-resource-server) in
+[docs/OAUTH_PROXY.md](OAUTH_PROXY.md#7-configuration-examples).
+
+### Recipe 8: OAuth proxy in `authorization_server` mode
+
+For clients that need this server to be the authorization server, in front
+of one static Keycloak client: this server registers clients itself, shows a
+per-client consent page, receives Keycloak's redirect at
+`/oauth/callback` and sends the browser back to the client with
+`iss` set to its own issuer. Keycloak needs exactly one redirect URI,
+`https://mcp.example.com/oauth/callback`. Requires `oauth`.
+
+```toml
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example.com"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://keycloak.example.com/realms/my-realm"
+audience = "my-mcp-server"
+jwks_uri = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:admin"
+role = "admin"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+
+[server.auth.oauth.proxy]
+authorize_url = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/auth"
+token_url = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token"
+client_id = "my-mcp-server"
+client_secret = "replace-with-the-keycloak-client-secret"
+mode = "authorization_server"
+# Placeholder so the file validates on its own. In production omit it and set
+# RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE instead.
+sealing_secret = "replace-with-at-least-32-random-bytes-from-a-secret-store"
+consent_ttl = "30d"
+```
+
+Every replica behind one load balancer must run the same `mode`,
+`public_url` and `sealing_secret`; no sticky sessions are needed. The
+[`OAUTH_PROXY.md` guide](OAUTH_PROXY.md#4-flow-dissection-authorization_server-proxy)
+covers the flow step by step, the startup rules, secret rotation with
+`sealing_secret_previous`, the Keycloak settings and the migration from
+passthrough. To try the flow locally against an in-process fake identity
+provider, run `cargo run --example oauth_proxy_as_demo --features oauth`.
+
+Complete, tested variants: see cases
+[P3-P7](OAUTH_PROXY.md#settings-matrix-proxy) in
+[docs/OAUTH_PROXY.md](OAUTH_PROXY.md#7-configuration-examples).
+
 ---
 
 ### Complete TOML configuration reference
@@ -3304,6 +3476,13 @@ jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # env: RMCP_SERVER_
 # narrow that set - HS* and `none` are never selectable.
 allowed_algorithms = ["RS256"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS
 jwks_cache_ttl = "10m"
+# Optional opt-ins, all off by default. List-valued env variables take a
+# comma-separated value.
+# challenge_scopes = ["mcp:read"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES
+# insufficient_scope_challenge = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE
+# additional_audiences = ["https://mcp.example.com/mcp"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES
+# accept_resource_audience = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE
+# omit_error_on_missing_credential = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL
 
 [[server.auth.oauth.scopes]]
 scope = "mcp:admin"
@@ -3324,6 +3503,14 @@ client_id = "my-mcp-server"
 # alongside a differing api:// scope (AADSTS9010010). Leave false to
 # preserve spec behaviour. Never strips PKCE/state/redirect_uri.
 strip_resource_param = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM
+# Proxy mode: "passthrough" (default) or "authorization_server". The sealing
+# secrets and consent_ttl are only read in "authorization_server" mode.
+# mode = "passthrough"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE
+# sealing_secret = "replace-with-32-plus-random-bytes"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET
+# sealing_secret_previous = "previous-secret-kept-during-rotation"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS
+# (Kubernetes: use RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE and
+# RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE to supply them from mounted Secret files.)
+# consent_ttl = "30d"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL
 
 [rbac]
 enabled = true
@@ -3430,6 +3617,13 @@ selects the separate `serve_stdio()` entry point, which bypasses auth, RBAC,
 TLS, and origin checks entirely. Routing between `serve()` and `serve_stdio()`
 is the caller's responsibility; the bridge covers `serve()` only.
 
+**stdio transport limits.** With rmcp 3.6.0 or later resolved, `serve_stdio()`
+drops (and logs) any incoming line over 16 MiB without a JSON-RPC reply, so
+that request stays pending until the client times out or cancels, and it drops
+a final message that has no trailing newline at EOF. `serve_stdio()` keeps
+rmcp's blocking `stdio()`; to get rmcp's non-blocking Linux pipe transport,
+serve your handler with `rmcp::transport::stdio_pipes()` yourself.
+
 ### Environment variable overrides (opt-in)
 
 Environment reading is never automatic. `serve()`, `validate()`, and every config constructor read no process environment. Three opt-in methods layer env overrides onto already-constructed config structs:
@@ -3482,6 +3676,17 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS` | `server.auth.oauth.allowed_algorithms` | comma-separated algorithm list | requires `oauth` feature; may only narrow the built-in set |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM` | `server.auth.oauth.proxy.strip_resource_param` | bool | requires `oauth` feature; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES` | `server.auth.oauth.challenge_scopes` | comma-separated scope list | requires `oauth` feature; an empty list is rejected |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE` | `server.auth.oauth.insufficient_scope_challenge` | bool | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES` | `server.auth.oauth.additional_audiences` | comma-separated audience list | requires `oauth` feature; an empty list is rejected |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE` | `server.auth.oauth.accept_resource_audience` | bool | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL` | `server.auth.oauth.omit_error_on_missing_credential` | bool | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE` | `server.auth.oauth.proxy.mode` | ProxyMode | requires `oauth` feature; `passthrough` or `authorization_server`; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` | `server.auth.oauth.proxy.sealing_secret` | SecretString | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE` | `server.auth.oauth.proxy.sealing_secret` | Path | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS` | `server.auth.oauth.proxy.sealing_secret_previous` | SecretString | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE` | `server.auth.oauth.proxy.sealing_secret_previous` | Path | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL` | `server.auth.oauth.proxy.consent_ttl` | humantime duration | requires `oauth` feature; also requires `[server.auth.oauth.proxy]` to be declared |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT` | `observability.log_format` | String | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED` | `observability.metrics_enabled` | bool | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND` | `observability.metrics_bind` | String | |
@@ -3492,6 +3697,8 @@ call order is:
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT` | `rbac.redaction_salt` | SecretString | secret; redacted in report |
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` | `rbac.redaction_salt` | Path | secret; redacted in report |
 <!-- END ENV_OVERRIDE_TABLE -->
+
+Replicas behind one load balancer must use identical values for every OAuth opt-in and proxy variable: these knobs change the wire behaviour, so replicas that disagree answer the same client differently.
 
 #### Naming convention
 
@@ -3511,6 +3718,8 @@ An empty or whitespace-only salt (either form) is rejected with `RmcpServerKitEr
 
 **File normalization.** Exactly one terminal line ending is stripped from the file contents: `\r\n` (CRLF), a lone `\n` (LF), or a lone `\r` (CR). All other content is preserved exactly, including leading and trailing spaces and any internal newlines. The same logical secret therefore produces the same redaction salt whether supplied inline (no trailing newline) or written to a file with a standard trailing newline (`echo "my-salt" > salt.txt` produces `my-salt\n`, which normalizes to `my-salt`). Spaces surrounding the value are significant: `"  my-salt  "` and `"my-salt"` hash differently.
 
+The proxy sealing secrets (`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` and `..._SEALING_SECRET_PREVIOUS`, each with a `_FILE` sibling) follow the same rules as `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET`: the direct and `_FILE` variables of one secret must not both be set, the file loses exactly one terminal line ending, and the value must be at least 32 UTF-8 bytes and not whitespace-only. Every error names the variable and never echoes the value.
+
 #### Audit report
 
 Each method returns `Vec<EnvOverride>`. Each entry carries:
@@ -3520,13 +3729,13 @@ Each method returns `Vec<EnvOverride>`. Each entry carries:
 - `source` - `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
 - `value` - the applied string for non-secret targets; `None` for secret-typed targets
 
-Secret-typed targets (`server.session_binding_secret`, `rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
+Secret-typed targets (`server.session_binding_secret`, `server.auth.oauth.proxy.sealing_secret`, `server.auth.oauth.proxy.sealing_secret_previous`, `rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
 
 #### `oauth` feature interaction
 
-The three `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variables require the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `RmcpServerKitError::Config` naming the variable and stating it requires the `oauth` feature.
+Every `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variable requires the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `RmcpServerKitError::Config` naming the variable and stating it requires the `oauth` feature.
 
-When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `RmcpServerKitError::Config` instructing the operator to declare `[server.auth.oauth]` first.
+When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `RmcpServerKitError::Config` instructing the operator to declare `[server.auth.oauth]` first. Likewise every `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__*` variable requires a declared `[server.auth.oauth.proxy]` table.
 
 The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in a ConfigMap (with `role_claim` and other static RBAC-mapping config), and supply the environment-specific `issuer`, `audience`, and `jwks_uri` via Secrets or Deployment env vars.
 

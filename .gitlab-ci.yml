@@ -272,7 +272,8 @@ docs-validate:
   script:
     - rtk cargo nextest run --all-features --test docs_citations
     - (cd docs/rust-guidelines && sha256sum -c SHA256SUMS)
-    - rtk lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
+    - rtk lychee --version
+    - rtk lychee --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md
 
 # ---------------------------------------------------------------------------
 # Docs stage: rustdoc + SECURITY.md grep gates (mirrors GitHub `docs` job)
@@ -365,13 +366,45 @@ mutants:
       allow_failure: true
   allow_failure: true
   timeout: 4h
+  parallel: 4
+  variables:
+    # Mutation runs only need the build to compile. Deny-level lints make
+    # mutants unviable, so cap lints via `--cap-lints=true` and let warnings
+    # through for this job.
+    CARGO_BUILD_WARNINGS: allow
+  # src/oauth.rs is compiled only with --features oauth and is left out, as on GitHub (its mutants could only report MISSED here);
+  # src/oauth_as.rs and src/oauth_seal.rs run in mutants-oauth. 360 s matches GitHub MUTANTS_TEST_TIMEOUT;
+  # about 364 mutants at ~1.44 min each need 4 shards to fit the 4 h job timeout.
+  script:
+    - rtk cargo mutants --no-shuffle --cap-lints=true --timeout 360 --sharding round-robin --shard $((CI_NODE_INDEX - 1))/$CI_NODE_TOTAL -f src/rbac.rs -f src/auth.rs || true
+  artifacts:
+    when: always
+    expire_in: 1 month
+    paths:
+      - mutants.out
+
+# `src/oauth_as.rs` and `src/oauth_seal.rs` are compiled only with
+# `--features oauth`; cargo-mutants does not understand `cfg`, so they need
+# their own job (default-feature mutants would all report MISSED). 210 mutants
+# at ~1.44 min x (264 s oauth suite / 218 s) each: 4 shards ~ 92 min each.
+mutants-oauth:
+  stage: nightly
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+  allow_failure: true
+  timeout: 4h
+  parallel: 4
   variables:
     # Mutation runs only need the build to compile. Deny-level lints make
     # mutants unviable, so cap lints via `--cap-lints=true` and let warnings
     # through for this job.
     CARGO_BUILD_WARNINGS: allow
   script:
-    - rtk cargo mutants --no-shuffle --cap-lints=true --timeout 300 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
+    - rtk cargo mutants --no-shuffle --cap-lints=true --timeout 360 --features oauth --sharding round-robin --shard $((CI_NODE_INDEX - 1))/$CI_NODE_TOTAL -f src/oauth_as.rs -f src/oauth_seal.rs || true
   artifacts:
     when: always
     expire_in: 1 month

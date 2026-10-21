@@ -238,8 +238,8 @@ mod tests {
     use super::*;
     use crate::{
         auth::{
-            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenCredentials,
-            default_max_concurrent_verifications,
+            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, ChallengeConfig,
+            SeenCredentials, default_max_concurrent_verifications,
         },
         rbac::{RbacConfig, RoleConfig},
     };
@@ -262,6 +262,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         })
     }
@@ -286,6 +287,7 @@ mod tests {
         let mut req = Request::builder().uri(uri).body(Body::empty())?;
         if let Some(assigned_role) = role {
             let _previous = req.extensions_mut().insert(AuthIdentity {
+                granted_scopes: None,
                 name: "tester".into(),
                 role: assigned_role.to_owned(),
                 method: AuthMethod::BearerToken,

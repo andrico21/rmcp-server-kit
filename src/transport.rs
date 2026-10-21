@@ -57,13 +57,16 @@ use crate::oauth::JwksCache;
 #[cfg(feature = "oauth")]
 use crate::oauth::OAuthConfig;
 #[cfg(feature = "oauth")]
-use crate::oauth::{OAuthProxyConfig, OauthHttpClient};
+use crate::oauth::{OAuthProxyConfig, OauthHttpClient, ProxyMode};
+#[cfg(feature = "oauth")]
+use crate::rbac::ScopeChallenge;
 use crate::{
     admin::AdminState,
     auth::{
-        ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState, MtlsConfig,
-        SeenCredentials, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
-        extract_mtls_identity, resolve_max_concurrent_verifications,
+        ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState,
+        ChallengeConfig, MtlsConfig, SeenCredentials, TlsConnInfo, auth_middleware,
+        build_pre_auth_limiter, build_rate_limiter, extract_mtls_identity,
+        resolve_max_concurrent_verifications,
     },
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
@@ -75,6 +78,8 @@ use crate::{
         session_binding_middleware,
     },
 };
+#[cfg(feature = "oauth")]
+use crate::{oauth_as::unwrap_refresh_token_param, oauth_seal::Sealer};
 
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
 /// at the public API boundary, flattening the chain via the alternate
@@ -1851,6 +1856,8 @@ impl McpServerConfig {
     /// configuration violates: admin/auth wiring, TLS cert-key pairing, mTLS
     /// without TLS, bind address, URL, origin, or size-limit checks.
     fn check(&self) -> Result<(), RmcpServerKitError> {
+        #[cfg(feature = "oauth")]
+        use crate::config::check_shared_oauth_relations;
         use crate::config::{
             SharedConfigViolation, check_auth_nested_config, check_shared_config_invariants,
         };
@@ -1968,6 +1975,19 @@ impl McpServerConfig {
         // 10. Nested auth config: API-key identities, OAuth URL/capacity
         //     checks, auth limiter capacity, and mTLS capacity.
         check_auth_nested_config(self.auth.as_ref())?;
+
+        // 10b. Relations between the OAuth opt-ins and public_url /
+        //      allowed_origins (shared with the TOML validator). Runs
+        //      whenever OAuth is configured, even with auth disabled: the
+        //      proxy routes are mounted regardless of `auth.enabled`.
+        #[cfg(feature = "oauth")]
+        if let Some(oauth_cfg) = self.auth.as_ref().and_then(|auth| auth.oauth.as_ref()) {
+            check_shared_oauth_relations(
+                oauth_cfg,
+                self.public_url.as_deref(),
+                &self.allowed_origins,
+            )?;
+        }
 
         // 11. tls_handshake_timeout must be > 0. A zero deadline would
         //     reap every handshake before it could complete, rejecting
@@ -2437,6 +2457,23 @@ where
     // Build the MCP route, optionally wrapped with auth and RBAC middleware.
     let mut mcp_router = axum::Router::new().nest_service("/mcp", mcp_service);
 
+    // This server's origin and RFC 9728 resource identifier: advertised by
+    // the Protected Resource Metadata below and, when the operator opts in,
+    // accepted as a JWT audience.
+    let server_url = derive_server_url(&config);
+    let resource_url = format!("{server_url}/mcp");
+
+    #[cfg(feature = "oauth")]
+    if let Some(oauth_config) = config.auth.as_ref().and_then(|auth| auth.oauth.as_ref()) {
+        if config.public_url.is_none() {
+            tracing::warn!(
+                resource = %resource_url,
+                "OAuth is configured without public_url: Protected Resource Metadata advertises a resource derived from the bind address and the 401 challenge carries a relative resource_metadata URL; set server.public_url (env RMCP_SERVER_KIT__SERVER__PUBLIC_URL)"
+            );
+        }
+        log_enabled_oauth_opt_ins(oauth_config);
+    }
+
     // Build auth state eagerly when auth is configured so we can wire both
     // the auth middleware *and* the optional admin router against the same
     // state. The middleware itself is installed further down in layer order.
@@ -2450,10 +2487,29 @@ where
                 .oauth
                 .as_ref()
                 .map(|oauth_cfg| {
-                    JwksCache::with_shutdown(oauth_cfg, ct.child_token()).map(Arc::new)
+                    // Only a configured `public_url` makes `resource_url` an
+                    // external identifier a client could have been issued a
+                    // token for; the bind-address fallback never qualifies.
+                    let resource_audience = (oauth_cfg.accept_resource_audience
+                        && config.public_url.is_some())
+                    .then(|| resource_url.clone());
+                    JwksCache::with_shutdown_and_resource_audience(
+                        oauth_cfg,
+                        ct.child_token(),
+                        resource_audience,
+                    )
+                    .map(Arc::new)
                 })
                 .transpose()
                 .context("JWKS HTTP client")?;
+            #[cfg(feature = "oauth")]
+            let challenge = auth_config
+                .oauth
+                .as_ref()
+                .map(ChallengeConfig::from_oauth)
+                .unwrap_or_default();
+            #[cfg(not(feature = "oauth"))]
+            let challenge = ChallengeConfig::default();
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
@@ -2478,6 +2534,7 @@ where
                 // client was actually challenged from.
                 resource_metadata_url: config.public_url.as_deref().map(mcp_resource_metadata_url),
                 log_context: AuthLogContext::new(&config.log_context, &rbac_swap.load()),
+                challenge,
             }))
         }
         _ => None,
@@ -2564,10 +2621,38 @@ where
 
         let rbac_for_mw = Arc::clone(&rbac_swap);
         let deny_log_knobs = DenyLogKnobs::from_config(&config.log_context);
+        #[cfg(feature = "oauth")]
+        let scope_challenge = config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.oauth.as_ref())
+            .filter(|oauth| oauth.insufficient_scope_challenge)
+            .map(|oauth| {
+                Arc::new(ScopeChallenge {
+                    scope_roles: oauth
+                        .scopes
+                        .iter()
+                        .map(|mapping| (mapping.scope.clone(), mapping.role.clone()))
+                        .collect(),
+                    resource_metadata: config.public_url.as_deref().map_or_else(
+                        || "/.well-known/oauth-protected-resource".into(),
+                        mcp_resource_metadata_url,
+                    ),
+                })
+            });
+        #[cfg(not(feature = "oauth"))]
+        let scope_challenge = None;
         mcp_router = mcp_router.layer(from_fn(move |req, next| {
             let policy = rbac_for_mw.load_full();
             let tl = tool_limiter.clone();
-            rbac_middleware(policy, tl, deny_log_knobs, req, next)
+            rbac_middleware(
+                policy,
+                tl,
+                deny_log_knobs,
+                scope_challenge.clone(),
+                req,
+                next,
+            )
         }));
     }
 
@@ -2671,9 +2756,6 @@ where
     // authorization_servers - this tells MCP clients (e.g. Claude Code SDK)
     // that the server exists but does NOT require OAuth authentication,
     // preventing them from gating the connection behind a broken auth flow.
-    let server_url = derive_server_url(&config);
-    let resource_url = format!("{server_url}/mcp");
-
     #[cfg(feature = "oauth")]
     let prm_metadata = if let Some(auth_config) = &config.auth
         && let Some(oauth_config) = &auth_config.oauth
@@ -2722,6 +2804,7 @@ where
             auth_state.as_ref(),
             config.max_request_body,
             &config.admin_role,
+            &config.name,
         )?;
     }
 
@@ -3005,6 +3088,15 @@ fn spawn_external_shutdown_bridge(
 /// token. This typestate guarantees, at compile time, that the server
 /// never starts with an invalid configuration.
 ///
+/// # Handler factory
+///
+/// `handler_factory` runs for each new MCP session and, for MCP 2026-07-28
+/// stateless requests, for each request. rmcp calls it before it validates
+/// the standard request headers, so building a handler does not mean a
+/// request will be dispatched to it. Keep the factory cheap, synchronous and
+/// safe to call repeatedly; share long-lived state (connection pools, task
+/// stores, caches) through `Arc` values captured by the closure.
+///
 /// # Errors
 ///
 /// Returns [`RmcpServerKitError::Startup`] if binding to `config.bind_addr`
@@ -3077,6 +3169,15 @@ where
 /// All three optional parameters degrade gracefully: if `ready_tx` is
 /// `None`, no signal is sent; if `shutdown` is `None`, the server only
 /// stops on an OS signal (just like [`serve`]).
+///
+/// # Handler factory
+///
+/// `handler_factory` runs for each new MCP session and, for MCP 2026-07-28
+/// stateless requests, for each request. rmcp calls it before it validates
+/// the standard request headers, so building a handler does not mean a
+/// request will be dispatched to it. Keep the factory cheap, synchronous and
+/// safe to call repeatedly; share long-lived state (connection pools, task
+/// stores, caches) through `Arc` values captured by the closure.
 ///
 /// # Errors
 ///
@@ -3342,6 +3443,7 @@ fn install_oauth_proxy_routes(
     auth_state: Option<&Arc<AuthState>>,
     max_request_body: usize,
     admin_role: &str,
+    server_name: &str,
 ) -> Result<axum::Router, RmcpServerKitError> {
     use axum::{
         extract::RawQuery,
@@ -3350,11 +3452,35 @@ fn install_oauth_proxy_routes(
     };
     use tower_http::limit::RequestBodyLimitLayer;
 
-    use crate::oauth::{authorization_server_metadata, handle_authorize, handle_token};
+    use crate::{
+        oauth::{authorization_server_metadata, handle_authorize, handle_token},
+        oauth_as::{admin_sealer, install_routes},
+    };
 
     let Some(proxy) = &oauth_config.proxy else {
         return Ok(router);
     };
+
+    match proxy.mode {
+        ProxyMode::Passthrough => {}
+        ProxyMode::AuthorizationServer => {
+            let facade = install_routes(oauth_config, server_url, server_name)?;
+            let http = OauthHttpClient::with_config(oauth_config)?;
+            let admin = if proxy.expose_admin_endpoints
+                && (proxy.introspection_url.is_some() || proxy.revocation_url.is_some())
+            {
+                let sealer = Arc::new(admin_sealer(proxy)?);
+                build_oauth_admin_router(proxy, http, auth_state, admin_role, Some(sealer))?
+            } else {
+                axum::Router::new()
+            };
+            return Ok(router.merge(
+                facade
+                    .merge(admin)
+                    .layer(RequestBodyLimitLayer::new(max_request_body)),
+            ));
+        }
+    }
 
     // Single shared HTTP client for all proxy endpoints. Cloning is
     // cheap (refcounted) and shares the underlying connection pool.
@@ -3425,7 +3551,7 @@ fn install_oauth_proxy_routes(
     }
 
     let admin_router = if admin_routes_enabled {
-        build_oauth_admin_router(proxy, http, auth_state, admin_role)?
+        build_oauth_admin_router(proxy, http, auth_state, admin_role, None)?
     } else {
         axum::Router::new()
     };
@@ -3464,6 +3590,7 @@ fn build_oauth_admin_router(
     http: OauthHttpClient,
     auth_state: Option<&Arc<AuthState>>,
     admin_role: &str,
+    refresh_unwrap: Option<Arc<Sealer>>,
 ) -> Result<axum::Router, RmcpServerKitError> {
     use axum::{middleware::from_fn, routing::post};
 
@@ -3475,24 +3602,46 @@ fn build_oauth_admin_router(
     if proxy.introspection_url.is_some() {
         let proxy_introspect = proxy.clone();
         let introspect_http = http.clone();
+        let unwrap = refresh_unwrap.clone();
         admin_router = admin_router.route(
             "/introspect",
             post(move |body: String| {
                 let proxy_config = proxy_introspect.clone();
                 let http_client = introspect_http.clone();
-                async move { handle_introspect(&http_client, &proxy_config, &body).await }
+                let token_sealer = unwrap.clone();
+                async move {
+                    let upstream_body = match token_sealer {
+                        Some(sealer) => match unwrap_refresh_token_param(&sealer, &body) {
+                            Ok(adapted) => adapted,
+                            Err(response) => return response,
+                        },
+                        None => body,
+                    };
+                    handle_introspect(&http_client, &proxy_config, &upstream_body).await
+                }
             }),
         );
     }
     if proxy.revocation_url.is_some() {
         let proxy_revoke = proxy.clone();
         let revoke_http = http;
+        let unwrap = refresh_unwrap;
         admin_router = admin_router.route(
             "/revoke",
             post(move |body: String| {
                 let proxy_config = proxy_revoke.clone();
                 let http_client = revoke_http.clone();
-                async move { handle_revoke(&http_client, &proxy_config, &body).await }
+                let token_sealer = unwrap.clone();
+                async move {
+                    let upstream_body = match token_sealer {
+                        Some(sealer) => match unwrap_refresh_token_param(&sealer, &body) {
+                            Ok(adapted) => adapted,
+                            Err(response) => return response,
+                        },
+                        None => body,
+                    };
+                    handle_revoke(&http_client, &proxy_config, &upstream_body).await
+                }
             }),
         );
     }
@@ -3524,6 +3673,36 @@ fn build_oauth_admin_router(
             })))
     } else {
         Ok(admin_router_with_headers)
+    }
+}
+
+/// Log, once at router build, which OAuth conformance opt-ins are enabled.
+///
+/// Silent while every opt-in keeps its 3.20.0 default, so an unchanged
+/// configuration emits no new line. Logs counts and booleans only, never a
+/// scope or audience value.
+#[cfg(feature = "oauth")]
+fn log_enabled_oauth_opt_ins(oauth: &OAuthConfig) {
+    let proxy_mode = oauth
+        .proxy
+        .as_ref()
+        .map_or(ProxyMode::Passthrough, |proxy| proxy.mode);
+    let any_enabled = oauth.challenge_scopes.is_some()
+        || oauth.insufficient_scope_challenge
+        || !oauth.additional_audiences.is_empty()
+        || oauth.accept_resource_audience
+        || oauth.omit_error_on_missing_credential
+        || matches!(proxy_mode, ProxyMode::AuthorizationServer);
+    if any_enabled {
+        tracing::info!(
+            challenge_scopes = oauth.challenge_scopes.as_ref().map_or(0, Vec::len),
+            insufficient_scope_challenge = oauth.insufficient_scope_challenge,
+            additional_audiences = oauth.additional_audiences.len(),
+            accept_resource_audience = oauth.accept_resource_audience,
+            omit_error_on_missing_credential = oauth.omit_error_on_missing_credential,
+            proxy_mode = %proxy_mode.as_str(),
+            "oauth opt-in features enabled"
+        );
     }
 }
 
@@ -4382,6 +4561,8 @@ pub(crate) async fn security_headers_middleware(
     use axum::http::header;
 
     let mut resp = next.run(req).await;
+    #[cfg(feature = "oauth")]
+    let page_headers = resp.extensions().get::<PageSecurityHeaders>().cloned();
     let headers = resp.headers_mut();
 
     // Strip server identity headers to reduce information leakage.
@@ -4464,7 +4645,35 @@ pub(crate) async fn security_headers_middleware(
         );
     }
 
+    #[cfg(feature = "oauth")]
+    if let Some(page) = page_headers {
+        let _csp = headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(page.csp),
+        );
+        let _referrer = headers.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("same-origin"),
+        );
+        let _cache = headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     resp
+}
+
+/// Mandatory browser-page policy, independent of API-header operator overrides.
+#[cfg(feature = "oauth")]
+#[derive(Clone)]
+pub(crate) struct PageSecurityHeaders {
+    /// Mandatory script-free policy for this page type.
+    csp: &'static str,
+}
+
+#[cfg(feature = "oauth")]
+impl PageSecurityHeaders {
+    /// Mark an authorization page with its script-free policy.
+    pub(crate) const fn new(csp: &'static str) -> Self {
+        Self { csp }
+    }
 }
 
 /// Set a single security header on the response, honouring the
@@ -4607,7 +4816,10 @@ pub(crate) fn validate_security_headers(
 /// cancel-safe: the only await is `next.run(req)`; header mutation afterwards
 /// is synchronous, so cancellation simply drops the response before it is sent.
 #[cfg(feature = "oauth")]
-async fn oauth_token_cache_headers_middleware(req: Request<Body>, next: Next) -> Response {
+pub(crate) async fn oauth_token_cache_headers_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     use axum::http::header;
 
     let mut resp = next.run(req).await;
@@ -4996,7 +5208,11 @@ fn parse_request_origin_tuple(value: &str) -> Option<(String, String, u16)> {
 
 /// Parse a configured allowlist entry: the request rules, plus one optional
 /// root trailing `/`, which is normalized away.
-fn parse_config_origin_tuple(value: &str) -> Option<(String, String, u16)> {
+///
+/// Also used by `config::check_shared_oauth_relations` so the startup check
+/// that the `public_url` origin is allowlisted normalizes exactly like the
+/// runtime origin check.
+pub(crate) fn parse_config_origin_tuple(value: &str) -> Option<(String, String, u16)> {
     parse_origin(value, true)
 }
 
@@ -5490,6 +5706,21 @@ fn mask_session_id_for_log(value: &str) -> String {
 /// Use this only when the MCP client spawns the server as a trusted subprocess
 /// (e.g. Claude Desktop, VS Code Copilot). For network-accessible deployments,
 /// use `serve()` (Streamable HTTP) instead.
+///
+/// # Transport limits
+///
+/// With rmcp 3.6.0 or later resolved, an incoming line longer than 16 MiB is
+/// dropped and logged with no JSON-RPC reply, so that request stays pending
+/// until the client times out or cancels it. A final message without a
+/// trailing newline at EOF is also dropped.
+///
+/// This function keeps rmcp's blocking `rmcp::transport::stdio()`.
+/// Applications on rmcp 3.6.0 or later that want rmcp's non-blocking Linux
+/// pipe transport can serve their handler with
+/// `rmcp::transport::stdio_pipes()` themselves. On Linux it panics when
+/// called outside a Tokio runtime or inside one built without the IO driver;
+/// on other platforms, or when stdin and stdout are not both pipes, it falls
+/// back to the blocking stdio handles.
 ///
 /// # Errors
 ///
@@ -6020,6 +6251,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         Ok((state, token))
@@ -8330,7 +8562,7 @@ mod tests {
     async fn expired_api_key_through_real_wiring_names_owner_and_returns_expired_challenge()
     -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
-        let _guard = capture_debug_logs(logs.clone());
+        let _capture = capture_debug_logs_pinned(logs.clone());
         let mut fields = LogContextConfig::recommended();
         fields.credential_owner = true;
         let expired_entry = ApiKeyEntry::new(
@@ -8375,6 +8607,744 @@ mod tests {
         assert!(line.contains("credential_owner=\"old-key\""), "{line}");
         assert!(line.contains("credential_rejection=expired"), "{line}");
 
+        Ok(())
+    }
+
+    /// An injected challenge scope never reaches `serve`.
+    ///
+    /// A `challenge_scopes` entry smuggled past the builder by assigning the
+    /// public field (a quote plus CRLF header injection) is rejected by
+    /// `McpServerConfig::validate`, the only way to obtain the
+    /// `Validated<McpServerConfig>` that `serve` requires, so it can never
+    /// reach the unescaped `scope="..."` challenge parameter.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_scope_header_injection_is_rejected_before_serve() -> anyhow::Result<()> {
+        let mut oauth = OAuthConfig::builder(
+            "https://idp.example.test",
+            "mcp",
+            "https://idp.example.test/jwks.json",
+        )
+        .challenge_scopes(vec!["mcp:read".to_owned()])
+        .build();
+        oauth.challenge_scopes = Some(vec![
+            "mcp:read".to_owned(),
+            "x\"\r\nX-Injected: 1".to_owned(),
+        ]);
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+
+        let Err(err) = McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
+            .with_auth(auth)
+            .validate()
+        else {
+            anyhow::bail!("an injected challenge scope must fail validation");
+        };
+
+        assert!(
+            err.to_string().contains("oauth.challenge_scopes[1]"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// Message of the missing-`public_url` startup warning.
+    #[cfg(feature = "oauth")]
+    const PUBLIC_URL_UNSET_WARNING: &str = "OAuth is configured without public_url";
+    /// Full missing-`public_url` warning message, verbatim.
+    #[cfg(feature = "oauth")]
+    const PUBLIC_URL_UNSET_WARNING_FULL: &str = "OAuth is configured without public_url: Protected Resource Metadata advertises a resource derived from the bind address and the 401 challenge carries a relative resource_metadata URL; set server.public_url (env RMCP_SERVER_KIT__SERVER__PUBLIC_URL)";
+    /// Message of the OAuth opt-in summary line.
+    #[cfg(feature = "oauth")]
+    const OPT_IN_SUMMARY: &str = "oauth opt-in features enabled";
+
+    /// [`capture_debug_logs`] that cannot lose events to the process-global
+    /// callsite interest cache.
+    ///
+    /// While exactly one scoped dispatcher is live, tracing-core computes the
+    /// interest of a callsite first hit on ANOTHER thread from that thread's
+    /// default (no subscriber) and caches it as `never`, so a concurrent test
+    /// reaching the same callsite first would silence it for this capture.
+    /// The returned extra `NoSubscriber` dispatch keeps two dispatchers live,
+    /// so every registration combines all of them; the explicit rebuild then
+    /// covers callsites registered before this capture existed.
+    fn capture_debug_logs_pinned(logs: CapturedLogs) -> (tracing::Dispatch, DefaultGuard) {
+        use tracing::{callsite::rebuild_interest_cache, subscriber::NoSubscriber};
+
+        let multi_dispatcher_pin = tracing::Dispatch::new(NoSubscriber::default());
+        let guard = capture_debug_logs(logs);
+        rebuild_interest_cache();
+        (multi_dispatcher_pin, guard)
+    }
+
+    /// A capture still records an event whose callsite another thread without a subscriber registered first.
+    #[test]
+    fn pinned_capture_keeps_an_event_first_registered_on_another_thread() -> anyhow::Result<()> {
+        use std::thread;
+
+        fn emit() {
+            tracing::debug!("pinned capture probe");
+        }
+
+        let logs = CapturedLogs::default();
+        let capture = capture_debug_logs_pinned(logs.clone());
+        thread::spawn(emit)
+            .join()
+            .map_err(|_panic| anyhow::anyhow!("event emitter thread panicked"))?;
+        emit();
+        drop(capture);
+
+        assert!(logs.contents().contains("pinned capture probe"));
+        Ok(())
+    }
+
+    /// Builds the router for an OAuth config adjusted by `configure` (and
+    /// `public_url` when given) while [`capture_debug_logs_pinned`] captures
+    /// every event, and returns the captured log.
+    #[cfg(feature = "oauth")]
+    fn router_build_logs(
+        configure: impl FnOnce(&mut OAuthConfig),
+        public_url: Option<&str>,
+    ) -> anyhow::Result<CapturedLogs> {
+        let mut oauth = OAuthConfig::builder(
+            "https://idp.example.test",
+            "mcp-audience",
+            "https://idp.example.test/jwks.json",
+        )
+        .scope("mcp:read", "viewer")
+        .build();
+        configure(&mut oauth);
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        let logs = CapturedLogs::default();
+        let _capture = capture_debug_logs_pinned(logs.clone());
+        let _router = reqlog_router(|base| {
+            let with_auth = base.with_auth(auth);
+            match public_url {
+                Some(url) => with_auth.with_public_url(url),
+                None => with_auth,
+            }
+        })?;
+        Ok(logs)
+    }
+
+    /// OAuth without `public_url` logs the startup warning exactly once at router
+    /// build, naming the bind-address-derived resource, and logs no opt-in
+    /// summary for an otherwise 3.20.0-shaped config.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_without_public_url_warns_once_at_router_build() -> anyhow::Result<()> {
+        let logs = router_build_logs(|_oauth| {}, None)?;
+
+        let warnings = logs.lines_containing(PUBLIC_URL_UNSET_WARNING);
+        let [warning] = warnings.as_slice() else {
+            anyhow::bail!("expected one warning line: {}", logs.contents());
+        };
+        assert!(warning.contains(" WARN "), "{warning}");
+        assert!(
+            warning.contains("resource=http://127.0.0.1:8080/mcp"),
+            "{warning}"
+        );
+        // The message ends exactly where the structured fields start.
+        assert!(
+            warning.contains(&format!("{PUBLIC_URL_UNSET_WARNING_FULL} resource=")),
+            "{warning}"
+        );
+        assert_eq!(logs.lines_containing(OPT_IN_SUMMARY), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// A 3.20.0-shaped OAuth config with `public_url` logs neither the startup
+    /// warning nor the opt-in summary, and a config without OAuth logs no
+    /// warning even without `public_url`.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn unchanged_oauth_config_with_public_url_logs_no_new_line() -> anyhow::Result<()> {
+        let logs = router_build_logs(|_oauth| {}, Some("https://mcp.example.test"))?;
+        assert!(
+            logs.contents()
+                .contains("configured Streamable HTTP allowed hosts"),
+            "the capture must observe router build: {}",
+            logs.contents()
+        );
+        assert_eq!(
+            logs.lines_containing(PUBLIC_URL_UNSET_WARNING),
+            Vec::<String>::new()
+        );
+        assert_eq!(logs.lines_containing(OPT_IN_SUMMARY), Vec::<String>::new());
+
+        let api_key_logs = CapturedLogs::default();
+        let _capture = capture_debug_logs_pinned(api_key_logs.clone());
+        let _router = reqlog_router(|cfg| cfg.with_auth(AuthConfig::with_keys(vec![])))?;
+        assert!(
+            api_key_logs
+                .contents()
+                .contains("configured Streamable HTTP allowed hosts"),
+            "the capture must observe router build: {}",
+            api_key_logs.contents()
+        );
+        assert_eq!(
+            api_key_logs.lines_containing(PUBLIC_URL_UNSET_WARNING),
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// Each opt-in knob on its own produces exactly one INFO summary line
+    /// with counts and booleans, never a scope or audience value.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_opt_in_summary_logged_when_one_knob_is_enabled() -> anyhow::Result<()> {
+        type Knob = fn(&mut OAuthConfig);
+        let knobs: [(&str, Knob); 6] = [
+            ("challenge_scopes=1 ", |oauth| {
+                oauth.challenge_scopes = Some(vec!["mcp:zq9-scope-value".to_owned()]);
+            }),
+            ("insufficient_scope_challenge=true ", |oauth| {
+                oauth.insufficient_scope_challenge = true;
+            }),
+            ("additional_audiences=2 ", |oauth| {
+                oauth.additional_audiences = vec![
+                    "https://zq9-alt.example/mcp".to_owned(),
+                    "zq9-legacy-aud".to_owned(),
+                ];
+            }),
+            ("accept_resource_audience=true ", |oauth| {
+                oauth.accept_resource_audience = true;
+            }),
+            ("omit_error_on_missing_credential=true ", |oauth| {
+                oauth.omit_error_on_missing_credential = true;
+            }),
+            ("proxy_mode=authorization_server", |oauth| {
+                let mut proxy = OAuthProxyConfig::builder(
+                    "https://idp.example.test/authorize",
+                    "https://idp.example.test/token",
+                    "client",
+                )
+                .sealing_secret(SecretString::from(
+                    "unit-test-sealing-secret-0123456789abcdef",
+                ))
+                .build();
+                proxy.mode = ProxyMode::AuthorizationServer;
+                oauth.proxy = Some(proxy);
+            }),
+        ];
+        let mut checked = 0_usize;
+        for (field, knob) in knobs {
+            let logs = router_build_logs(knob, Some("https://mcp.example.test"))?;
+            let summaries = logs.lines_containing(OPT_IN_SUMMARY);
+            let [summary] = summaries.as_slice() else {
+                anyhow::bail!("{field}: expected one summary line: {}", logs.contents());
+            };
+            assert!(summary.contains(" INFO "), "{summary}");
+            assert!(
+                summary.contains(&format!("{OPT_IN_SUMMARY} challenge_scopes=")),
+                "{summary}"
+            );
+            for name in [
+                "challenge_scopes=",
+                "insufficient_scope_challenge=",
+                "additional_audiences=",
+                "accept_resource_audience=",
+                "omit_error_on_missing_credential=",
+                "proxy_mode=",
+            ] {
+                assert!(summary.contains(name), "{field}: {name} missing: {summary}");
+            }
+            assert!(summary.contains(field), "{field}: {summary}");
+            assert!(!summary.contains("zq9"), "{summary}");
+            assert!(!logs.contents().contains("zq9"), "{}", logs.contents());
+            assert_eq!(
+                logs.lines_containing(PUBLIC_URL_UNSET_WARNING),
+                Vec::<String>::new()
+            );
+            checked = checked.saturating_add(1);
+        }
+        assert_eq!(checked, 6);
+        Ok(())
+    }
+
+    /// `challenge_scopes = Some(vec![])` still counts as an enabled opt-in
+    /// (`is_some`, not non-empty) and reports `challenge_scopes=0`; `None`
+    /// with every other knob off logs no summary.
+    ///
+    /// Validation rejects the empty list at startup, but the router build
+    /// follows the rule literally.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn empty_challenge_scopes_counts_as_enabled_opt_in() -> anyhow::Result<()> {
+        let empty_logs = router_build_logs(
+            |oauth| oauth.challenge_scopes = Some(Vec::new()),
+            Some("https://mcp.example.test"),
+        )?;
+        let summaries = empty_logs.lines_containing(OPT_IN_SUMMARY);
+        let [summary] = summaries.as_slice() else {
+            anyhow::bail!("expected one summary line: {}", empty_logs.contents());
+        };
+        assert!(
+            summary.contains(&format!("{OPT_IN_SUMMARY} challenge_scopes=0 ")),
+            "{summary}"
+        );
+
+        let none_logs = router_build_logs(
+            |oauth| oauth.challenge_scopes = None,
+            Some("https://mcp.example.test"),
+        )?;
+        assert_eq!(
+            none_logs.lines_containing(OPT_IN_SUMMARY),
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// A passthrough-mode OAuth proxy config for the router-build log tests.
+    #[cfg(feature = "oauth")]
+    fn passthrough_proxy() -> OAuthProxyConfig {
+        let proxy = OAuthProxyConfig::builder(
+            "https://idp.example.test/authorize",
+            "https://idp.example.test/token",
+            "client",
+        )
+        .sealing_secret(SecretString::from(
+            "unit-test-sealing-secret-0123456789abcdef",
+        ))
+        .build();
+        assert_eq!(proxy.mode, ProxyMode::Passthrough);
+        proxy
+    }
+
+    /// A passthrough proxy with every opt-in knob at its default logs no summary.
+    ///
+    /// Positive control: the router build did log. The same proxy plus one
+    /// knob logs exactly one summary showing `proxy_mode=passthrough`.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn passthrough_proxy_alone_is_not_an_opt_in() -> anyhow::Result<()> {
+        let quiet = router_build_logs(
+            |oauth| oauth.proxy = Some(passthrough_proxy()),
+            Some("https://mcp.example.test"),
+        )?;
+        assert!(
+            quiet
+                .contents()
+                .contains("configured Streamable HTTP allowed hosts"),
+            "the capture must observe router build: {}",
+            quiet.contents()
+        );
+        assert_eq!(quiet.lines_containing(OPT_IN_SUMMARY), Vec::<String>::new());
+        assert_eq!(
+            quiet.lines_containing(PUBLIC_URL_UNSET_WARNING),
+            Vec::<String>::new()
+        );
+
+        let one_knob = router_build_logs(
+            |oauth| {
+                oauth.proxy = Some(passthrough_proxy());
+                oauth.omit_error_on_missing_credential = true;
+            },
+            Some("https://mcp.example.test"),
+        )?;
+        let summaries = one_knob.lines_containing(OPT_IN_SUMMARY);
+        let [summary] = summaries.as_slice() else {
+            anyhow::bail!("expected one summary line: {}", one_knob.contents());
+        };
+        assert!(summary.contains("proxy_mode=passthrough"), "{summary}");
+        assert!(
+            summary.contains("omit_error_on_missing_credential=true "),
+            "{summary}"
+        );
+        Ok(())
+    }
+
+    /// One opt-in knob with `public_url` unset logs exactly one summary AND
+    /// exactly one missing-`public_url` warning.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn opt_in_summary_logged_even_without_public_url() -> anyhow::Result<()> {
+        let logs = router_build_logs(|oauth| oauth.omit_error_on_missing_credential = true, None)?;
+        let summaries = logs.lines_containing(OPT_IN_SUMMARY);
+        let [summary] = summaries.as_slice() else {
+            anyhow::bail!("expected one summary line: {}", logs.contents());
+        };
+        assert!(summary.contains(" INFO "), "{summary}");
+        assert!(
+            summary.contains("omit_error_on_missing_credential=true "),
+            "{summary}"
+        );
+        let warnings = logs.lines_containing(PUBLIC_URL_UNSET_WARNING);
+        let [warning] = warnings.as_slice() else {
+            anyhow::bail!("expected one warning line: {}", logs.contents());
+        };
+        assert!(warning.contains(" WARN "), "{warning}");
+        Ok(())
+    }
+
+    /// Without OAuth, the fallback Protected Resource Metadata advertises only
+    /// the `public_url`-derived resource (trailing slash trimmed) at both the
+    /// canonical and the root well-known paths.
+    #[tokio::test]
+    async fn no_oauth_prm_fallback_resource_is_derived_from_public_url() -> anyhow::Result<()> {
+        #[derive(Clone)]
+        struct Handler;
+        impl ServerHandler for Handler {}
+
+        let mut checked = 0_usize;
+        for public_url in ["https://mcp.example.test/", "https://mcp.example.test"] {
+            let config =
+                McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_public_url(public_url);
+            let (router, _params) = build_app_router(config, || Handler)?;
+            for path in [
+                "/.well-known/oauth-protected-resource/mcp",
+                "/.well-known/oauth-protected-resource",
+            ] {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(Body::empty())
+                    .context("PRM request")?;
+                let resp = router.clone().oneshot(req).await?;
+                assert_eq!(resp.status(), StatusCode::OK, "{public_url} {path}");
+                let prm: serde_json::Value = serde_json::from_str(&body_string(resp).await?)?;
+                assert_eq!(
+                    prm,
+                    serde_json::json!({ "resource": "https://mcp.example.test/mcp" }),
+                    "{public_url} {path}"
+                );
+                checked = checked.saturating_add(1);
+            }
+        }
+        assert_eq!(checked, 4);
+        Ok(())
+    }
+
+    /// The JWT cache gets a resource audience only with the opt-in AND `public_url`.
+    ///
+    /// `build_app_router` hands it `{public_url}/mcp` (trailing slash of
+    /// `public_url` trimmed) only when `accept_resource_audience` is on and
+    /// `public_url` is set; the bind-address fallback is never accepted as an
+    /// audience.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn resource_audience_wired_only_with_opt_in_and_public_url() -> anyhow::Result<()> {
+        #[derive(Clone)]
+        struct Handler;
+        impl ServerHandler for Handler {}
+
+        const ALT: &str = "https://alt.example/mcp";
+        const RESOURCE: &str = "https://mcp.example.test/mcp";
+        let mut checked = 0_usize;
+        for (accept, additional, public_url, expected) in [
+            (false, false, None, None),
+            (true, false, None, None),
+            (false, false, Some("https://mcp.example.test/"), None),
+            (
+                true,
+                false,
+                Some("https://mcp.example.test/"),
+                Some(RESOURCE),
+            ),
+            // `additional_audiences` alone never sets the resource audience.
+            (false, true, None, None),
+            (false, true, Some("https://mcp.example.test/"), None),
+            (true, true, None, None),
+            (
+                true,
+                true,
+                Some("https://mcp.example.test/"),
+                Some(RESOURCE),
+            ),
+        ] {
+            let oauth = OAuthConfig::builder(
+                "https://idp.example.test",
+                "mcp-audience",
+                "https://idp.example.test/jwks.json",
+            )
+            .scope("mcp:read", "viewer")
+            .accept_resource_audience(accept)
+            .additional_audiences(if additional {
+                vec![ALT.to_owned()]
+            } else {
+                Vec::new()
+            })
+            .build();
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            let base = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_auth(auth);
+            let config = match public_url {
+                Some(url) => base.with_public_url(url),
+                None => base,
+            };
+            let (router, params) = build_app_router(config, || Handler)?;
+            let cache = params
+                .auth_state
+                .as_ref()
+                .and_then(|state| state.jwks_cache.as_ref())
+                .context("OAuth auth state carries a JWT cache")?;
+            assert_eq!(
+                cache.__test_resource_audience(),
+                expected,
+                "accept={accept} additional={additional} public_url={public_url:?}"
+            );
+            for path in [
+                "/.well-known/oauth-protected-resource/mcp",
+                "/.well-known/oauth-protected-resource",
+            ] {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(Body::empty())
+                    .context("PRM request")?;
+                let resp = router.clone().oneshot(req).await?;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let prm: serde_json::Value = serde_json::from_str(&body_string(resp).await?)?;
+                let advertised = prm
+                    .get("resource")
+                    .and_then(serde_json::Value::as_str)
+                    .context("PRM carries a resource")?;
+                match (public_url, expected) {
+                    (Some(_), Some(accepted)) => {
+                        assert_eq!(Some(accepted), cache.__test_resource_audience());
+                        assert_eq!(advertised, accepted, "{path}");
+                    }
+                    (Some(_), None) => {
+                        assert_eq!(advertised, "https://mcp.example.test/mcp", "{path}");
+                    }
+                    (None, _) => {
+                        assert_eq!(advertised, "http://127.0.0.1:8080/mcp", "{path}");
+                    }
+                }
+            }
+            checked = checked.saturating_add(1);
+        }
+        assert_eq!(checked, 8);
+        Ok(())
+    }
+
+    /// Builds the router for `oauth` (auth switch `enabled`, `public_url` when
+    /// given) under the pinned log capture.
+    ///
+    /// Returns the captured log and, when the router carries JWT auth state,
+    /// whether a JWT cache exists and the resource audience it accepts.
+    #[cfg(feature = "oauth")]
+    fn build_oauth_router_observed(
+        oauth: OAuthConfig,
+        enabled: bool,
+        public_url: Option<&str>,
+    ) -> anyhow::Result<(CapturedLogs, bool, Option<String>)> {
+        #[derive(Clone)]
+        struct Handler;
+        impl ServerHandler for Handler {}
+
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.enabled = enabled;
+        auth.oauth = Some(oauth);
+        let base = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_auth(auth);
+        let config = match public_url {
+            Some(url) => base.with_public_url(url),
+            None => base,
+        };
+        let logs = CapturedLogs::default();
+        let _capture = capture_debug_logs_pinned(logs.clone());
+        let (_router, params) = build_app_router(config, || Handler)?;
+        let cache = params
+            .auth_state
+            .as_ref()
+            .and_then(|state| state.jwks_cache.as_ref());
+        let audience =
+            cache.and_then(|jwks| jwks.__test_resource_audience().map(ToOwned::to_owned));
+        Ok((logs, cache.is_some(), audience))
+    }
+
+    /// A minimal OAuth config for the observed-build tests.
+    #[cfg(feature = "oauth")]
+    fn observed_oauth() -> OAuthConfig {
+        OAuthConfig::builder(
+            "https://idp.example.test",
+            "mcp-audience",
+            "https://idp.example.test/jwks.json",
+        )
+        .scope("mcp:read", "viewer")
+        .build()
+    }
+
+    /// `accept_resource_audience = true` without `public_url` still logs the
+    /// startup warning exactly once and one opt-in summary, and the cache gets no
+    /// resource audience (the `public_url` guard).
+    ///
+    /// `serve()` validation rejects this combination, but the router build
+    /// still wires it as given; the config is set directly on the struct.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn accept_resource_audience_without_public_url_warns_and_wires_nothing()
+    -> anyhow::Result<()> {
+        let mut oauth = observed_oauth();
+        oauth.accept_resource_audience = true;
+        let (logs, has_cache, audience) = build_oauth_router_observed(oauth, true, None)?;
+
+        let warnings = logs.lines_containing(PUBLIC_URL_UNSET_WARNING);
+        let [warning] = warnings.as_slice() else {
+            anyhow::bail!("expected one warning line: {}", logs.contents());
+        };
+        assert!(warning.contains(" WARN "), "{warning}");
+        assert!(
+            warning.contains(&format!("{PUBLIC_URL_UNSET_WARNING_FULL} resource=")),
+            "{warning}"
+        );
+        let summaries = logs.lines_containing(OPT_IN_SUMMARY);
+        let [summary] = summaries.as_slice() else {
+            anyhow::bail!("expected one summary line: {}", logs.contents());
+        };
+        assert!(
+            summary.contains("accept_resource_audience=true "),
+            "{summary}"
+        );
+        assert!(has_cache);
+        assert_eq!(audience, None);
+        Ok(())
+    }
+
+    /// Pins that the startup warning and the opt-in summary fire even with
+    /// `auth.enabled = false` while `auth.oauth` is `Some`.
+    ///
+    /// Rationale: the warning applies "when OAuth is configured", and the
+    /// Protected Resource Metadata is still served from the OAuth config
+    /// whether or not the auth middleware is enabled, so the warning about
+    /// its derived resource stays relevant. No JWT cache exists then.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn auth_disabled_with_oauth_configured_still_warns_and_summarises() -> anyhow::Result<()>
+    {
+        let (warn_logs, warn_cache, warn_audience) =
+            build_oauth_router_observed(observed_oauth(), false, None)?;
+        assert_eq!(
+            warn_logs.lines_containing(PUBLIC_URL_UNSET_WARNING).len(),
+            1,
+            "{}",
+            warn_logs.contents()
+        );
+        assert!(!warn_cache);
+        assert_eq!(warn_audience, None);
+
+        let mut oauth = observed_oauth();
+        oauth.accept_resource_audience = true;
+        let (sum_logs, sum_cache, sum_audience) =
+            build_oauth_router_observed(oauth, false, Some("https://mcp.example.test"))?;
+        assert_eq!(
+            sum_logs.lines_containing(OPT_IN_SUMMARY).len(),
+            1,
+            "{}",
+            sum_logs.contents()
+        );
+        assert_eq!(
+            sum_logs.lines_containing(PUBLIC_URL_UNSET_WARNING),
+            Vec::<String>::new()
+        );
+        assert!(!sum_cache);
+        assert_eq!(sum_audience, None);
+        Ok(())
+    }
+
+    /// Full cross product of the build-time OAuth knobs against an oracle
+    /// derived from the documented contract (wiring, warning, summary).
+    ///
+    /// Expected, per combination: the warning appears once iff `public_url`
+    /// is unset (whatever `auth.enabled`); the summary appears once iff at
+    /// least one of the six opt-ins is on, carrying exact counts, booleans
+    /// and the proxy mode; the JWT cache exists iff `auth.enabled`, and its
+    /// resource audience is `{public_url}/mcp` iff `accept_resource_audience`
+    /// and `public_url` are both set.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_build_time_wiring_matrix() -> anyhow::Result<()> {
+        const RESOURCE: &str = "https://mcp.example.test/mcp";
+        let mut checked = 0_usize;
+        for bits in 0_u32..64 {
+            let on = |bit: u32| (bits >> bit) & 1 == 1;
+            let (accept, additional, has_url, enabled, isc, omit) =
+                (on(0), on(1), on(2), on(3), on(4), on(5));
+            for challenge in [None, Some(0_usize), Some(2_usize)] {
+                for proxy in [
+                    None,
+                    Some(ProxyMode::Passthrough),
+                    Some(ProxyMode::AuthorizationServer),
+                ] {
+                    let mut oauth = observed_oauth();
+                    oauth.accept_resource_audience = accept;
+                    oauth.additional_audiences = if additional {
+                        vec![
+                            "https://alt.example/mcp".to_owned(),
+                            "zq9-legacy".to_owned(),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    oauth.insufficient_scope_challenge = isc;
+                    oauth.omit_error_on_missing_credential = omit;
+                    oauth.challenge_scopes =
+                        challenge.map(|n| (0..n).map(|i| format!("zq9-scope-{i}")).collect());
+                    oauth.proxy = proxy.map(|mode| {
+                        let mut cfg = passthrough_proxy();
+                        cfg.mode = mode;
+                        cfg
+                    });
+                    let label = format!(
+                        "accept={accept} additional={additional} url={has_url} enabled={enabled} \
+                         isc={isc} omit={omit} challenge={challenge:?} proxy={proxy:?}"
+                    );
+                    let url = has_url.then_some("https://mcp.example.test/");
+                    let (logs, has_cache, audience) =
+                        build_oauth_router_observed(oauth, enabled, url)?;
+
+                    let warnings = logs.lines_containing(PUBLIC_URL_UNSET_WARNING);
+                    assert_eq!(
+                        warnings.len(),
+                        usize::from(!has_url),
+                        "{label}: {warnings:?}"
+                    );
+                    for warning in &warnings {
+                        assert!(warning.contains(" WARN "), "{label}: {warning}");
+                        assert!(
+                            warning.contains(&format!("{PUBLIC_URL_UNSET_WARNING_FULL} resource=")),
+                            "{label}: {warning}"
+                        );
+                    }
+
+                    let any_opt_in = challenge.is_some()
+                        || isc
+                        || additional
+                        || accept
+                        || omit
+                        || proxy == Some(ProxyMode::AuthorizationServer);
+                    let summaries = logs.lines_containing(OPT_IN_SUMMARY);
+                    assert_eq!(
+                        summaries.len(),
+                        usize::from(any_opt_in),
+                        "{label}: {summaries:?}"
+                    );
+                    if let [summary] = summaries.as_slice() {
+                        let mode = match proxy {
+                            Some(ProxyMode::AuthorizationServer) => "authorization_server",
+                            Some(_) | None => "passthrough",
+                        };
+                        let expected = format!(
+                            "{OPT_IN_SUMMARY} challenge_scopes={} insufficient_scope_challenge={isc} additional_audiences={} accept_resource_audience={accept} omit_error_on_missing_credential={omit} proxy_mode={mode}",
+                            challenge.unwrap_or(0_usize),
+                            if additional { 2_usize } else { 0_usize },
+                        );
+                        assert!(summary.contains(" INFO "), "{label}: {summary}");
+                        assert!(summary.ends_with(&expected), "{label}: {summary}");
+                    }
+                    assert!(!logs.contents().contains("zq9"), "{label}");
+
+                    let expected_audience =
+                        (enabled && accept && has_url).then(|| RESOURCE.to_owned());
+                    assert_eq!(has_cache, enabled, "{label}");
+                    assert_eq!(audience, expected_audience, "{label}");
+                    checked = checked.saturating_add(1);
+                }
+            }
+        }
+        assert_eq!(checked, 576);
         Ok(())
     }
 
@@ -10254,6 +11224,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext {
                 fields,
                 fingerprint_salt: None,
@@ -10289,7 +11260,7 @@ mod tests {
         )
         .build();
         let http = OauthHttpClient::with_config(&oauth_config).context("oauth http client")?;
-        build_oauth_admin_router(&proxy, http, Some(state), "admin").context("admin router")
+        build_oauth_admin_router(&proxy, http, Some(state), "admin", None).context("admin router")
     }
 
     /// Builds a POST request carrying a bearer token and a form body.

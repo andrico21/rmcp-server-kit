@@ -1,5 +1,8 @@
 //! Stateless binding between rmcp session IDs and authenticated identities.
 
+extern crate alloc;
+
+use alloc::sync::Arc;
 use core::{fmt, str};
 use std::sync::OnceLock;
 
@@ -44,7 +47,7 @@ pub(crate) enum SessionBindingSecret {
     /// Process-random fallback for single-instance deployments.
     Process([u8; MAC_LEN]),
     /// Operator-supplied shared secret for multi-instance deployments.
-    Configured(SecretString),
+    Configured(Arc<SecretString>),
 }
 
 impl fmt::Debug for SessionBindingSecret {
@@ -125,7 +128,7 @@ pub(crate) fn configured_session_binding_secret(
     secret: &SecretString,
 ) -> Result<SessionBindingSecret, RmcpServerKitError> {
     validate_configured_secret("session_binding_secret", secret.expose_secret())?;
-    Ok(SessionBindingSecret::Configured(secret.clone()))
+    Ok(SessionBindingSecret::Configured(Arc::new(secret.clone())))
 }
 
 /// Validate the configured session-binding secret's strength.
@@ -331,7 +334,7 @@ pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
     let key = match secret {
         SessionBindingSecret::Process(bytes) => bytes.as_slice(),
         SessionBindingSecret::Configured(configured_secret) => {
-            configured_key = configured_secret.expose_secret();
+            configured_key = configured_secret.as_ref().expose_secret();
             configured_key.as_bytes()
         }
     };
@@ -437,12 +440,41 @@ mod tests {
     const RAW_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
     const OTHER_RAW_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
 
+    /// Pins allocation sharing and identical MAC tags for configured-secret clones.
+    #[test]
+    fn configured_secret_clones_share_one_allocation() -> anyhow::Result<()> {
+        // Given: one validated configured secret.
+        let secret = configured_session_binding_secret(&SecretString::from("x".repeat(32)))?;
+        // When: a request clones its binding secret.
+        let cloned = secret.clone();
+        // Then: both variants share their allocation and produce identical tags.
+        let (SessionBindingSecret::Configured(original), SessionBindingSecret::Configured(copy)) =
+            (&secret, &cloned)
+        else {
+            anyhow::bail!("configured constructor must retain the configured variant");
+        };
+        assert!(
+            Arc::ptr_eq(original, copy),
+            "configured clones must share one secret allocation"
+        );
+        let mut original_mac = keyed_mac(&secret);
+        original_mac.update(b"same-input");
+        let mut cloned_mac = keyed_mac(&cloned);
+        cloned_mac.update(b"same-input");
+        assert_eq!(
+            original_mac.finalize().into_bytes(),
+            cloned_mac.finalize().into_bytes()
+        );
+        Ok(())
+    }
+
     fn test_secret(byte: u8) -> SessionBindingSecret {
         SessionBindingSecret::Process([byte; MAC_LEN])
     }
 
     fn test_identity(name: &str, method: AuthMethod, sub: Option<&str>) -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             name: name.to_owned(),
             role: "ops".to_owned(),
             method,

@@ -174,6 +174,9 @@ fn compute_mac(
 #[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+    use alloc::sync::Arc;
+
     use anyhow::Context as _;
     use proptest::prelude::*;
     use secrecy::SecretString;
@@ -189,14 +192,15 @@ mod tests {
 
     /// Build the fixed operator secret shared by these tests.
     fn secret() -> SessionBindingSecret {
-        SessionBindingSecret::Configured(SecretString::from(
+        SessionBindingSecret::Configured(Arc::new(SecretString::from(
             "test-secret-that-is-at-least-32-bytes-long".to_owned(),
-        ))
+        )))
     }
 
     /// Build a bearer-token identity with the given name.
     fn identity(name: &str) -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             name: name.to_owned(),
             role: "ops".to_owned(),
             method: AuthMethod::BearerToken,
@@ -260,9 +264,9 @@ mod tests {
         let fp = fingerprint(&identity("alice"));
         let raw = RawTaskId::parse("task-abc-123").context("valid id")?;
         let token = wrap(&secret(), &raw, &fp);
-        let rotated = SessionBindingSecret::Configured(SecretString::from(
+        let rotated = SessionBindingSecret::Configured(Arc::new(SecretString::from(
             "a-completely-different-secret-over-32-bytes".to_owned(),
-        ));
+        )));
         assert_eq!(unwrap_and_verify(&rotated, &token, &fp), None);
         Ok(())
     }

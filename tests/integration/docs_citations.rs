@@ -21,6 +21,12 @@
 //! a parseable citation.
 //!
 //! Drift fixes are easy: re-read the cited code and update the number.
+#[path = "oauth_cases/case_info.rs"]
+mod case_info;
+#[cfg(test)]
+#[path = "oauth_cases/fence_tables.rs"]
+mod fence_tables;
+
 #[cfg_attr(
     target_os = "linux",
     expect(
@@ -49,7 +55,6 @@
 #[cfg(test)]
 mod tests {
     extern crate alloc;
-
     use alloc::collections::BTreeMap;
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::{
@@ -60,10 +65,15 @@ mod tests {
 
     use anyhow::Context as _;
     use rmcp_server_kit::{
-        config::{ObservabilityConfig, ServerConfig},
+        config::{
+            ObservabilityConfig, ServerConfig, validate_observability_config,
+            validate_server_config,
+        },
         rbac::RbacConfig,
     };
     use serde::Deserialize;
+
+    use crate::case_info::{document_fences, validate_document};
 
     /// How far (in lines, each direction) an anchor symbol may sit from the
     /// cited line/range. The doc headers promise "approximate" citations;
@@ -657,11 +667,8 @@ mod tests {
     fn extract_toml_fences(doc: &str) -> Vec<TomlFence> {
         let mut fences = Vec::new();
         let mut open: Option<TomlFence> = None;
-
         for (idx, line) in doc.lines().enumerate() {
-            let line_no = idx.saturating_add(1);
             let trimmed = line.trim_start();
-
             if let Some(mut fence) = open.take() {
                 if trimmed == "```" {
                     fences.push(fence);
@@ -672,63 +679,96 @@ mod tests {
                 }
                 continue;
             }
-
             if let Some(raw_info) = trimmed.strip_prefix("```") {
                 let info = raw_info.trim();
                 if info == "toml" || info.starts_with("toml,") {
                     open = Some(TomlFence {
-                        line: line_no,
+                        line: idx.saturating_add(1),
                         info: info.to_owned(),
                         body: String::new(),
                     });
                 }
             }
         }
-
         fences
     }
 
-    fn assert_operator_root_keys(block: &TomlFence, table: &toml::Table) {
+    fn assert_operator_root_keys(doc: &str, block: &TomlFence, table: &toml::Table) {
         for key in table.keys() {
             assert!(
                 matches!(key.as_str(), "server" | "rbac" | "observability"),
-                "docs/GUIDE.md:{} has unknown operator-config root table/key `{key}`",
+                "{doc}:{} has unknown operator-config root table/key `{key}`",
                 block.line
             );
         }
     }
 
-    fn assert_operator_config_block_parses(block: &TomlFence) -> anyhow::Result<()> {
+    fn assert_operator_config_block_parses(doc: &str, block: &TomlFence) -> anyhow::Result<()> {
+        parse_operator_config_block(doc, block).map(drop)
+    }
+
+    fn parse_operator_config_block(
+        doc: &str,
+        block: &TomlFence,
+    ) -> anyhow::Result<GuideOperatorConfig> {
         let table: toml::Table = match toml::from_str(&block.body) {
             Ok(table) => table,
             Err(error) => anyhow::bail!(
-                "docs/GUIDE.md:{} operator TOML is not valid TOML: {error}\n{}",
+                "{doc}:{} operator TOML is not valid TOML: {error}\n{}",
                 block.line,
                 block.body
             ),
         };
-        assert_operator_root_keys(block, &table);
+        assert_operator_root_keys(doc, block, &table);
 
         let parsed: GuideOperatorConfig = match toml::from_str(&block.body) {
             Ok(parsed) => parsed,
             Err(error) => anyhow::bail!(
-                "docs/GUIDE.md:{} operator TOML does not match rmcp-server-kit config schema: {error}\n{}",
+                "{doc}:{} operator TOML does not match rmcp-server-kit config schema: {error}\n{}",
                 block.line,
                 block.body
             ),
         };
         assert!(
             parsed.server.is_some() || parsed.rbac.is_some() || parsed.observability.is_some(),
-            "docs/GUIDE.md:{} operator TOML block must contain server, rbac, or observability config",
+            "{doc}:{} operator TOML block must contain server, rbac, or observability config",
             block.line
         );
+        Ok(parsed)
+    }
+
+    /// Parses a complete operator block and runs the crate's own TOML
+    /// validators on it, so a documented config that `serve()` would refuse
+    /// fails here. The OAuth tables only validate with the `oauth` feature.
+    fn assert_operator_config_block_validates(doc: &str, block: &TomlFence) -> anyhow::Result<()> {
+        let parsed = parse_operator_config_block(doc, block)?;
+        if cfg!(feature = "oauth") {
+            if let Some(server) = &parsed.server
+                && let Err(error) = validate_server_config(server)
+            {
+                anyhow::bail!(
+                    "{doc}:{} operator TOML fails validate_server_config: {error}\n{}",
+                    block.line,
+                    block.body
+                );
+            }
+            if let Some(observability) = &parsed.observability
+                && let Err(error) = validate_observability_config(observability)
+            {
+                anyhow::bail!(
+                    "{doc}:{} operator TOML fails validate_observability_config: {error}\n{}",
+                    block.line,
+                    block.body
+                );
+            }
+        }
         Ok(())
     }
 
-    fn assert_cargo_toml_block_parses(block: &TomlFence) -> anyhow::Result<()> {
+    fn assert_cargo_toml_block_parses(doc: &str, block: &TomlFence) -> anyhow::Result<()> {
         if let Err(error) = toml::from_str::<toml::Value>(&block.body) {
             anyhow::bail!(
-                "docs/GUIDE.md:{} Cargo TOML is not valid TOML: {error}\n{}",
+                "{doc}:{} Cargo TOML is not valid TOML: {error}\n{}",
                 block.line,
                 block.body
             );
@@ -736,10 +776,10 @@ mod tests {
         Ok(())
     }
 
-    fn assert_toml_fragment_parses(block: &TomlFence) -> anyhow::Result<()> {
+    fn assert_toml_fragment_parses(doc: &str, block: &TomlFence) -> anyhow::Result<()> {
         if let Err(error) = toml::from_str::<toml::Value>(&block.body) {
             anyhow::bail!(
-                "docs/GUIDE.md:{} TOML fragment is not valid TOML: {error}\n{}",
+                "{doc}:{} TOML fragment is not valid TOML: {error}\n{}",
                 block.line,
                 block.body
             );
@@ -766,14 +806,53 @@ mod tests {
         let doc = fs::read_to_string(root.join("docs/GUIDE.md")).context("read GUIDE.md")?;
         let fences = extract_toml_fences(&doc);
 
-        assert_eq!(fences.len(), 18, "GUIDE.md TOML fence count drifted");
+        assert_eq!(fences.len(), 20, "GUIDE.md TOML fence count drifted");
         for block in &fences {
             match block.info.as_str() {
-                "toml" => assert_operator_config_block_parses(block)?,
-                "toml,cargo" => assert_cargo_toml_block_parses(block)?,
-                "toml,fragment" => assert_toml_fragment_parses(block)?,
+                "toml" => assert_operator_config_block_parses("docs/GUIDE.md", block)?,
+                "toml,cargo" => assert_cargo_toml_block_parses("docs/GUIDE.md", block)?,
+                "toml,fragment" => assert_toml_fragment_parses("docs/GUIDE.md", block)?,
                 other => anyhow::bail!(
                     "docs/GUIDE.md:{} uses unsupported TOML fence info string `{other}`; use `toml` for complete operator config, `toml,cargo` for Cargo snippets, or `toml,fragment` for intentionally incomplete excerpts",
+                    block.line
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins that every TOML fence in `docs/OAUTH_PROXY.md` parses with its
+    /// declared role, and that every complete operator config also passes
+    /// the crate's TOML validators.
+    #[test]
+    fn oauth_proxy_toml_fences_parse() -> anyhow::Result<()> {
+        const DOC: &str = "docs/OAUTH_PROXY.md";
+        let root = workspace_root();
+        let doc = fs::read_to_string(root.join(DOC)).context("read OAUTH_PROXY.md")?;
+        validate_document(&doc)?;
+        let fences: Vec<_> = document_fences(&doc)?
+            .into_iter()
+            .filter(|fence| fence.info == "toml" || fence.info.starts_with("toml,"))
+            .map(|fence| TomlFence {
+                line: fence.line,
+                info: fence.info,
+                body: fence.body,
+            })
+            .collect();
+
+        assert_eq!(fences.len(), 19, "OAUTH_PROXY.md TOML fence count drifted");
+        for block in &fences {
+            match block.info.as_str() {
+                "toml" => assert_operator_config_block_validates(DOC, block)?,
+                "toml,fragment" => assert_toml_fragment_parses(DOC, block)?,
+                info if info
+                    .strip_prefix("toml,case=")
+                    .is_some_and(|id| !id.is_empty() && !id.contains(',')) =>
+                {
+                    assert_operator_config_block_parses(DOC, block)?;
+                }
+                other => anyhow::bail!(
+                    "{DOC}:{} uses unsupported TOML fence info string `{other}`; use `toml` for complete operator config or `toml,fragment` for intentionally incomplete excerpts",
                     block.line
                 ),
             }
