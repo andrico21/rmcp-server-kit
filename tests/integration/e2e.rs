@@ -105,6 +105,129 @@ mod tests {
     struct TestHandler;
 
     #[derive(Clone)]
+    struct NestedHeaderToolHandler;
+
+    impl ServerHandler for NestedHeaderToolHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            if name != "route" {
+                return None;
+            }
+            let schema = serde_json::json!({"type":"object","properties":{"target":{
+                "type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"}}
+            }}});
+            schema
+                .as_object()
+                .map(|object| Tool::new("route", "route", Arc::new(object.clone())))
+        }
+
+        fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            ready(Ok(ListToolsResult::with_all_items(
+                self.get_tool("route").into_iter().collect(),
+            )))
+        }
+
+        fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            ready(Ok(CallToolResult::success(vec![]).into()))
+        }
+    }
+
+    /// Pins nested parameter headers through the hook and RBAC-context wrappers.
+    #[tokio::test]
+    async fn nested_param_header_is_enforced_through_both_wrappers() -> anyhow::Result<()> {
+        use std::io::{Write as _, stdout};
+
+        use rmcp_server_kit::tool_hooks::{ToolHooks, with_hooks};
+
+        // Given: both kit wrappers surround a handler with a nested header schema.
+        let hooks = Arc::new(ToolHooks::new());
+        let base = spawn_server_with(config_on_port(0), move || {
+            with_hooks(NestedHeaderToolHandler, Arc::clone(&hooks))
+        })
+        .await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let cases = [
+            (
+                Some("eu"),
+                serde_json::json!({"target":{"region":"eu"}}),
+                200,
+                None,
+            ),
+            (
+                None,
+                serde_json::json!({"target":{"region":"eu"}}),
+                400,
+                Some("missing Mcp-Param-Region header"),
+            ),
+            (
+                Some("us"),
+                serde_json::json!({"target":{"region":"eu"}}),
+                400,
+                Some("does not match body value"),
+            ),
+            (None, serde_json::json!({}), 200, None),
+        ];
+        let mut observed = Vec::new();
+        // When: matching, missing, mismatching, and absent nested arguments cross HTTP.
+        for (header, arguments, expected, message) in cases {
+            let request = client
+                .post(format!("{}/mcp", base.base))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", "tools/call")
+                .header("Mcp-Name", "route");
+            let request_with_header = match header {
+                Some(value) => request.header("Mcp-Param-Region", value),
+                None => request,
+            };
+            let response = request_with_header
+                .json(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":1_u32, "method":"tools/call",
+                    "params":{"name":"route","arguments":arguments,"_meta":{
+                        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities":{}
+                    }}
+                }))
+                .send()
+                .await?;
+            let status = response.status();
+            let body = mcp_response_json(response).await?;
+            writeln!(stdout(), "nested header: {status} {body}")?;
+            observed.push((status, body, expected, message));
+        }
+        // Then: every outcome follows the schema supplied through both wrappers.
+        for (status, body, expected, message) in observed {
+            assert_eq!(status, expected, "{body}");
+            match message {
+                Some(fragment) => assert!(
+                    body.pointer("/error/message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|text| text.contains(fragment)),
+                    "{body}"
+                ),
+                None => assert!(body.get("result").is_some(), "{body}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Clone)]
     struct RecordingToolHandler {
         called: Arc<StdMutex<Vec<String>>>,
     }
