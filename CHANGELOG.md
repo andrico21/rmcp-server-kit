@@ -120,10 +120,49 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   4.6.8 -> 4.6.9, `equivalent` 1.0.2 -> 1.0.3, `libc` 0.2.190 -> 0.2.191,
   `zerocopy` / `zerocopy-derive` 0.8.62 -> 0.8.63, `cc` 1.8.0 -> 1.9.0,
   `find-msvc-tools` 0.1.14 -> 0.1.15 and `schannel` 0.1.29 -> 0.1.30. No
-  `Cargo.toml` requirement changed and `rmcp` stays at 3.5.1 (3.6.0 is
-  available and needs the `docs/RMCP_UPGRADE_CHECKLIST.md` review). The
+  `Cargo.toml` requirement changed; `rmcp` moves separately (next entry). The
   `supply-chain/config.toml` cargo-vet exemptions are re-pinned to the 16 new
   versions; `cargo vet --locked` passes.
+- `rmcp` / `rmcp-macros` 3.5.1 -> 3.6.0 in `Cargo.lock`. The `rmcp = "3"`
+  requirement is unchanged, so downstream builds already accept 3.6.0. The
+  upstream `src/handler/` tree is byte-identical between the two tags (compare
+  `rmcp-v3.5.1...rmcp-v3.6.0`), so the `ServerHandler` surface is unchanged:
+  the delegation guard passes with its method count (29) and classification
+  tables untouched, and `server_handler_methods!` still holds zero
+  `self.inner` references. `StreamableHttpServerConfig` builders and defaults
+  are unchanged. Upstream changes visible through this crate:
+  - A `/mcp` POST without `Mcp-Session-Id` whose body is not `initialize` now
+    gets `400 Bad Request: Session ID is required` instead of
+    `422 Unexpected message, expect initialize request` (upstream #1377). It
+    is answered by rmcp after this crate's auth and RBAC layers, which do not
+    change.
+  - Server-to-client sampling, roots and elicitation requests to a peer that
+    negotiated `2026-07-28` or later now always fail with `invalid_request`
+    (#1326); before, they were allowed from inside a request handler. This
+    crate issues none of them itself.
+  - For a `tools/call` sent with `MCP-Protocol-Version` `2026-07-28` or later,
+    rmcp looks up the tool input schema on every request (one handler from the
+    factory per call) instead of caching the first answer per tool name
+    (#1349), so `Mcp-Param-*` checks follow the current `get_tool` result;
+    nested `x-mcp-header` annotations are accepted (#1359).
+  - A JSON-RPC message that carries both `result` and `error`, or a request or
+    notification that carries either, is rejected when parsed (#1283); a
+    request id written as an integral float (`1.0`) is read as that integer
+    (#1346).
+  - `LocalSessionManager` releases its session map lock before it waits on a
+    session worker (#1323), and handlers still running after transport EOF
+    are cancelled (#1333).
+  - `serve_stdio` drops an incoming line longer than 16 MiB (rmcp
+    `DEFAULT_MAX_LINE_LENGTH`, #1049); it was unbounded before.
+
+  rmcp 3.6.0 keeps `rust-version = "1.88"` and adds `libc` as a Linux-only
+  dependency, which `Cargo.lock` already held. The resolver also re-pointed
+  five lockfile edges without moving any version: `errno`, `rustix`,
+  `rustls-platform-verifier` and `winapi-util` name `windows-sys` 0.52.0
+  instead of 0.61.2 (Windows-only), and `tempfile` (dev-only, through
+  `proptest`) names `getrandom` 0.3.4 instead of 0.4.3. The two cargo-vet
+  exemptions in `supply-chain/config.toml` are re-pinned to 3.6.0;
+  `cargo vet --locked` passes.
 
 ### Fixed
 
