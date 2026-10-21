@@ -34,7 +34,7 @@ mod tests {
     use alloc::{collections::VecDeque, sync::Arc};
     use core::{
         fmt,
-        future::ready,
+        future::{pending, ready},
         net::SocketAddr,
         num::NonZeroUsize,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -107,6 +107,178 @@ mod tests {
     #[derive(Clone)]
     struct RecordingToolHandler {
         called: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct CancellableToolHandler {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        started: Arc<Notify>,
+    }
+
+    impl ServerHandler for CancellableToolHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        #[expect(
+            clippy::integer_division_remainder_used,
+            reason = "tokio select expands to remainder arithmetic even in biased mode"
+        )]
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, rmcp::ErrorData> {
+            if request.name == "wait" {
+                self.events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push("started");
+                self.started.notify_one();
+                tokio::select! {
+                    biased;
+                    () = context.ct.cancelled() => {
+                        self.events.lock().unwrap_or_else(PoisonError::into_inner).push("cancelled");
+                        return Err(rmcp::ErrorData::internal_error("cancelled", None));
+                    }
+                    () = sleep(Duration::from_secs(30)) => {
+                        self.events.lock().unwrap_or_else(PoisonError::into_inner).push("timeout");
+                    }
+                }
+            }
+            if request.name == "quick" {
+                self.events
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push("quick");
+            }
+            Ok(CallToolResult::success(vec![]).into())
+        }
+    }
+
+    async fn wait_for_handler_cancellation(
+        events: &StdMutex<Vec<&'static str>>,
+    ) -> anyhow::Result<()> {
+        let observed = timeout(Duration::from_secs(10), async {
+            while !events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&"cancelled")
+            {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let snapshot = events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        observed
+            .with_context(|| format!("missing cancelled event within 10s; events={snapshot:?}"))?;
+        Ok(())
+    }
+
+    /// Pins legacy notification cancellation while retaining the same usable session.
+    #[tokio::test]
+    async fn legacy_session_cancellation_reaches_the_handler() -> anyhow::Result<()> {
+        // Given: a wait tool is in flight on an initialized legacy session.
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let started = Arc::new(Notify::new());
+        let handler = CancellableToolHandler {
+            events: Arc::clone(&events),
+            started: Arc::clone(&started),
+        };
+        let base = spawn_server_with(config_on_port(0), move || handler.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(40))
+            .build()?;
+        let session = mcp_initialize_with_bearer(&client, &base.base, None).await?;
+        let call = tokio::spawn({
+            let call_client = client.clone();
+            let url = format!("{}/mcp", base.base);
+            let call_session = session.clone();
+            async move {
+                let response = call_client.post(url).header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream").header("mcp-session-id", call_session)
+                    .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait"}}"#).send().await?;
+                let body = response.text().await?;
+                Ok::<_, reqwest::Error>(body)
+            }
+        });
+        timeout(Duration::from_secs(10), started.notified())
+            .await
+            .context("wait tool did not start")?;
+        // When: the client cancels request 2 without closing its session.
+        let cancellation_response = client.post(format!("{}/mcp", base.base)).header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream").header("mcp-session-id", &session)
+            .body(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"test"}}"#).send().await?;
+        assert_eq!(cancellation_response.status(), 202);
+        // Then: the handler sees cancellation and the session still serves quick calls.
+        wait_for_handler_cancellation(&events).await?;
+        let response = client
+            .post(format!("{}/mcp", base.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .body(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quick"}}"#)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let body = mcp_response_json(response).await?;
+        assert!(body.get("result").is_some(), "quick call: {body}");
+        call.abort();
+        let snapshot = events.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(!snapshot.contains(&"timeout"), "events={snapshot:?}");
+        drop(snapshot);
+        Ok(())
+    }
+
+    /// Pins handler cancellation when a negotiated stateless client disconnects.
+    #[tokio::test]
+    async fn stateless_2026_disconnect_cancels_the_handler() -> anyhow::Result<()> {
+        // Given: a metadata-bearing stateless wait call has reached the handler.
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let started = Arc::new(Notify::new());
+        let handler = CancellableToolHandler {
+            events: Arc::clone(&events),
+            started: Arc::clone(&started),
+        };
+        let base = spawn_server_with(config_on_port(0), move || handler.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(40))
+            .build()?;
+        let call = tokio::spawn({
+            let call_client = client.clone();
+            let url = format!("{}/mcp", base.base);
+            async move {
+                let response = call_client.post(url).header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("MCP-Protocol-Version", "2026-07-28").header("Mcp-Method", "tools/call").header("Mcp-Name", "wait")
+                    .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"wait","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#).send().await?;
+                pending::<()>().await;
+                Ok::<_, reqwest::Error>(response)
+            }
+        });
+        timeout(Duration::from_secs(10), started.notified())
+            .await
+            .context("stateless wait tool did not start")?;
+        // When: dropping the pending HTTP request or unread response disconnects the client.
+        call.abort();
+        let joined = call.await;
+        assert!(
+            joined.is_err_and(|error| error.is_cancelled()),
+            "client task must be aborted"
+        );
+        // Then: the handler observes cancellation before another stateless request succeeds.
+        wait_for_handler_cancellation(&events).await?;
+        let response = client.post(format!("{}/mcp", base.base)).header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28").header("Mcp-Method", "tools/call").header("Mcp-Name", "quick")
+            .body(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quick","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#).send().await?;
+        assert_eq!(response.status(), 200);
+        let body = mcp_response_json(response).await?;
+        assert!(body.get("result").is_some(), "quick call: {body}");
+        Ok(())
     }
 
     impl ServerHandler for RecordingToolHandler {
