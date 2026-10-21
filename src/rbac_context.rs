@@ -1007,9 +1007,9 @@ mod tests {
     }
 
     fn task_secret() -> SessionBindingSecret {
-        SessionBindingSecret::Configured(SecretString::from(
+        SessionBindingSecret::Configured(Arc::new(SecretString::from(
             "task-binding-test-secret-at-least-32-bytes".to_owned(),
-        ))
+        )))
     }
 
     fn get_task_request(id: i64, task_id: &str, identity: AuthIdentity) -> ClientJsonRpcMessage {
