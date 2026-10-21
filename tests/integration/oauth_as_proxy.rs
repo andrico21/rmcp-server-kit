@@ -29,7 +29,8 @@ mod tests {
     use rustls::crypto::ring;
     use serde_json::{Value, json};
     use tokio::{
-        net::TcpListener,
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::{TcpListener, TcpStream},
         sync::oneshot,
         task::{JoinSet, spawn_blocking},
         time::timeout,
@@ -1126,10 +1127,19 @@ mod tests {
     async fn malformed_and_oversized_bodies_fail_closed() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("30days").await?;
+        // The body cap answers on the declared length alone, so only the head is sent.
+        let head = declared_length_post(&server.base, "register", 1024 * 1024 + 1).await?;
+        ensure!(
+            head.starts_with("http/1.1 413 "),
+            "declared oversized registration rejected"
+        );
+        ensure!(
+            !head.contains("\r\nlocation:") && !head.contains("\r\nx-injected:"),
+            "no injected response to an oversized registration"
+        );
         for (path, body) in [
             ("register", vec![255_u8]),
             ("register", b"{broken".to_vec()),
-            ("register", vec![b'x'; 1024 * 1024 + 1]),
             ("oauth/consent", vec![255_u8]),
             ("oauth/consent", vec![b'x'; 0x8001]),
             (
@@ -1157,6 +1167,26 @@ mod tests {
             );
         }
         server.close().await
+    }
+
+    /// Send a `POST` head declaring `length` body bytes, send none of them, and return the lowercased response.
+    ///
+    /// The listener answers an over-cap `content-length` before it reads the body. Bytes sent
+    /// but never read make the listener's close a reset, and on Windows that reset aborts the
+    /// client write (os error 10053) and can discard the response before it is read.
+    async fn declared_length_post(base: &str, path: &str, length: usize) -> anyhow::Result<String> {
+        let authority = base.strip_prefix("http://").context("plain http base")?;
+        let mut stream = TcpStream::connect(authority).await?;
+        let head = format!(
+            "POST /{path} HTTP/1.1\r\nhost: {authority}\r\ncontent-type: application/json\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await?;
+        let mut response = Vec::new();
+        let read = timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .context("response before the declared body is sent")??;
+        ensure!(read > 0, "listener answered the declared length");
+        Ok(String::from_utf8_lossy(&response).to_lowercase())
     }
 
     /// State cookies are flow-specific and cannot substitute for browser CSRF credentials.
