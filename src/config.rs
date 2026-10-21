@@ -6369,6 +6369,9 @@ client_ip = false
         "server.security_headers",
         // Tuning knobs intentionally file-only: changing them per-process via
         // the environment invites drift between replicas of the same service.
+        // `server.sse_priming_enabled` is the deliberate exception: it is a
+        // client-compatibility switch, so it has an env override while its
+        // sibling `server.sse_retry` stays file-only.
         "server.tls_handshake_timeout",
         "server.max_concurrent_tls_handshakes",
         "server.shutdown_timeout",
