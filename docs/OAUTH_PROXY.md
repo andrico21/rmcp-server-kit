@@ -43,7 +43,9 @@ your own environment, not as a tested recipe.
 | Choose it when | the IdP supports what MCP clients need (for Keycloak: CIMD and resource indicators) | you must keep the 3.20.0 behaviour, or the IdP cannot do dynamic registration and clients do not check `iss` (for example Microsoft Entra ID without DCR, with `strip_resource_param = true`) | the IdP has no client registration MCP clients can use, and you need 2026-07-28 clients to work through one static client |
 
 The passthrough proxy stays the default only for backward compatibility. An
-unchanged 3.20.0 configuration keeps its 3.20.0 wire behaviour byte for byte.
+unchanged 3.20.0 configuration keeps its 3.20.0 wire behaviour byte for byte
+for this crate's own code; rmcp-owned behaviour follows your resolved rmcp
+version.
 
 ## 2. Flow dissection: direct mode
 

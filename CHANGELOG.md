@@ -11,9 +11,11 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
-Opt-in MCP 2026-07-28 authorization features. Every new knob defaults to the
-3.20.0 behaviour; see [`docs/MIGRATION.md`](docs/MIGRATION.md) (no action
-required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
+Opt-in MCP 2026-07-28 authorization features, follow-ups to the rmcp 3.6.0
+lockfile move (tests, docs and one internal change), and dependency
+maintenance. Every new knob defaults to the 3.20.0 behaviour; see
+[`docs/MIGRATION.md`](docs/MIGRATION.md) (no action required) and
+[`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
 
 ### Added
 
@@ -93,6 +95,20 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   echoed), and the consent page renders the name inside a `<bdi>` isolate with
   the unverified marker outside it; an emoji sequence joined by U+200D is
   rejected as a documented trade-off.
+- Tests only: RBAC/rmcp parser differential tests. A pinned table and a
+  duplicated-key property test in `src/rbac.rs` compare what RBAC extracts
+  from a `/mcp` body with what rmcp 3.6.0 parses and dispatches, and an e2e
+  test proves that no tool call reaches the handler without RBAC inspecting
+  it. [`docs/RMCP_UPGRADE_CHECKLIST.md`](docs/RMCP_UPGRADE_CHECKLIST.md)
+  section 3 now runs them on every rmcp bump.
+- Tests only: client cancellation on the legacy and 2026-07-28 HTTP paths,
+  a pin that cancelling a request never cancels a task, and nested
+  `Mcp-Param-*` headers enforced through both handler wrappers.
+- Docs only: the handler factory lifetime, nested `Mcp-Param-*` headers and
+  the rmcp 3.6.0 stdio limits in [`docs/GUIDE.md`](docs/GUIDE.md), which
+  scopes rmcp 3.6 clients request in
+  [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md), and case R3 retitled as an
+  audience migration case.
 
 ### Changed
 
@@ -104,6 +120,8 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `Referrer-Policy: same-origin` and `Cache-Control: no-store` for the new
   `authorization_server` HTML pages only (consent and error pages). Every
   other response keeps the operator's header settings.
+- The configured session-binding secret is shared across requests instead of
+  copied for each one. Session and task ids are unchanged.
 - CI only: a new nightly `mutants-oauth` job (GitHub and GitLab) runs cargo-mutants
   with `--features oauth` over `src/oauth_as.rs` and `src/oauth_seal.rs`, which
   the default-feature mutants jobs cannot compile. The GitHub default-feature job
@@ -131,20 +149,27 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   tables untouched, and `server_handler_methods!` still holds zero
   `self.inner` references. `StreamableHttpServerConfig` builders and defaults
   are unchanged. Upstream changes visible through this crate:
-  - A `/mcp` POST without `Mcp-Session-Id` whose body is not `initialize` now
-    gets `400 Bad Request: Session ID is required` instead of
+  - On the legacy session lifecycle (a request that does not select the
+    2026-07-28 stateless path), a `/mcp` POST without `Mcp-Session-Id` whose
+    body is neither `initialize` nor `server/discover` now gets
+    `400 Bad Request: Session ID is required` instead of
     `422 Unexpected message, expect initialize request` (upstream #1377). It
     is answered by rmcp after this crate's auth and RBAC layers, which do not
     change.
-  - Server-to-client sampling, roots and elicitation requests to a peer that
-    negotiated `2026-07-28` or later now always fail with `invalid_request`
-    (#1326); before, they were allowed from inside a request handler. This
-    crate issues none of them itself.
+  - Every server-to-client request (sampling, roots, elicitation, ping or a
+    custom request) to a peer that negotiated `2026-07-28` or later now fails
+    with `invalid_request` (#1326); before, such requests were allowed from
+    inside a request handler. This crate issues none of them itself.
+  - On the stateless path, a POSTed JSON-RPC response or error now gets
+    HTTP 400 with an `invalid_request` JSON-RPC error instead of
+    `202 Accepted` (#1326).
   - For a `tools/call` sent with `MCP-Protocol-Version` `2026-07-28` or later,
     rmcp looks up the tool input schema on every request (one handler from the
     factory per call) instead of caching the first answer per tool name
     (#1349), so `Mcp-Param-*` checks follow the current `get_tool` result;
-    nested `x-mcp-header` annotations are accepted (#1359).
+    nested `x-mcp-header` annotations are accepted (#1359). rmcp 3.6.0 no
+    longer keeps the per-tool-name schema cache (`tool_schemas`), which grew
+    with every tool name a client chose to send.
   - A JSON-RPC message that carries both `result` and `error`, or a request or
     notification that carries either, is rejected when parsed (#1283); a
     request id written as an integral float (`1.0`) is read as that integer
@@ -153,7 +178,10 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
     session worker (#1323), and handlers still running after transport EOF
     are cancelled (#1333).
   - `serve_stdio` drops an incoming line longer than 16 MiB (rmcp
-    `DEFAULT_MAX_LINE_LENGTH`, #1049); it was unbounded before.
+    `DEFAULT_MAX_LINE_LENGTH`, #1049) without a JSON-RPC reply, so that
+    request stays pending until the client times out or cancels it; before,
+    the line was unbounded. A final message with no trailing newline at EOF is
+    dropped too.
 
   rmcp 3.6.0 keeps `rust-version = "1.88"` and adds `libc` as a Linux-only
   dependency, which `Cargo.lock` already held. The resolver also re-pointed
@@ -163,6 +191,10 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `proptest`) names `getrandom` 0.3.4 instead of 0.4.3. The two cargo-vet
   exemptions in `supply-chain/config.toml` are re-pinned to 3.6.0;
   `cargo vet --locked` passes.
+
+  `Cargo.toml` keeps `rmcp = "3"`; 3.6.0 is the tested lockfile resolution,
+  and consumers see these upstream changes when their own resolution reaches
+  rmcp 3.6.0.
 
 ### Fixed
 
@@ -209,9 +241,11 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
 
 - A configuration that sets none of the new knobs keeps byte-identical
   3.20.0 wire behaviour (status, headers, bodies, routes, redirects, upstream
-  request bodies, token acceptance), pinned by the `compat_3_20` suite in
-  `tests/integration/e2e.rs`. The only addition is the WARN line above when
-  `public_url` is unset.
+  request bodies, token acceptance) for this crate's own code, pinned by the
+  `compat_3_20` suite in `tests/integration/e2e.rs`. The only addition is the
+  WARN line above when `public_url` is unset. Behaviour that rmcp itself owns
+  follows the consumer's resolved rmcp version (see the rmcp 3.6.0 entry under
+  Changed).
 
 ## [3.20.0] - 2026-10-13
 

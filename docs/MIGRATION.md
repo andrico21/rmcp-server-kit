@@ -5,11 +5,17 @@ downstream project, and how to migrate across breaking major releases.
 
 ## Migrating to the next release (unreleased): opt-in MCP 2026-07-28 authorization features
 
+The lockfile also moves to rmcp 3.6.0 (`Cargo.toml` keeps `rmcp = "3"`); see
+the rmcp 3.6.0 entry under `### Changed` in the `[Unreleased]` section of
+[`CHANGELOG.md`](../CHANGELOG.md) for the upstream changes it brings.
+
 **No action required.** Every new knob defaults to the 3.20.0 behaviour, no
 existing default, field type or public signature changes, and a 3.20.0
 TOML, environment or builder configuration keeps its 3.20.0 wire behaviour
 (status codes, headers, bodies, routes, redirects, upstream requests and
-token acceptance). New validation rules only fire when a new knob is set.
+token acceptance) for this crate's own code; rmcp-owned behaviour follows
+your resolved rmcp version. New validation rules only fire when a new knob
+is set.
 
 The one visible difference for an unchanged configuration is a new startup
 WARN line, logged once when OAuth is configured and `public_url` is not set:
