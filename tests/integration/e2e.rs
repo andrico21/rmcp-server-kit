@@ -148,8 +148,6 @@ mod tests {
     /// Pins nested parameter headers through the hook and RBAC-context wrappers.
     #[tokio::test]
     async fn nested_param_header_is_enforced_through_both_wrappers() -> anyhow::Result<()> {
-        use std::io::{Write as _, stdout};
-
         use rmcp_server_kit::tool_hooks::{ToolHooks, with_hooks};
 
         // Given: both kit wrappers surround a handler with a nested header schema.
@@ -208,20 +206,19 @@ mod tests {
                 .await?;
             let status = response.status();
             let body = mcp_response_json(response).await?;
-            writeln!(stdout(), "nested header: {status} {body}")?;
             observed.push((status, body, expected, message));
         }
         // Then: every outcome follows the schema supplied through both wrappers.
         for (status, body, expected, message) in observed {
-            assert_eq!(status, expected, "{body}");
+            assert_eq!(status, expected, "status={status}, body={body}");
             match message {
                 Some(fragment) => assert!(
                     body.pointer("/error/message")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|text| text.contains(fragment)),
-                    "{body}"
+                    "status={status}, body={body}"
                 ),
-                None => assert!(body.get("result").is_some(), "{body}"),
+                None => assert!(body.get("result").is_some(), "status={status}, body={body}"),
             }
         }
         Ok(())
@@ -1525,7 +1522,6 @@ mod tests {
     /// Proves malformed parser inputs never dispatch a tool RBAC did not inspect.
     #[tokio::test]
     async fn rbac_parser_differential_never_dispatches_an_uninspected_tool() -> anyhow::Result<()> {
-        use std::io::{Write as _, stdout};
         // Given: an authenticated session permits only the control tool.
         let (token, hash) = generate_api_key()?;
         let called = Arc::new(StdMutex::new(Vec::new()));
@@ -1564,19 +1560,21 @@ mod tests {
                 .await?;
             let status = response.status();
             let text = response.text().await?;
-            writeln!(stdout(), "parser case {index}: {status} {text}")?;
             // Then: malformed requests cannot succeed, and only the control is dispatched.
             match index {
                 0 | 1 => assert!(
                     !(status == 200 && text.contains("\"result\"")),
                     "case {index}: {status} {text}"
                 ),
-                2 => assert_eq!(status, 403, "float-id denied call: {text}"),
+                2 => assert_eq!(
+                    status, 403,
+                    "float-id denied call: status={status}, body={text}"
+                ),
                 3 => {
-                    assert_eq!(status, 200, "control: {text}");
+                    assert_eq!(status, 200, "control: status={status}, body={text}");
                     assert!(
                         text.contains("\"result\""),
-                        "control must return result: {text}"
+                        "control must return result: status={status}, body={text}"
                     );
                 }
                 _ => anyhow::bail!("unexpected parser differential case"),
