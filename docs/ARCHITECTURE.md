@@ -141,6 +141,7 @@ axum Router                                  src/transport.rs:2399  (build_app_r
    │
    ├── 4. CORS / Compression / Timeouts      tower-http layers
    │      Body size cap (default 1 MiB)
+   │      cors_header_policy filters preflight request headers in front of CorsLayer
    │
    ├── 5. Optional concurrency cap           src/transport.rs (build_app_router)
    │      tower::limit::ConcurrencyLimitLayer + load_shed

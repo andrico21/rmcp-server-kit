@@ -250,6 +250,35 @@ rmcp's internal origin check is **intentionally left disabled** - this
 middleware is the single authoritative validator, which avoids double
 enforcement under diverging semantics.
 
+##### CORS for browser MCP clients
+
+CORS is installed whenever the server has effective allowed origins: the
+configured `allowed_origins`, or, when that list is empty, the origin derived
+from `public_url`. A server with neither has no CORS layer. When it is
+installed:
+
+- allowed methods are `GET`, `POST`, `DELETE` and `OPTIONS`;
+- a browser on an allowed origin may send these request headers:
+  `Content-Type`, `Authorization`, `Mcp-Session-Id`, `Mcp-Protocol-Version`,
+  `Last-Event-Id`, `Mcp-Method`, `Mcp-Name`, plus any `Mcp-Param-*` name
+  (names compare case-insensitively);
+- a preflight that asks for any other request header gets no
+  `Access-Control-Allow-Headers` at all, so the browser blocks that request;
+- the response headers `Mcp-Session-Id`, `WWW-Authenticate`, `Last-Event-Id`
+  and `Mcp-Protocol-Version` are exposed to scripts on an allowed origin;
+- CORS-safelisted headers such as `accept` are not listed, because browsers
+  send them without a preflight;
+- there is no setting to extend the request-header list.
+
+A request from an origin that isn't allowed never reaches CORS: the origin
+check above rejects it first with `403`. CORS is not authorization either.
+It only lets the browser read the response; authentication and RBAC still
+apply to every request. Responses to requests without an `Origin` header keep
+their 3.20.0 headers (CORS adds only `Vary: origin`, as it already did), except
+`OPTIONS` responses: the CORS layer answers every `OPTIONS` request as a
+preflight, so those carry `Access-Control-Allow-Methods` whether or not an
+`Origin` is sent.
+
 #### `serve()`
 
 ```rust

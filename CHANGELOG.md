@@ -13,8 +13,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 Opt-in MCP 2026-07-28 authorization features, follow-ups to the rmcp 3.6.0
 lockfile move (tests, docs and one internal change), an SSE priming opt-out
-for clients that reject the priming event, and dependency maintenance. Every
-new knob defaults to the 3.20.0 behaviour; see
+for clients that reject the priming event, CORS that lets browser MCP clients
+on an allowed origin use the MCP protocol headers (#71), and dependency
+maintenance. Every new knob defaults to the 3.20.0 behaviour; see
 [`docs/MIGRATION.md`](docs/MIGRATION.md) (no action required) and
 [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
 
@@ -124,6 +125,23 @@ new knob defaults to the 3.20.0 behaviour; see
 
 ### Changed
 
+- CORS for browser MCP clients (#71): CORS is installed whenever allowed
+  origins are effective (configured `allowed_origins`, or the origin derived
+  from `public_url`), as before. It now allows `GET`, `POST`, `DELETE` and
+  `OPTIONS`, and a browser on an allowed origin may send `Content-Type`,
+  `Authorization`, `Mcp-Session-Id`, `Mcp-Protocol-Version`, `Last-Event-Id`,
+  `Mcp-Method`, `Mcp-Name` and any `Mcp-Param-*` request header. A preflight
+  that asks for any other header gets no `Access-Control-Allow-Headers`, so
+  the browser blocks that request; CORS-safelisted headers such as `accept`
+  need no preflight and are not listed. Responses to an allowed `Origin`
+  expose `Mcp-Session-Id`, `WWW-Authenticate`, `Last-Event-Id` and
+  `Mcp-Protocol-Version`. Disallowed origins are still rejected by the origin
+  check before CORS runs, and CORS is not authorization: authentication and
+  RBAC apply as before. There is no setting to extend the header list and no
+  opt-out (see [`docs/MIGRATION.md`](docs/MIGRATION.md)). Closes #71.
+- CI only: `Swatinem/rust-cache` 2.9.2 (#73), and
+  `EmbarkStudios/cargo-deny-action` re-pinned from the annotated `v2` tag
+  object to the commit it points to (#74, same code).
 - CI only: `actions/checkout` v7.0.1 and `actions/upload-artifact` v7.0.2;
   `softprops/action-gh-release` v3 and `Swatinem/rust-cache` v2.9.1 re-pinned
   to their tag commits. Dependabot ignores `dtolnay/rust-toolchain` because it
@@ -259,8 +277,12 @@ new knob defaults to the 3.20.0 behaviour; see
 - A configuration that sets none of the new knobs keeps byte-identical
   3.20.0 wire behaviour (status, headers, bodies, routes, redirects, upstream
   request bodies, token acceptance) for this crate's own code, pinned by the
-  `compat_3_20` suite in `tests/integration/e2e.rs`. The only addition is the
-  WARN line above when `public_url` is unset. Behaviour that rmcp itself owns
+  `compat_3_20` suite in `tests/integration/e2e.rs`. There are two additions:
+  the WARN line above when `public_url` is unset, and, with allowed origins
+  configured (or derived from `public_url`), the CORS headers described under
+  Changed on OPTIONS responses and on responses to an allowed `Origin`.
+  Responses to other requests without an `Origin` header are unchanged.
+  Behaviour that rmcp itself owns
   follows the consumer's resolved rmcp version (see the rmcp 3.6.0 entry under
   Changed).
 

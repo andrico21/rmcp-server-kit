@@ -45,7 +45,11 @@ your own environment, not as a tested recipe.
 The passthrough proxy stays the default only for backward compatibility. An
 unchanged 3.20.0 configuration keeps its 3.20.0 wire behaviour byte for byte
 for this crate's own code; rmcp-owned behaviour follows your resolved rmcp
-version.
+version. The one exception is CORS: with allowed origins configured (or
+derived from `public_url`), OPTIONS responses and responses to an allowed
+`Origin` carry the CORS headers for browser MCP clients described in
+[GUIDE.md](GUIDE.md#cors-for-browser-mcp-clients); responses to other
+requests without an `Origin` header are unchanged.
 
 ## 2. Flow dissection: direct mode
 
