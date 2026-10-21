@@ -162,7 +162,9 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `webpki-root-certs` from 1.0.9 to 1.0.10 (RUSTSEC-2026-0383, bundled roots
   trusted distrusted emSign intermediates; reached through `reqwest`'s
   `rustls-platform-verifier`). `cargo audit` and `cargo deny check` are clean
-  again.
+  again. The `rustls-webpki` requirement in `Cargo.toml` is raised from
+  0.103.15 to 0.103.16, so a downstream build cannot resolve the vulnerable
+  version.
 
 ### Notes
 
