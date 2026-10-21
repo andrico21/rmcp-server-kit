@@ -522,7 +522,7 @@ config and env block.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [R1](#r1---direct-mode-pre-registered-keycloak-client-client-id-audience-strict-mode-realm-role-mapping) | `"https://mcp.example"` | `"mcp-example"` | `"strict"` | - | - | `"realm_access.roles"` | - | - | - | - | - | pre-registered client `mcp-example`, realm roles, `Audience` mapper |
 | [R2](#r2---direct-mode-with-cimd-resource-indicators-and-accept_resource_audience) | `"https://mcp.example"` | `"mcp-example"` | - | `true` | - | scopes | - | - | - | - | - | CIMD and resource indicators, optional `mcp:*` client scopes |
-| [R3](#r3---additional_audiences-one-server-reachable-under-two-hostnames-or-moving-from-a-client-id-audience-to-the-resource-url) | `"https://mcp.example"` | `"https://mcp.example/mcp"` | - | - | `["https://mcp-old.example/mcp", "mcp-example-legacy"]` | scopes | - | - | - | - | - | `Audience` mapper with the resource URL; old mappers kept while migrating |
+| [R3](#r3---additional_audiences-audience-migration-to-the-resource-url) | `"https://mcp.example"` | `"https://mcp.example/mcp"` | - | - | `["https://mcp-old.example/mcp", "mcp-example-legacy"]` | scopes | - | - | - | - | - | `Audience` mapper with the resource URL; old mappers kept while migrating |
 | [R4a](#r4---roles-from-realm_accessroles-resource_accessclientroles-and-groups) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | `"realm_access.roles"` | - | - | - | - | - | realm role `mcp-users` |
 | [R4b](#r4---roles-from-realm_accessroles-resource_accessclientroles-and-groups) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | `"resource_access.mcp-example.roles"` | - | - | - | - | - | client role `mcp-user` of `mcp-example` |
 | [R4c](#r4---roles-from-realm_accessroles-resource_accessclientroles-and-groups) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | `"groups"` | - | - | - | - | - | group `mcp-users` with a group membership mapper |
@@ -751,7 +751,7 @@ Content-Type: application/json
 {"authorization_servers":["https://idp.example/realms/example"],"bearer_methods_supported":["header"],"resource":"https://mcp.example/mcp","scopes_supported":["mcp:admin","mcp:read"]}
 ```
 
-### R3 - `additional_audiences`: one server reachable under two hostnames, or moving from a client-id audience to the resource URL
+### R3 - `additional_audiences`: audience migration to the resource URL
 
 Settings: [resource-server matrix](#settings-matrix-resource-server), row R3.
 
