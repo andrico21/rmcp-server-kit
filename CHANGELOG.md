@@ -11,6 +11,27 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Fixed
+
+- The OAuth proxy navigation endpoints no longer send CORS response headers:
+  `/authorize` in both proxy modes, and `/oauth/consent` and `/oauth/callback`
+  in `authorization_server` mode, for every method including OPTIONS. RFC 9700
+  section 2.6 says CORS MUST NOT be supported at the authorization endpoint;
+  browsers reach these pages by navigation. `Vary: origin` and every response
+  to a request without `Origin` (other than OPTIONS) are unchanged; token,
+  registration, metadata and `/mcp` CORS are unchanged. No opt-out, because it
+  would re-enable a MUST NOT. The owner approved this patch release without an
+  opt-out as an exception to the default-change policy above, because it
+  corrects behaviour the RFC forbids. Earlier releases also granted CORS at
+  `/authorize` whenever CORS was installed.
+
+### Changed
+
+- Docs only: the CORS section of the guide and the 3.21.0 migration note no
+  longer say browsers can send nothing beyond the MCP headers (CORS-safelisted
+  headers need no grant), and the guide notes that tracing headers are not
+  granted.
+
 ## [3.21.0] - 2026-10-22
 
 Opt-in MCP 2026-07-28 authorization features, follow-ups to the rmcp 3.6.0

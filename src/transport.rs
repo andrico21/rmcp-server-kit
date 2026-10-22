@@ -2871,6 +2871,7 @@ where
     // Browser MCP CORS uses a strict request-header allowlist before mirroring
     // and exposes protocol response headers only for allowed origins. The
     // effective origins include the origin auto-derived from public_url.
+    // Installed OAuth navigation endpoints receive no CORS grant.
     if !cors_origins.is_empty() {
         // Align CORS with the origin middleware: the predicate matches the
         // same normalized `AllowedOrigin` set, so an entry that normalizes
@@ -2893,8 +2894,21 @@ where
                 HeaderName::from_static("mcp-protocol-version"),
             ])
             .vary([ORIGIN]);
+        #[cfg(feature = "oauth")]
+        let navigation_paths: &'static [&'static str] = cors_navigation_paths(
+            config
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.oauth.as_ref())
+                .and_then(|oauth| oauth.proxy.as_ref())
+                .map(|proxy| proxy.mode),
+        );
+        #[cfg(not(feature = "oauth"))]
+        let navigation_paths: &'static [&'static str] = &[];
         router = router.layer(cors);
-        router = router.layer(from_fn(cors_header_policy));
+        router = router.layer(from_fn(move |req: Request<Body>, next: Next| {
+            cors_header_policy(navigation_paths, req, next)
+        }));
     }
 
     // Optional response compression (gzip + brotli). Skips small bodies
@@ -3130,14 +3144,31 @@ fn cors_request_headers_allowed(value: &HeaderValue) -> bool {
         })
 }
 
-/// Filters preflight headers before mirroring and preserves origin-less responses.
+/// Installed OAuth navigation endpoints without CORS support, per RFC 9700 section 2.6.
+#[cfg(feature = "oauth")]
+const fn cors_navigation_paths(mode: Option<ProxyMode>) -> &'static [&'static str] {
+    match mode {
+        None => &[],
+        Some(ProxyMode::Passthrough) => &["/authorize"],
+        Some(ProxyMode::AuthorizationServer) => {
+            &["/authorize", "/oauth/consent", "/oauth/callback"]
+        }
+    }
+}
+
+/// Filters preflight headers and removes navigation CORS grants without changing Vary.
 // cancel-safe: holds no shared state across await; dropping it drops only the inner future.
-async fn cors_header_policy(mut req: Request<Body>, next: Next) -> Response {
+async fn cors_header_policy(
+    navigation_paths: &'static [&'static str],
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
     use axum::http::header::{
         ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS,
         VARY,
     };
 
+    let navigation = navigation_paths.contains(&req.uri().path());
     let is_options = req.method() == Method::OPTIONS;
     if is_options
         && req
@@ -3161,6 +3192,17 @@ async fn cors_header_policy(mut req: Request<Body>, next: Next) -> Response {
             VARY,
             HeaderValue::from_static("access-control-request-headers"),
         );
+    }
+    if navigation {
+        let names: Vec<_> = response
+            .headers()
+            .keys()
+            .filter(|name| name.as_str().starts_with("access-control-"))
+            .cloned()
+            .collect();
+        for name in names {
+            let _removed = response.headers_mut().remove(name);
+        }
     }
     response
 }
@@ -11420,6 +11462,57 @@ mod tests {
         let resp = app.oneshot(req).await?;
         assert_owasp_headers(&resp, "cors-preflight");
 
+        Ok(())
+    }
+
+    /// Selects only navigation paths installed by the configured OAuth proxy mode.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn cors_navigation_paths_follow_the_installed_proxy_mode() -> anyhow::Result<()> {
+        // Given each possible installed proxy mode, when selecting its paths,
+        // then only the framework-owned navigation endpoints are exempted.
+        anyhow::ensure!(cors_navigation_paths(None).is_empty(), "no proxy paths");
+        anyhow::ensure!(
+            cors_navigation_paths(Some(ProxyMode::Passthrough)) == ["/authorize"],
+            "passthrough paths"
+        );
+        anyhow::ensure!(
+            cors_navigation_paths(Some(ProxyMode::AuthorizationServer))
+                == ["/authorize", "/oauth/consent", "/oauth/callback"],
+            "authorization-server paths"
+        );
+        Ok(())
+    }
+
+    /// Keeps browser CORS on a consumer-owned authorization route without a proxy.
+    #[tokio::test]
+    // cancel-safe: owns the fixture router and drops only its request future on cancellation.
+    async fn cors_consumer_authorize_route_keeps_cors_without_proxy() -> anyhow::Result<()> {
+        use axum::routing::get;
+
+        // Given a consumer route and no OAuth proxy.
+        #[derive(Clone)]
+        struct ProbeHandler;
+        impl ServerHandler for ProbeHandler {}
+        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0")
+            .with_allowed_origins(["http://good.example"])
+            .with_extra_router(axum::Router::new().route("/authorize", get(extra_router_probe)));
+        let (app, _params) = build_app_router(config, || ProbeHandler)?;
+        let req = Request::builder()
+            .uri("/authorize")
+            .header(header::ORIGIN, "http://good.example")
+            .body(Body::empty())?;
+
+        // When an allowed browser requests the consumer route.
+        let response = app.oneshot(req).await?;
+
+        // Then the route retains its CORS grant.
+        anyhow::ensure!(response.status() == StatusCode::OK, "consumer route status");
+        anyhow::ensure!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                == Some(&HeaderValue::from_static("http://good.example")),
+            "consumer authorization route must retain CORS"
+        );
         Ok(())
     }
 

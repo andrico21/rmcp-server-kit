@@ -47,8 +47,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:3243`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:5874`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:3285`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:5916`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -110,7 +110,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 ```
 TCP / TLS handshake                         `TlsListener` src/transport.rs:3973
    │  - Handshakes run CONCURRENTLY on a background acceptor task
-│    (`run_tls_acceptor`, src/transport.rs:4064): 256-permit in-flight
+│    (`run_tls_acceptor`, src/transport.rs:4106): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
    │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
@@ -119,11 +119,11 @@ TCP / TLS handshake                         `TlsListener` src/transport.rs:3973
    ▼
 axum Router                                  src/transport.rs:2399  (build_app_router)
    │
-├── 0. Security headers                   `security_headers_middleware` src/transport.rs:4690
+├── 0. Security headers                   `security_headers_middleware` src/transport.rs:4732
    │      Outermost response-only decoration: HSTS, CSP,
    │      X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
-├── 1. Origin check                       `origin_check_middleware` src/transport.rs:5514
+├── 1. Origin check                       `origin_check_middleware` src/transport.rs:5556
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
    ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
@@ -141,7 +141,7 @@ axum Router                                  src/transport.rs:2399  (build_app_r
    │
    ├── 4. CORS / Compression / Timeouts      tower-http layers
    │      Body size cap (default 1 MiB)
-   │      cors_header_policy filters preflight request headers in front of CorsLayer
+   │      cors_header_policy filters preflight request headers in front of CorsLayer and removes CORS grants at the OAuth navigation endpoints
    │
    ├── 5. Optional concurrency cap           src/transport.rs (build_app_router)
    │      tower::limit::ConcurrencyLimitLayer + load_shed
@@ -196,12 +196,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (`src/transport.rs:4419`) |
-| `GET  /readyz`                             | `readyz`  (`src/transport.rs:4484`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (`src/transport.rs:4434`) |
+| `GET  /healthz`                            | `healthz` (`src/transport.rs:4461`) |
+| `GET  /readyz`                             | `readyz`  (`src/transport.rs:4526`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (`src/transport.rs:4476`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:220`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth`, mounted in `build_app_router` (`src/transport.rs:2399`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3574`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3616`) |
 | `POST /register` (`authorization_server` mode) | `register` (`src/oauth_as.rs:396`) - validates redirect URIs and answers `201` with a sealed per-client `client_id` |
 | `GET  /authorize` (`authorization_server` mode) | `authorize` (`src/oauth_as.rs:492`) - opens the sealed client, checks the exact `redirect_uri` and S256 PKCE, serves the consent page (or skips it on remembered consent) |
 | `POST /oauth/consent` (`authorization_server` mode) | `consent` (`src/oauth_as.rs:670`) - CSRF-checked approve/deny; approval sets the state and consent cookies and redirects to the upstream IdP |
@@ -216,7 +216,7 @@ Authenticated endpoints:
 | `POST /mcp`         | Yes  | The MCP JSON-RPC endpoint (Streamable HTTP)    |
 | `GET  /mcp`         | Yes  | SSE stream for server → client messages        |
 | `*    /admin/*`     | Yes (role: `admin`) | `AdminConfig` in `src/admin.rs:50`            |
-| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy via `build_oauth_admin_router` | `src/transport.rs:3723` |
+| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy via `build_oauth_admin_router` | `src/transport.rs:3765` |
 
 ---
 
@@ -364,7 +364,7 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 2. It extracts CN/SAN as `name`, derives `role` from the configured
    subject→role mapping, and attaches `AuthIdentity { method: Mtls, … }`
    to the **per-connection** extension in `extract_handshake_identity`
-   (`extract_handshake_identity`, `src/transport.rs:4041`).
+   (`extract_handshake_identity`, `src/transport.rs:4083`).
 3. `auth_middleware` reads the identity directly from that connection
    state (`auth_middleware`, `src/auth.rs:2782`); no shared SocketAddr-keyed map is
    consulted, so there is no port-reuse aliasing risk.
@@ -468,7 +468,7 @@ replacement for `TcpListener`.
 Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
-   spawns `run_tls_acceptor` (`src/transport.rs:4064`) as the dedicated background acceptor task that owns the listener.
+   spawns `run_tls_acceptor` (`src/transport.rs:4106`) as the dedicated background acceptor task that owns the listener.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -719,7 +719,7 @@ recommended.
 
 ### Optional OAuth 2.1 proxy
 When `oauth.proxy` is configured, rmcp-server-kit mounts thin proxy endpoints under
-the server's own URL via `install_oauth_proxy_routes` (`src/transport.rs:3574`):
+the server's own URL via `install_oauth_proxy_routes` (`src/transport.rs:3616`):
 - `/.well-known/oauth-authorization-server`
 - `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`
 
@@ -739,7 +739,7 @@ refresh tokens to the client. It keeps no server-side state; every
 registration, consent, state cookie, code and refresh wrapper is sealed by
 `Sealer` (`src/oauth_seal.rs:83`) with a key derived per purpose from
 `sealing_secret`. The HTML pages carry their own CSP through
-`PageSecurityHeaders` (`src/transport.rs:4801`). Flows, knobs and Keycloak
+`PageSecurityHeaders` (`src/transport.rs:4843`). Flows, knobs and Keycloak
 settings for both modes are in [`OAUTH_PROXY.md`](OAUTH_PROXY.md).
 
 ### Hardening defaults
@@ -1088,7 +1088,7 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
 Wired in `build_app_router` (`src/transport.rs:2399`);
-`origin_check_middleware` is at `src/transport.rs:5514`.
+`origin_check_middleware` is at `src/transport.rs:5556`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
    to evaluate. `build_app_router` installs the auth layer before the RBAC

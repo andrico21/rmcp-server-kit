@@ -3,6 +3,34 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.21.1: no CORS at the OAuth navigation endpoints
+
+**No action required** for integrations that already navigate to the
+authorization endpoint. An integration that calls it with `fetch` must switch
+to navigation.
+
+What changes: the OAuth proxy's navigation endpoints no longer send CORS
+response headers. They are `/authorize` in both proxy modes, and
+`/oauth/consent` and `/oauth/callback` in `authorization_server` mode. The
+change covers every method, `OPTIONS` included. `Vary: origin` stays, and
+responses to requests without an `Origin` header, other than `OPTIONS`, are
+unchanged. CORS on the token and registration endpoints, the metadata
+documents and `/mcp` is unchanged.
+
+Why: RFC 9700 section 2.6 says CORS MUST NOT be supported at the
+authorization endpoint. Browsers reach these pages by navigation, never by
+`fetch`.
+
+There is no opt-out, because one would re-enable behaviour the RFC says MUST
+NOT happen. The change ships in a patch release as an owner-approved
+exception to the default-change policy stated at the top of
+[`CHANGELOG.md`](../CHANGELOG.md), because it corrects behaviour the RFC
+forbids.
+
+A browser integration that `fetch`es `/authorize` must navigate to it
+instead, for example by setting `window.location` or opening a popup. Details
+are in [GUIDE.md](GUIDE.md#cors-for-browser-mcp-clients).
+
 ## Migrating to 3.21.0: opt-in MCP 2026-07-28 authorization features and CORS for browser clients
 
 The lockfile also moves to rmcp 3.6.0 (`Cargo.toml` keeps `rmcp = "3"`); see
@@ -46,10 +74,11 @@ and `Authorization`. A preflight asking for any other header gets no
 `Access-Control-Allow-Headers`. Responses to an allowed `Origin` also expose
 `Mcp-Session-Id`, `WWW-Authenticate`, `Last-Event-Id` and
 `Mcp-Protocol-Version`. Responses to requests without an `Origin` header,
-other than OPTIONS, are unchanged. There is no opt-out because none is
-needed: the origin allowlist is still the gate, so a disallowed origin is
-rejected before CORS runs, and the request-header list is strict, so a
-browser can send nothing beyond the MCP headers. Details are in
+other than OPTIONS, are unchanged. There is no CORS opt-out. Disallowed
+origins are rejected before CORS runs. Preflight header grants are limited to
+the names listed above; this does not prohibit CORS-safelisted request
+headers or browser-controlled headers and is not server-side validation of
+the actual request's header names. Details are in
 [GUIDE.md](GUIDE.md#cors-for-browser-mcp-clients).
 
 When at least one opt-in below is enabled the server also logs one INFO
