@@ -257,6 +257,131 @@ mod tests {
         }
     }
 
+    /// Send a table case from the allowed browser origin and pin its wire status.
+    // cancel-safe: owns only the request future; the caller owns and closes the listener.
+    async fn cors_response(
+        server: &Harness,
+        (method, path, status): (&str, &str, u16),
+    ) -> anyhow::Result<Response> {
+        let mut request = server
+            .client
+            .request(method.parse()?, format!("{}{path}", server.base))
+            .header("origin", &server.base);
+        if method == "OPTIONS" {
+            request = request.header("access-control-request-method", "POST");
+        }
+        if method == "POST" {
+            request = request
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body("");
+        }
+        let response = request.send().await?;
+        ensure!(
+            response.status() == status,
+            "{method} {path}: expected {status}, got {}",
+            response.status()
+        );
+        Ok(response)
+    }
+
+    /// Reject every CORS grant header while preserving the authorization page's Vary.
+    fn ensure_navigation_cors(response: &Response, method: &str, path: &str) -> anyhow::Result<()> {
+        for name in response.headers().keys() {
+            ensure!(
+                !name.as_str().starts_with("access-control-"),
+                "{method} {path}: remaining access-control-* header: {name}"
+            );
+        }
+        if method == "GET" && path.starts_with("/authorize?") {
+            ensure!(
+                response
+                    .headers()
+                    .get_all("vary")
+                    .iter()
+                    .any(|value| value == "origin"),
+                "{method} {path}: Vary: origin must remain"
+            );
+        }
+        Ok(())
+    }
+
+    /// Navigation pages never grant cross-origin script reads in authorization-server mode.
+    #[tokio::test]
+    // cancel-safe: the harness cancels and aborts fixture tasks if the test is dropped.
+    async fn navigation_endpoints_carry_no_cors_grant() -> anyhow::Result<()> {
+        // Given an allowed browser and a registered client, without a consent cookie.
+        let server = Harness::start_mode("30days", "authorization_server").await?;
+        let cid = server.register("CORS navigation app").await?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(Harness::params(&cid))
+            .finish();
+        let authorize = format!("/authorize?{query}");
+        for (method, path, status) in [
+            ("GET", authorize.as_str(), 200),
+            ("HEAD", authorize.as_str(), 200),
+            ("OPTIONS", "/authorize", 200),
+            ("OPTIONS", "/oauth/consent", 200),
+            ("OPTIONS", "/oauth/callback", 200),
+            ("POST", "/oauth/consent", 400),
+            ("GET", "/oauth/callback", 400),
+            ("POST", "/authorize", 405),
+        ] {
+            // When the real listener handles each navigation request, then no CORS is granted.
+            let response = cors_response(&server, (method, path, status)).await?;
+            ensure_navigation_cors(&response, method, path)?;
+        }
+        server.close().await
+    }
+
+    /// Passthrough authorization redirects and preflights never carry CORS grants.
+    #[tokio::test]
+    // cancel-safe: the harness cancels and aborts fixture tasks if the test is dropped.
+    async fn passthrough_authorize_carries_no_cors_grant() -> anyhow::Result<()> {
+        // Given a passthrough proxy and an allowed browser.
+        let server = Harness::start_mode("30days", "passthrough").await?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(Harness::params("legacy-client"))
+            .finish();
+        let authorize = format!("/authorize?{query}");
+        for (method, path, status) in [
+            ("GET", authorize.as_str(), 302),
+            ("HEAD", authorize.as_str(), 302),
+            ("OPTIONS", "/authorize", 200),
+        ] {
+            // When the real listener handles authorization, then no CORS is granted.
+            let response = cors_response(&server, (method, path, status)).await?;
+            ensure_navigation_cors(&response, method, path)?;
+        }
+        server.close().await
+    }
+
+    /// Token, registration and metadata endpoints retain browser CORS in both proxy modes.
+    #[tokio::test]
+    // cancel-safe: the harness cancels and aborts fixture tasks if the test is dropped.
+    async fn token_register_and_metadata_keep_cors() -> anyhow::Result<()> {
+        for mode in ["passthrough", "authorization_server"] {
+            // Given each installed proxy mode and its allowed browser origin.
+            let server = Harness::start_mode("30days", mode).await?;
+            for case in [
+                ("OPTIONS", "/token", 200),
+                ("OPTIONS", "/register", 200),
+                ("GET", "/.well-known/oauth-authorization-server", 200),
+            ] {
+                // When the real listener responds, then the browser retains its origin grant.
+                let response = cors_response(&server, case).await?;
+                ensure!(
+                    response
+                        .headers()
+                        .get("access-control-allow-origin")
+                        .is_some_and(|value| value == server.base.as_str()),
+                    "{mode} {case:?}: expected origin grant"
+                );
+            }
+            server.close().await?;
+        }
+        Ok(())
+    }
+
     /// Extract the form token and the single CSRF cookie without browser cookie magic.
     async fn consent_form(response: Response) -> anyhow::Result<(String, String)> {
         ensure!(response.status() == 200, "consent page status");
