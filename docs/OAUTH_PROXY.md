@@ -49,7 +49,10 @@ version. The one exception is CORS: with allowed origins configured (or
 derived from `public_url`), OPTIONS responses and responses to an allowed
 `Origin` carry the CORS headers for browser MCP clients described in
 [GUIDE.md](GUIDE.md#cors-for-browser-mcp-clients); responses to other
-requests without an `Origin` header are unchanged.
+requests without an `Origin` header are unchanged. The OAuth navigation
+endpoints (`/authorize`, and in `authorization_server` mode `/oauth/consent`
+and `/oauth/callback`) carry no CORS headers since 3.21.1 (RFC 9700 section
+2.6).
 
 ## 2. Flow dissection: direct mode
 
@@ -2373,6 +2376,7 @@ are case [P7](#p7---migration-passthrough---authorization_server) in section
 | Clock skew between replicas | lifetimes are absolute Unix times written by one replica and checked by another; skew shortens or lengthens the 600 s and 120 s windows; keep clocks synchronised |
 | Reserved paths | `/oauth/consent` and `/oauth/callback` belong to the proxy; an application route there would conflict |
 | Request floods | **no rate limiting on the proxy endpoints.** `extra_route_rate_limit` covers only routes added with `with_extra_router`, and the tool and pre-auth limiters cover `/mcp`. The request-body cap (`max_request_body`) and the optional global `max_concurrent_requests` cap do apply. Rate limiting `/register`, `/authorize`, `/oauth/*` and `/token` is the operator's job, for example at the ingress |
+| Cross-origin reads of the authorization pages | no CORS grant at /authorize, /oauth/consent and /oauth/callback (RFC 9700 section 2.6); browsers reach them by navigation only |
 
 Known differences from the wording of the
 [MCP Security Best Practices](https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices):

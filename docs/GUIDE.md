@@ -258,7 +258,7 @@ from `public_url`. A server with neither has no CORS layer. When it is
 installed:
 
 - allowed methods are `GET`, `POST`, `DELETE` and `OPTIONS`;
-- a browser on an allowed origin may send these request headers:
+- preflights from an allowed origin grant these request-header names:
   `Content-Type`, `Authorization`, `Mcp-Session-Id`, `Mcp-Protocol-Version`,
   `Last-Event-Id`, `Mcp-Method`, `Mcp-Name`, plus any `Mcp-Param-*` name
   (names compare case-insensitively);
@@ -266,18 +266,39 @@ installed:
   `Access-Control-Allow-Headers` at all, so the browser blocks that request;
 - the response headers `Mcp-Session-Id`, `WWW-Authenticate`, `Last-Event-Id`
   and `Mcp-Protocol-Version` are exposed to scripts on an allowed origin;
-- CORS-safelisted headers such as `accept` are not listed, because browsers
-  send them without a preflight;
+- CORS-safelisted request headers need no `Access-Control-Allow-Headers`
+  grant when their values meet Fetch's syntax and size limits (each value at
+  most 128 bytes, at most 1024 bytes in total); the usual MCP
+  `Accept: application/json, text/event-stream` qualifies, while
+  `Authorization` and `Content-Type: application/json` still need the
+  preflight grant above;
+- tracing headers such as `traceparent`, `tracestate` and `baggage` are not
+  granted, so a browser application that injects them into cross-origin
+  requests must exclude this server from that propagation; MCP's
+  trace-context convention (SEP-414) carries trace context in `_meta`
+  instead;
 - there is no setting to extend the request-header list.
 
 A request from an origin that isn't allowed never reaches CORS: the origin
 check above rejects it first with `403`. CORS is not authorization either.
-It only lets the browser read the response; authentication and RBAC still
-apply to every request. Responses to requests without an `Origin` header keep
-their 3.20.0 headers (CORS adds only `Vary: origin`, as it already did), except
-`OPTIONS` responses: the CORS layer answers every `OPTIONS` request as a
-preflight, so those carry `Access-Control-Allow-Methods` whether or not an
-`Origin` is sent.
+It controls whether scripts on another origin may read responses and which
+methods and headers a preflight permits; requests that need no preflight are
+still sent. Authentication and RBAC still apply to `/mcp` regardless of CORS.
+Responses to requests without an `Origin` header keep their 3.20.0 headers
+(CORS adds only `Vary: origin`, as it already did), except `OPTIONS`
+responses: the CORS layer answers every `OPTIONS` request to a route this
+server serves as a preflight, so those carry `Access-Control-Allow-Methods`
+(except at the navigation endpoints below) whether or not an `Origin` is
+sent.
+
+The OAuth proxy's navigation endpoints get no CORS grant: `/authorize` in
+both proxy modes, and `/oauth/consent` and `/oauth/callback` in
+`authorization_server` mode. Browsers reach them by navigation, never by
+`fetch`, and RFC 9700 section 2.6 says CORS MUST NOT be supported at the
+authorization endpoint. Their responses carry no `Access-Control-*` header
+for any method, OPTIONS included; `Vary: origin` stays. A route you add with
+`with_extra_router` at one of those paths keeps CORS when the proxy did not
+install that path.
 
 #### `serve()`
 
