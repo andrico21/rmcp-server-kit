@@ -668,16 +668,16 @@ jobs:
       fail-fast: false
       matrix:
         # NOTE: cargo-mutants shards are ZERO-indexed: valid values for
-        # `--shard k/4` are 0..3. Passing 4/4 silently selects an empty
+        # `--shard k/8` are 0..7. Passing 8/8 silently selects an empty
         # shard instead of erroring.
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
-      - name: Run cargo mutants on the oauth-feature modules (shard ${{ matrix.shard }}/4)
+      - name: Run cargo mutants on the oauth-feature modules (shard ${{ matrix.shard }}/8)
         # Scope: the two authorization-server modules that are compiled ONLY
         # with `--features oauth` (src/lib.rs `#[cfg(feature = "oauth")]`).
         # cargo-mutants does not understand `cfg`: run with default features
@@ -688,24 +688,42 @@ jobs:
         #   `cargo mutants --list --features oauth -f src/oauth_as.rs
         #    -f src/oauth_seal.rs | wc -l`  ->  210 mutants
         #   `cargo test --features oauth` warm: 264 s (second of two runs)
-        # Shard rule: minutes/shard = ceil(mutants / shards) x 1.44 x (suite s
-        #   / 218), where 1.44 min/mutant at a 218 s default suite comes from
-        #   the `mutants` job budget measurement. 4 shards: 53 x 1.44 x 1.211
-        #   = ~92 min, under the 150 min planning bound and the 170m wall.
-        # Per-test cap: 264 s x 1.2 = 317 s <= 360 s, so the `mutants` job's
-        #   360 s is kept. Re-measure when the oauth suite grows.
+        # Shard rule, re-measured. The 2026-10-20 estimate (1.44 min per
+        #   mutant scaled by suite time, ~92 min for 4 shards) was about 2x too
+        #   low. In the 2026-10-22 nightly (run 39749209759, 4 shards of 53-54
+        #   mutants) the two healthy shards' `cargo mutants` steps took 162.1 and
+        #   166.1 min (~3.1 min per mutant, with 2 and 3 mutant timeouts), only
+        #   about 8 and 4 min under the 170m wall. Most oauth mutants run most
+        #   of the suite before a test fails, because the integration tests
+        #   come after the ~190 s lib suite. At ~3.1 min per mutant and the ~1.7x
+        #   slow-runner contention in the `mutants` job's 2026-10-05 erratum,
+        #   27 mutants (213 / 8 shards) project 27 x 3.1 x 1.7 = ~142 min, about
+        #   28 min under the wall; 36 (6 shards) would not fit. Each extra
+        #   baseline costs about 8 min of runner time, which is acceptable.
+        # Per-test cap: B = 264 s (the 2026-10-20 warm measurement above; the
+        #   2026-10-22 nightly measured a baseline test phase of 244 s and 250 s
+        #   on its two healthy shards). A run needs B x 1.7 = ~449 s of
+        #   headroom under that contention, so the 360 s cap (chosen above
+        #   264 s x 1.2 = 317 s) was too tight. On that nightly shards 1 and 2 hit the cap during the
+        #   unmutated baseline (the last test binary, the Argon2 proptests in a
+        #   debug build, was still running), exited 4 and tested 0 of 53
+        #   mutants each. Cap raised to 600 s (~2.3 x B) for this job only. A
+        #   baseline or mutant run that reaches the cap now costs up to 240 s
+        #   more, which the shard rule above allows for. The summariser's
+        #   near-cap warning (baseline >= 90% of the cap) now fires at 540 s.
+        #   Re-measure when the oauth suite grows.
         # Wrap in `timeout` so we exit 0 even if cargo-mutants blows past the
         # wall-clock budget (job-level `timeout-minutes` SIGKILLs and bypasses
         # `|| true`); the summariser and the final step report truncation.
 
         env:
-          MUTANTS_TEST_TIMEOUT: "360"
+          MUTANTS_TEST_TIMEOUT: "600"
 
         run: |
           set +e
           timeout 170m cargo mutants --no-shuffle --cap-lints=true \
             --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 --features oauth \
-            --sharding round-robin --shard ${{ matrix.shard }}/4 \
+            --sharding round-robin --shard ${{ matrix.shard }}/8 \
             -f src/oauth_as.rs -f src/oauth_seal.rs
           status=$?
           set -e
@@ -734,7 +752,7 @@ jobs:
       # before testing, and fills outcomes.json in incrementally. If the run is
       # killed at the wall, the untested tail is simply absent from outcomes,
       # so generated-vs-completed is the only way to see how much was skipped.
-      - name: Summarize mutation results (shard ${{ matrix.shard }}/4)
+      - name: Summarize mutation results (shard ${{ matrix.shard }}/8)
         if: always()
         run: |
           out=mutants.out
@@ -757,9 +775,9 @@ jobs:
           # job already avoids.
           baseline_test=$(jq '[.outcomes[] | select(.scenario == "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | first // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
           max_test=$(jq '[.outcomes[]? | select(.scenario != "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | max // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
-          test_cap="${MUTANTS_TEST_TIMEOUT:-360}"
+          test_cap="${MUTANTS_TEST_TIMEOUT:-600}"
           {
-            echo "### cargo-mutants shard ${{ matrix.shard }}/4"
+            echo "### cargo-mutants shard ${{ matrix.shard }}/8"
             echo ""
             echo "| metric | value |"
             echo "|---|---|"
@@ -790,7 +808,7 @@ jobs:
             case "$status" in
               0 | 2 | 3 | 124 | 137) ;;
               *)
-                echo "::error::shard ${{ matrix.shard }}/4 left no parseable mutants.out (exit status $status); mutation results were never produced. See the run log."
+                echo "::error::shard ${{ matrix.shard }}/8 left no parseable mutants.out (exit status $status); mutation results were never produced. See the run log."
                 exit 1
                 ;;
             esac
@@ -800,11 +818,11 @@ jobs:
           # exits 4 (not 124/137), so it used to leave a green job with
           # near-zero coverage and no annotation at all.
           if [ "$completed" -lt "$generated" ]; then
-            echo "::error::shard ${{ matrix.shard }}/4 tested $completed of $generated mutants; $((generated - completed)) are absent from outcomes.json. Mutation coverage is incomplete."
+            echo "::error::shard ${{ matrix.shard }}/8 tested $completed of $generated mutants; $((generated - completed)) are absent from outcomes.json. Mutation coverage is incomplete."
             exit 1
           fi
           if [ "${TRUNCATED:-0}" = "1" ]; then
-            echo "::error::shard ${{ matrix.shard }}/4 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
+            echo "::error::shard ${{ matrix.shard }}/8 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
           fi
           # Baseline near-cap warning, deliberately NOT a failure: the cap must
           # exceed the full suite's runtime, so a baseline creeping toward it is
@@ -814,10 +832,10 @@ jobs:
           # see the contention note above. Re-evaluates itself every nightly
           # instead of waiting for someone to remember to re-measure.
           if awk -v b="$baseline_test" -v c="$test_cap" 'BEGIN { exit !(b >= 0.9 * c) }'; then
-            echo "::warning::shard ${{ matrix.shard }}/4: baseline test phase ${baseline_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a baseline failure. Raise the cap or make the suite faster."
+            echo "::warning::shard ${{ matrix.shard }}/8: baseline test phase ${baseline_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a baseline failure. Raise the cap or make the suite faster."
           fi
 
-      - name: Upload mutants.out (shard ${{ matrix.shard }}/4)
+      - name: Upload mutants.out (shard ${{ matrix.shard }}/8)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
