@@ -3,10 +3,10 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
-## Migrating to the next release (unreleased): opt-in MCP 2026-07-28 authorization features
+## Migrating to 3.21.0: opt-in MCP 2026-07-28 authorization features and CORS for browser clients
 
 The lockfile also moves to rmcp 3.6.0 (`Cargo.toml` keeps `rmcp = "3"`); see
-the rmcp 3.6.0 entry under `### Changed` in the `[Unreleased]` section of
+the rmcp 3.6.0 entry under `### Changed` in the `[3.21.0]` section of
 [`CHANGELOG.md`](../CHANGELOG.md) for the upstream changes it brings.
 
 **No action required.** Every new knob defaults to the 3.20.0 behaviour, no
