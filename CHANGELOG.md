@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.21.0] - 2026-10-22
+
 Opt-in MCP 2026-07-28 authorization features, follow-ups to the rmcp 3.6.0
 lockfile move (tests, docs and one internal change), an SSE priming opt-out
 for clients that reject the priming event, CORS that lets browser MCP clients
