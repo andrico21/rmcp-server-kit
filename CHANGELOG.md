@@ -14,10 +14,13 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 ### Changed
 
 - CI only: the nightly `mutants-oauth` jobs (GitHub and GitLab) raise the
-  per-test-run timeout from 360 s to 600 s. The oauth-feature suite takes about
-  250 s on a healthy runner, and on 22 October two of the four GitHub shards hit
-  the 360 s cap during the unmutated baseline run, so they tested none of their
-  mutants. The default-feature `mutants` job keeps 360 s.
+  per-test-run timeout from 360 s to 600 s and run 8 shards instead of 4. The
+  oauth-feature suite takes about 250 s on a healthy runner, and on 22 October
+  two of the four GitHub shards hit the 360 s cap during the unmutated baseline
+  run, so they tested none of their mutants. The two shards that did run took
+  162 and 166 of the 170 minutes allowed, because a mutant costs about 3 minutes
+  here, not the 1.7 minutes assumed, so 4 shards no longer fit. The default-feature
+  `mutants` job is unchanged.
 
 ## [3.21.1] - 2026-10-22
 

@@ -386,10 +386,10 @@ mutants:
 # `src/oauth_as.rs` and `src/oauth_seal.rs` are compiled only with
 # `--features oauth`; cargo-mutants does not understand `cfg`, so they need
 # their own job (default-feature mutants would all report MISSED). 210 mutants
-# at ~1.44 min x (264 s oauth suite / 218 s) each: 4 shards ~ 92 min each.
-# 600 s per test run, as on GitHub: the 360 s cap was too tight for this suite
-# under slow-runner contention (see the `mutants-oauth` note in
-# .github/workflows/ci.yml).
+# at ~3.1 min each (measured on GitHub, 2026-10-22): 8 shards of ~27 mutants,
+# ~142 min each under 1.7x slow-runner contention. 600 s per test run, as on
+# GitHub: the 360 s cap was too tight for this suite (see the `mutants-oauth`
+# note in .github/workflows/ci.yml).
 mutants-oauth:
   stage: nightly
   needs: []
@@ -400,7 +400,7 @@ mutants-oauth:
       allow_failure: true
   allow_failure: true
   timeout: 4h
-  parallel: 4
+  parallel: 8
   variables:
     # Mutation runs only need the build to compile. Deny-level lints make
     # mutants unviable, so cap lints via `--cap-lints=true` and let warnings
