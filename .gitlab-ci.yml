@@ -385,11 +385,12 @@ mutants:
 
 # `src/oauth_as.rs` and `src/oauth_seal.rs` are compiled only with
 # `--features oauth`; cargo-mutants does not understand `cfg`, so they need
-# their own job (default-feature mutants would all report MISSED). 210 mutants
-# at ~3.1 min each (measured on GitHub, 2026-10-22): 8 shards of ~27 mutants,
-# ~142 min each under 1.7x slow-runner contention. 600 s per test run, as on
-# GitHub: the 360 s cap was too tight for this suite (see the `mutants-oauth`
-# note in .github/workflows/ci.yml).
+# their own job (default-feature mutants would all report MISSED). 213 mutants
+# at ~3.1 min each (measured on GitHub, 2026-10-22): 8 shards of ~27 mutants.
+# GitHub projects ~142 min per shard under 1.7x slow-runner contention; this job
+# keeps its own 4 h limit. 600 s per test run, as on GitHub: the 360 s cap was
+# too tight for this suite (see the `mutants-oauth` note in
+# .github/workflows/ci.yml).
 mutants-oauth:
   stage: nightly
   needs: []

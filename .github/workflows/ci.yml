@@ -703,8 +703,8 @@ jobs:
         # Per-test cap: B = 264 s (the 2026-10-20 warm measurement above; the
         #   2026-10-22 nightly measured a baseline test phase of 244 s and 250 s
         #   on its two healthy shards). A run needs B x 1.7 = ~449 s of
-        #   headroom under that contention, so the 360 s cap (264 s x 1.2) was
-        #   too tight. On that nightly shards 1 and 2 hit the cap during the
+        #   headroom under that contention, so the 360 s cap (chosen above
+        #   264 s x 1.2 = 317 s) was too tight. On that nightly shards 1 and 2 hit the cap during the
         #   unmutated baseline (the last test binary, the Argon2 proptests in a
         #   debug build, was still running), exited 4 and tested 0 of 53
         #   mutants each. Cap raised to 600 s (~2.3 x B) for this job only. A
