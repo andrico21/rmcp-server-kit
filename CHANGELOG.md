@@ -11,6 +11,11 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.21.1] - 2026-10-22
+
+RFC 9700 conformance fix for the OAuth proxy navigation endpoints, and
+corrections to the CORS documentation.
+
 ### Fixed
 
 - The OAuth proxy navigation endpoints no longer send CORS response headers:
