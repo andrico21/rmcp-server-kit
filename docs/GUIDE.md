@@ -900,12 +900,16 @@ let config = RbacConfig::with_roles(vec![
 |--------|-------------|
 | `RbacConfig::default()` | Disabled (all operations allowed) |
 | `RbacConfig::with_roles(roles)` | Enabled with the given role definitions |
+| `.with_skill_roots(roots)` / `.with_restrict_resources(bool)` | Builders for the skills and resources settings |
+| `.validate()` | Check the skills and resources settings (required, see [Skills and resources](#skills-and-resources)) |
 
 ##### Optional fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `redaction_salt` | `Option<SecretString>` | `None` | Stable HMAC key used to redact denied argument values in deny logs. When omitted, a random per-process salt is used. See the `[rbac]` TOML example below. |
+| `skill_roots` | `Vec<String>` | `[]` | Extra skill namespace roots; `skill://` is always registered. See [Skills and resources](#skills-and-resources). |
+| `restrict_resources` | `bool` | `false` | Restrict ordinary resources per role. |
 
 #### `RoleConfig`
 
@@ -919,6 +923,8 @@ A single role definition.
 | `deny` | `Vec<String>` | `[]` | Denied operations (overrides allow) |
 | `hosts` | `Vec<String>` | `["*"]` | Host glob patterns |
 | `argument_allowlists` | `Vec<ArgumentAllowlist>` | `[]` | Per-tool argument constraints |
+| `skills` | `Vec<String>` | `[]` | Skill path globs; empty = no skills |
+| `resources` | `Option<Vec<String>>` | `None` | Ordinary-resource URI globs; effective only in restrict mode |
 
 ##### Constructors
 
@@ -926,6 +932,7 @@ A single role definition.
 |--------|-------------|
 | `RoleConfig::new(name, allow, hosts)` | Create with required fields |
 | `.with_argument_allowlists(vec)` | Builder: attach allowlists |
+| `.with_skills(vec)` / `.with_resources(vec)` | Builders: grant skills; set the ordinary-resource list (`Some`) |
 
 **Evaluation order:** deny is checked first (deny overrides allow).
 
@@ -1126,6 +1133,162 @@ However, a reload does **not** invalidate list responses already cached inside a
 client: rmcp clients cache list responses by method and cursor and honour a
 positive `ttl_ms`. Emit a low `ttl_ms` (or no `ttl_ms`) for role-sensitive lists
 if you need clients to discover policy changes quickly.
+
+#### Skills and resources
+
+With RBAC enabled, `RbacContextHandler` also enforces per-role access to skills
+(SEP-2640) and to resources. With RBAC disabled it forwards every one of these
+methods unchanged and leaves `cache_scope` alone.
+
+##### Fields
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `RbacConfig::skill_roots` | `Vec<String>` | `[]` | Extra skill namespace roots. The built-in `skill://` root is always registered and cannot be removed. |
+| `RbacConfig::restrict_resources` | `bool` | `false` | Restrict ordinary (non-skill) resources per role. |
+| `RoleConfig::skills` | `Vec<String>` | `[]` | Glob patterns over the skill path. Empty grants no skills; `["*"]` grants all. |
+| `RoleConfig::resources` | `Option<Vec<String>>` | `None` | Glob patterns over the canonical full URI of ordinary resources. Effective only in restrict mode. |
+
+Builders: `RbacConfig::with_skill_roots`, `RbacConfig::with_restrict_resources`,
+`RoleConfig::with_skills`, `RoleConfig::with_resources` (sets `Some`).
+`RbacConfig::with_roles` keeps the defaults. There are no environment variables
+for these fields.
+
+A root is a URI prefix that contains `://` and ends in `/`, for example
+`file:///srv/skills/`. The skill path is the part of a skill URI after its root.
+Register every namespace your skills live in; roots must not overlap each other
+or `skill://` (compared with the scheme lowercased), and a root must not contain
+`?` or `#` or be lexically unsafe (below).
+
+##### Default deny for skills, open resources by default
+
+- **Skills are denied unless the role has `skills`.** A role with an empty
+  `skills` list, an unknown role and a missing or empty role all get no skills.
+- **Ordinary resources are unrestricted for every caller** unless restrict mode is
+  on. Restrict mode is on when `restrict_resources = true`, and also (fail
+  closed) when any role sets `resources`; `validate` rejects the latter without
+  the former.
+- In restrict mode a resolved role with `resources = None` is unrestricted, a
+  role with `Some(list)` may access URIs matching the list (`Some([])` denies
+  every ordinary resource), and a caller whose role is unresolved is denied
+  every ordinary resource.
+- Deleting a role never widens access while restrict mode is on: the caller
+  becomes unresolved and is denied. Turning restrict mode off is an explicit
+  operator change.
+- `global_deny` still applies to tools only.
+
+##### Canonical form and matching
+
+Every URI is first put in a purely lexical canonical form: the scheme (the text
+before `://`, or before the first `:` for a URI without `://`) is lowercased and
+nothing is trimmed or decoded. A URI is denied when the text after the scheme
+contains `%` or `\`, has a `.` or `..` segment (a leading one counts), when a
+`scheme://` URI contains `//` after the scheme, or when it has no scheme.
+
+Then:
+
+1. A URI without `://` whose scheme equals a registered root's scheme is denied
+   (`skill:acme/SKILL.md`). A URI under a root that contains `?` or `#` is denied.
+2. A URI under a root is a **skill URI**. With `R` the remainder after the root,
+   it is allowed only when `R` is non-empty, the role has `skills`, and some
+   pattern `P` satisfies `glob(P, R)` or `glob(P + "/*", R)`. `*` matches any
+   run of characters, including `/`.
+3. A `SKILL.md` manifest outside every registered root is denied
+   (case-insensitive, query and fragment ignored). This is the fail-closed
+   answer to an unregistered skill namespace.
+4. Anything else is an ordinary resource and follows the rules above; `resources`
+   patterns are matched against the whole canonical URI.
+
+Pattern semantics:
+
+- `skills = ["acme/billing"]` grants the directory `skill://acme/billing/`, its
+  `SKILL.md`, every file below it, and every **nested skill** below it. Nested
+  skills inherit the parent's grant; there is no way to grant the parent
+  without them.
+- A trailing `*` extends the pattern: `acme/*` grants everything under `acme/`
+  and also `skill://acme/SKILL.md`, and because `*` crosses `/`, `acme/b*` also
+  grants `skill://acme/billing/x/y`.
+- A `skills` pattern that is empty, contains `://` or ends with `SKILL.md`, and a
+  `resources` pattern that is empty, starts with a root or has a non-lowercase
+  scheme, never matches. `validate` rejects them.
+
+##### What each method does
+
+| Method | Behaviour with RBAC enabled |
+|---|---|
+| `skills/list` | Role without `skills`: `-32601`, handler not called. Otherwise forwarded; a skill is kept only if its URI and every manifest file URI are accessible. Cursor, `ttl_ms` and meta are untouched, so a page may be empty with a live cursor. `cache_scope = Private`. |
+| `skills/get` | Role without `skills`: `-32601`. A non-skill or denied URI: `-32602` "unknown skill", handler not called. A result naming a denied file, or a skill URI the role cannot see: the same error. `Private`. |
+| `resources/directory/read` | A skill directory and role without `skills`: `-32601`. A denied URI: resource-not-found, handler not called. Otherwise forwarded, entries the role cannot access are dropped, `Private`. |
+| `resources/read` | A denied URI: resource-not-found, handler not called. If any `contents[i].uri` of the result is denied, the whole read is resource-not-found and no body reaches the wire. Otherwise `Private`, overriding an explicit `Public`. An input-required response passes through unchanged. |
+| `resources/list` | Always forwarded; entries the role cannot access are dropped; `Private`. |
+| `resources/subscribe` (legacy) | A denied URI: resource-not-found, handler not called. |
+| `resources/templates/list`, `unsubscribe`, `completion/complete` | Unchanged. See the limits below. |
+| `subscriptions/listen` | See below. |
+| `on_custom_request` | The nine names above (`skills/list`, `skills/get`, `resources/directory/read`, `resources/read`, `resources/list`, `resources/templates/list`, `resources/subscribe`, `resources/unsubscribe`, `subscriptions/listen`) answer `-32601` without reaching the handler, for every role. |
+
+Resource-not-found is the same fixed error ("resource not found") for a denied
+existing resource and a missing one. On the wire it is `-32002` for legacy
+peers and `-32602` for 2026-07-28 peers. Denials are logged at `debug` with the
+method and role only, never the URI or skill name. Every check in one call uses
+one policy snapshot.
+
+**Subscriptions.** rmcp calls `accepted_subscription_filter` before it
+acknowledges, without a request context. Under RBAC the wrapper therefore hands
+your handler only resource URIs every caller may use (ordinary URIs, and none at
+all in restrict mode), keeps only such URIs in its answer, and then
+`subscriptions/listen` re-checks the accepted URIs against a fresh policy
+snapshot (resource-not-found if one fails, for example after a reload). Your
+answer, and with it whether rmcp acknowledges, cannot depend on a denied
+resource. A consumer that accepts only URIs it knows gets rmcp's refusal for
+an empty filter: `-32601` with no acknowledgement (HTTP 404 on Streamable HTTP),
+identical for an existing, an absent and a skill URI.
+
+##### `RbacConfig::validate` is REQUIRED
+
+`RbacPolicy::new` is infallible: it logs one `warn!` per violation and, when a
+root is invalid, denies every resource and skill (an invalid pattern merely never
+matches). Call `RbacConfig::validate()` at startup on any operator-supplied
+config, including one deserialized from TOML:
+
+```rust,ignore
+let rbac: RbacConfig = toml::from_str(&text)?;
+rbac.validate()?; // RmcpServerKitError::Config listing every violation
+let policy = RbacPolicy::new(&rbac);
+```
+
+It rejects: an empty pattern or root; a root without `://`, without a trailing
+`/`, containing `?` or `#`, lexically unsafe, or overlapping another root (the
+built-in `skill://` included); a `skills` pattern containing `://` or ending
+with `SKILL.md`; a `resources` pattern that starts with a root or whose scheme
+is not lowercase; and any role with `resources` set while `restrict_resources`
+is `false`.
+
+##### Consumer contract and limits
+
+- **Resolve the exact string you receive.** The kit authorizes the string in the
+  request with only its scheme lowercased. A consumer that trims, decodes,
+  normalizes or case-folds the path before resolving can serve a different
+  resource than the one that was authorized. The same holds for every URI your
+  results return: each must be the string you resolved.
+- **Register every skill namespace** in `skill_roots`, and do not serve protected
+  skill files through unregistered aliases; an unregistered `SKILL.md` is denied
+  but other files under an unregistered alias are ordinary resources.
+- **Templates and completion are not gated.** `resources/templates/list` exposes
+  template names, descriptions and metadata, and `completion/complete` can
+  disclose concrete identifiers and counts. The existence-oracle guarantee (a
+  denied resource looks like a missing one) covers only the methods in the
+  table.
+- **Reload is not revocation of state a client already holds.** A reload governs
+  admission and every later request, but it does not revoke an established
+  `subscriptions/listen` subscription, a legacy subscription your handler
+  holds, or a response a client has already cached (rmcp clients honour a
+  positive `ttl_ms`; emit a low or no `ttl_ms` for role-sensitive lists).
+- **`subscriptions/listen` is deliberately reduced.** It never delivers
+  skill-URI updates, and in restrict mode no resource-URI updates at all. Only
+  legacy `resources/subscribe` is gated per role. Per-role listen would need new
+  middleware and is not planned.
+- **Nested skills inherit their parent's grant.**
+- `RbacRoleSummary` does not report skills or resources settings.
 
 #### `RbacDecision`
 
@@ -2860,6 +3023,49 @@ The Authorization Server Metadata document
 `introspection_endpoint` and `revocation_endpoint` only when the
 corresponding URLs are configured.
 
+### Skills extension (SEP-2640)
+
+rmcp 3.9 added the skills extension: `skills/list`, `skills/get` and
+`resources/directory/read`. To serve it, implement `list_skills`, `get_skill`
+and `read_resource_directory` on your handler and advertise both the extension
+and resources in `get_info`:
+
+```rust,ignore
+fn get_info(&self) -> ServerConfig {
+    ServerConfig::new(
+        ServerCapabilities::builder()
+            .enable_resources()
+            .enable_skills_with_directory_read() // or .enable_skills()
+            .build(),
+    )
+}
+```
+
+rmcp answers `-32601` when the extension (or `directoryRead`, for directory
+reads) is not advertised, and `-32603` when `resources` is missing, before your
+handler runs.
+
+`skills/get` returns a manifest, not the skill text: clients read the
+`SKILL.md` body through `resources/read`.
+
+**Skills are denied under RBAC unless the role has `skills`.** With RBAC
+disabled, the three methods are forwarded to your handler inside the identity
+scope (`current_identity()` / `current_role()` work). With an enabled
+`RbacPolicy`, a role whose `skills` list is empty, an unknown role and a missing
+role get `-32601` from `skills/list` and `skills/get` without your handler being
+called, whether or not tool-list filtering is on. A role with `skills` sees only
+the skills its patterns grant: `skills/list` is filtered, a denied or missing
+skill answers the same `-32602` "unknown skill", and `resources/directory/read`
+of a skill directory needs the grant. Ordinary directories are forwarded, and
+listings are filtered per role. `resources/read` is per-role too: skill files
+need the grant, and ordinary resources are unrestricted unless restrict mode is
+on. The check reads the current policy on every call, so
+`ReloadHandle::reload_rbac` takes effect on the next request. The matching
+rules, limits and `RbacConfig::validate` requirement are in
+[Skills and resources](#skills-and-resources).
+
+This crate does not enable rmcp's `skills-fs` feature.
+
 ### Tool hooks and result-size cap
 
 `rmcp_server_kit::tool_hooks::HookedHandler` is an opt-in wrapper around any
@@ -3606,6 +3812,13 @@ global_deny = ["*_purge_*"]
 # string from your secret manager if you want stable correlation.
 # redaction_salt = "replace-with-long-random-string-from-secrets-manager"  # env: RMCP_SERVER_KIT__RBAC__REDACTION_SALT
 # (Kubernetes: use RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE to supply the salt from a mounted Secret file.)
+# Extra skill namespace roots (each contains "://", ends in "/", no overlaps);
+# `skill://` is always registered. Skills are denied to a role without `skills`.
+skill_roots = ["file:///srv/skills/"]
+# Restrict ordinary (non-skill) resources per role. Default false: unrestricted.
+# When true, a role's `resources` applies (omitted = unrestricted for that role)
+# and a caller without a configured role is denied.
+restrict_resources = true
 
 [[rbac.roles]]
 name = "admin"
@@ -3622,6 +3835,11 @@ hosts = ["prod-*", "staging-*"]
 name = "viewer"
 allow = ["container_list", "container_inspect", "image_list"]
 hosts = ["prod-*"]
+# Skill paths (after the root), glob-matched; "acme/billing" also grants the
+# files and nested skills below it. Empty or omitted = no skills.
+skills = ["acme/billing", "hr/*"]
+# Ordinary-resource URI globs (scheme lowercase); needs restrict_resources = true.
+resources = ["file:///pub/*"]
 
 [[rbac.roles]]
 name = "restricted"

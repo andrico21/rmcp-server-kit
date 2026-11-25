@@ -52,7 +52,7 @@ an rmcp bump changes the surface:
 | `HOOKED_HANDLER_IMPL_METHOD_COUNT`, `RBAC_CONTEXT_HANDLER_IMPL_METHOD_COUNT` | how many methods each wrapper's own impl must scan to; catches a mis-scoped scanner or a silently shrunk impl |
 | `HOOKED_HANDLER_SOURCE`, `RBAC_CONTEXT_HANDLER_SOURCE`, `HOOKED_HANDLER_IMPL_ANCHOR`, `RBAC_CONTEXT_HANDLER_IMPL_ANCHOR` | the file and the column-0 full-generic impl anchor each scanner reads |
 | `HOOKED_HANDLER_SEMANTICALLY_UNPROVABLE`, `RBAC_CONTEXT_HANDLER_SEMANTICALLY_UNPROVABLE` | methods no driver can prove; asserted **empty** - every method is reachable through dispatch or a direct call |
-| `RBAC_CONTEXT_HANDLER_MACRO_ORIGINS` | per-method origin pins for the fifteen macro-generated methods (twelve discharged by the three macro-body drivers, three by the skill-method driver); a method that becomes a literal `fn` fails until it gains its own driver |
+| `RBAC_CONTEXT_HANDLER_MACRO_ORIGINS` | per-method origin pins for the eight macro-generated methods, each discharged by one of the three macro-body drivers; a method that becomes a literal `fn` fails until it gains its own driver |
 | `SEMANTIC_DRIVERS` (in the `src/tool_hooks.rs` / `src/rbac_context.rs` test modules) | method to driver-test table; the completeness gate asserts it equals `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` per wrapper |
 
 ### Semantic drivers: the rules a new driver must follow
@@ -73,6 +73,17 @@ an rmcp bump changes the surface:
 - Every driver also runs its request against `PassthroughDefaults` - the wrapper
   with all delegations deleted - and asserts the probe stayed untouched. That is
   the per-method mutation check, re-executed on every `cargo test`.
+- The skills gate calls `get_info`; skills probes must advertise `resources`,
+  skills and `directoryRead`.
+- Every new resource- or skill-shaped rmcp method (a request, a listing, a
+  subscription or a directory read) must go through
+  `RbacPolicy::resource_access` in `RbacContextHandler`, and its reserved name
+  must be added to `RESERVED_CUSTOM_METHODS` so the custom-request fallback
+  cannot bypass it.
+- Re-verify that rmcp still calls `accepted_subscription_filter` before it sends
+  the acknowledgement, and that `SubscriptionContext` construction is still
+  `pub(crate)`: the sanitized filter and the `listen` re-check assume the
+  consumer cannot forge either.
 
 ## 2. Transport / config drift
 
@@ -101,6 +112,9 @@ an rmcp bump changes the surface:
   re-derive the row's expected outcome from the new rmcp source. An invariant
   failure means rmcp would dispatch a tool call that RBAC did not inspect: treat
   it as an RBAC bypass and fix it before the bump merges.
+- [ ] New request methods can also arrive through the `CustomRequest` fallback
+  (`ClientRequest` is untagged, so params that fail a typed variant fall
+  through); a method-level denial must cover `on_custom_request`.
 - [ ] `cargo test --all-features` (covers the wrapper transparency tests).
 
 ## 4. Deprecation drift

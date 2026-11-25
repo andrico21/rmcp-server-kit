@@ -314,7 +314,7 @@ sequenceDiagram
     participant O as `origin_check_middleware`<br/>src/transport.rs:5543
     participant H as `security_headers_middleware`<br/>src/transport.rs:4719
     participant A as `auth_middleware`<br/>src/auth.rs:2782
-    participant B as `rbac_middleware`<br/>src/rbac.rs:1354
+    participant B as `rbac_middleware`<br/>src/rbac.rs:1759
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
     participant T as ServerHandler<br/>(consumer impl)
@@ -356,7 +356,7 @@ flowchart LR
 
     subgraph Hot["Request-time consumers"]
         AM[`auth_middleware`<br/>src/auth.rs:2782]
-        BM[`rbac_middleware`<br/>src/rbac.rs:1354]
+        BM[`rbac_middleware`<br/>src/rbac.rs:1759]
         TL["Task-locals<br/>`current_role` / `current_identity`<br/>`current_token` / `current_sub`<br/>src/rbac.rs:158-220"]
         TH[`HookedHandler`<br/>src/tool_hooks.rs:335]
     end
@@ -455,7 +455,7 @@ graph TD
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5543, `security_headers_middleware` ~L4719       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4536                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1760, `auth_middleware` L2782              |
-| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
+| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L818, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1759           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
 | OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3161, `JWKS_REFRESH_COOLDOWN` ~L3352, `select_jwks_key` L4053 |

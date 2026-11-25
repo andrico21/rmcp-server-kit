@@ -24,14 +24,16 @@ use rmcp::{
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CancelTaskParams,
         CancelledNotificationParam, CompleteRequestParams, CompleteResult, CustomNotification,
-        CustomRequest, CustomResult, DiscoverResult, Extensions, GetPromptRequestParams,
-        GetPromptResponse, GetSkillRequestParams, GetSkillResult, GetTaskParams, GetTaskResult,
-        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListSkillsResult, ListToolsResult, PaginatedRequestParams,
-        ProgressNotificationParam, ProtocolVersion, ReadResourceDirectoryRequestParams,
-        ReadResourceDirectoryResult, ReadResourceRequestParams, ReadResourceResponse, ServerConfig,
-        SetLevelRequestParams, SubscribeRequestParams, SubscriptionFilter, Tool,
-        UnsubscribeRequestParams, UpdateTaskParams,
+        CustomRequest, CustomResult, DiscoverResult, ErrorCode, Extensions, GetPromptRequestParams,
+        GetPromptResponse, GetSkillRequestMethod, GetSkillRequestParams, GetSkillResult,
+        GetTaskParams, GetTaskResult, InitializeRequestParams, InitializeResult, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListSkillsRequestMethod,
+        ListSkillsResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+        ProtocolVersion, ReadResourceDirectoryRequestMethod, ReadResourceDirectoryRequestParams,
+        ReadResourceDirectoryResult, ReadResourceRequestParams, ReadResourceResponse,
+        ResourceContents, ServerConfig, SetLevelRequestParams, Skill, SkillResources,
+        SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
+        UpdateTaskParams,
     },
     service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext},
 };
@@ -114,6 +116,98 @@ impl<H> RbacContextHandler<H> {
             .retain(|tool| policy.check_operation(role_name, &tool.name) == RbacDecision::Allow);
         result.with_cache_scope(CacheScope::Private)
     }
+}
+
+/// Skill and resource method names refused as custom fallbacks under RBAC.
+///
+/// A request whose params fail rmcp's typed variant would otherwise reach
+/// the consumer without the per-role checks.
+const RESERVED_CUSTOM_METHODS: [&str; 9] = [
+    "skills/list",
+    "skills/get",
+    "resources/directory/read",
+    "resources/read",
+    "resources/list",
+    "resources/templates/list",
+    "resources/subscribe",
+    "resources/unsubscribe",
+    "subscriptions/listen",
+];
+
+/// The fixed not-found error for a denied resource; identical for a
+/// denied existing and a missing resource.
+fn resource_not_found() -> ErrorData {
+    ErrorData::resource_not_found("resource not found", None)
+}
+
+/// The fixed error for a denied skill; identical for a denied existing and
+/// a missing skill.
+fn unknown_skill() -> ErrorData {
+    ErrorData::invalid_params("unknown skill", None)
+}
+
+/// Log an RBAC skills/resources denial with the method and role only, never
+/// the URI, params or skill name.
+fn log_denial(method: &'static str, role: Option<&str>) {
+    tracing::debug!(
+        method,
+        role = role.unwrap_or_default(),
+        "RBAC denied skills/resources request"
+    );
+}
+
+/// The URI of one `resources/read` content entry; `None` (denied) for a
+/// content kind this crate does not know.
+fn contents_uri(contents: &ResourceContents) -> Option<&str> {
+    match contents {
+        ResourceContents::TextResourceContents {
+            uri,
+            mime_type: _,
+            text: _,
+            meta: _,
+        }
+        | ResourceContents::BlobResourceContents {
+            uri,
+            mime_type: _,
+            blob: _,
+            meta: _,
+        } => Some(uri),
+        _ => None,
+    }
+}
+
+/// Whether `skill` may be shown to `role`: its URI is a granted SKILL URI
+/// and every manifest file is accessible. An unknown manifest kind is
+/// refused.
+fn skill_visible(policy: &RbacPolicy, role: Option<&str>, skill: &Skill) -> bool {
+    if !policy.is_skill_uri(&skill.uri) || !policy.resource_access(role, &skill.uri) {
+        return false;
+    }
+    match &skill.resources {
+        SkillResources::Files(files) => files
+            .iter()
+            .all(|file| policy.resource_access(role, &file.uri)),
+        SkillResources::Dynamic => true,
+        _ => false,
+    }
+}
+
+/// `requested` with every resource URI that is not universally allowed
+/// removed; an emptied list becomes `None`.
+fn sanitized_filter(policy: &RbacPolicy, requested: &SubscriptionFilter) -> SubscriptionFilter {
+    let mut sanitized = requested.clone();
+    sanitized.resource_subscriptions =
+        universally_allowed_uris(policy, sanitized.resource_subscriptions);
+    sanitized
+}
+
+/// Keep the universally allowed URIs; an empty result becomes `None`.
+fn universally_allowed_uris(policy: &RbacPolicy, uris: Option<Vec<String>>) -> Option<Vec<String>> {
+    uris.map(|mut list| {
+        list.retain(|uri| policy.universally_allowed(uri));
+        list
+    })
+    .filter(|list| !list.is_empty())
 }
 
 /// Extract the authenticated identity from a request's extensions, if any.
@@ -281,41 +375,194 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         Option<PaginatedRequestParams>,
         ListPromptsResult
     );
-    delegate_request!(
-        list_resources,
-        Option<PaginatedRequestParams>,
-        ListResourcesResult
-    );
+    // Under RBAC the consumer is always called and the result is filtered
+    // per role; the filtered result is private to the caller.
+    // cancel-safe: filtering runs on the local result after the delegated
+    // await; cancellation drops only those locals.
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let policy = self.rbac.load_full();
+        let identity = identity_from_request(&context);
+        let role = identity.as_ref().map(|auth| auth.role.clone());
+        let mut result =
+            scope_with_identity(identity, || self.inner.list_resources(request, context)).await?;
+        if !policy.is_enabled() {
+            return Ok(result);
+        }
+        result
+            .resources
+            .retain(|resource| policy.resource_access(role.as_deref(), &resource.uri));
+        Ok(result.with_cache_scope(CacheScope::Private))
+    }
+
     delegate_request!(
         list_resource_templates,
         Option<PaginatedRequestParams>,
         ListResourceTemplatesResult
     );
-    delegate_request!(
-        read_resource,
-        ReadResourceRequestParams,
-        ReadResourceResponse
-    );
-    // SEP-2640 skills and directory reads are resource reads: the inner
-    // handler may decide visibility from `current_identity()`, so they run
-    // inside the identity scope like `list_resources` / `read_resource`.
-    delegate_request!(
-        read_resource_directory,
-        ReadResourceDirectoryRequestParams,
-        ReadResourceDirectoryResult
-    );
-    delegate_request!(
-        list_skills,
-        Option<PaginatedRequestParams>,
-        ListSkillsResult
-    );
-    delegate_request!(get_skill, GetSkillRequestParams, GetSkillResult);
 
+    // A denied URI is refused before the consumer runs, and a result that
+    // carries any denied content is refused whole, so no body reaches the
+    // wire. Both use the same fixed not-found error.
+    // cancel-safe: the policy check runs before the delegated await and the
+    // result check on local values after it; cancellation drops only those.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let policy = self.rbac.load_full();
+        let identity = identity_from_request(&context);
+        let role = identity.as_ref().map(|auth| auth.role.clone());
+        if policy.is_enabled() && !policy.resource_access(role.as_deref(), &request.uri) {
+            log_denial("resources/read", role.as_deref());
+            return Err(resource_not_found());
+        }
+        let response =
+            scope_with_identity(identity, || self.inner.read_resource(request, context)).await?;
+        if !policy.is_enabled() {
+            return Ok(response);
+        }
+        match response {
+            ReadResourceResponse::Complete(result) => {
+                if result.contents.iter().all(|contents| {
+                    contents_uri(contents)
+                        .is_some_and(|uri| policy.resource_access(role.as_deref(), uri))
+                }) {
+                    Ok(ReadResourceResponse::Complete(
+                        result.with_cache_scope(CacheScope::Private),
+                    ))
+                } else {
+                    log_denial("resources/read", role.as_deref());
+                    Err(resource_not_found())
+                }
+            }
+            ReadResourceResponse::InputRequired(_) => Ok(response),
+            _ => {
+                log_denial("resources/read", role.as_deref());
+                Err(resource_not_found())
+            }
+        }
+    }
+
+    // A skill directory needs a skills grant, any directory needs access to
+    // its URI, and the listing is filtered per role.
+    // cancel-safe: the policy check runs before the delegated await and the
+    // filtering on the local result after it; cancellation drops only those.
+    async fn read_resource_directory(
+        &self,
+        request: ReadResourceDirectoryRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+        let policy = self.rbac.load_full();
+        let identity = identity_from_request(&context);
+        let role = identity.as_ref().map(|auth| auth.role.clone());
+        if policy.is_enabled() {
+            if policy.is_skill_uri(&request.uri) && !policy.skills_granted(role.as_deref()) {
+                log_denial("resources/directory/read", role.as_deref());
+                return Err(ErrorData::method_not_found::<
+                    ReadResourceDirectoryRequestMethod,
+                >());
+            }
+            if !policy.resource_access(role.as_deref(), &request.uri) {
+                log_denial("resources/directory/read", role.as_deref());
+                return Err(resource_not_found());
+            }
+        }
+        let mut result = scope_with_identity(identity, || {
+            self.inner.read_resource_directory(request, context)
+        })
+        .await?;
+        if !policy.is_enabled() {
+            return Ok(result);
+        }
+        result
+            .resources
+            .retain(|resource| policy.resource_access(role.as_deref(), &resource.uri));
+        Ok(result.with_cache_scope(CacheScope::Private))
+    }
+
+    // A role without a skills grant never reaches the consumer; the listing
+    // keeps only the skills the role may see.
+    // cancel-safe: the policy check runs before the delegated await and the
+    // filtering on the local result after it; cancellation drops only those.
+    async fn list_skills(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, ErrorData> {
+        let policy = self.rbac.load_full();
+        let identity = identity_from_request(&context);
+        let role = identity.as_ref().map(|auth| auth.role.clone());
+        if !policy.skills_granted(role.as_deref()) {
+            log_denial("skills/list", role.as_deref());
+            return Err(ErrorData::method_not_found::<ListSkillsRequestMethod>());
+        }
+        let mut result =
+            scope_with_identity(identity, || self.inner.list_skills(request, context)).await?;
+        if !policy.is_enabled() {
+            return Ok(result);
+        }
+        result
+            .skills
+            .retain(|skill| skill_visible(&policy, role.as_deref(), skill));
+        Ok(result.with_cache_scope(CacheScope::Private))
+    }
+
+    // A denied and a missing skill give the same fixed error.
+    // cancel-safe: the policy check runs before the delegated await and the
+    // result check on local values after it; cancellation drops only those.
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, ErrorData> {
+        let policy = self.rbac.load_full();
+        let identity = identity_from_request(&context);
+        let role = identity.as_ref().map(|auth| auth.role.clone());
+        if !policy.skills_granted(role.as_deref()) {
+            log_denial("skills/get", role.as_deref());
+            return Err(ErrorData::method_not_found::<GetSkillRequestMethod>());
+        }
+        if policy.is_enabled()
+            && (!policy.is_skill_uri(&request.uri)
+                || !policy.resource_access(role.as_deref(), &request.uri))
+        {
+            log_denial("skills/get", role.as_deref());
+            return Err(unknown_skill());
+        }
+        let result =
+            scope_with_identity(identity, || self.inner.get_skill(request, context)).await?;
+        if !policy.is_enabled() {
+            return Ok(result);
+        }
+        if !skill_visible(&policy, role.as_deref(), &result.skill) {
+            log_denial("skills/get", role.as_deref());
+            return Err(unknown_skill());
+        }
+        Ok(result.with_cache_scope(CacheScope::Private))
+    }
+
+    // Synchronous and identity-free: under RBAC the consumer sees only
+    // universally allowed resource URIs, so its answer (and with it whether
+    // rmcp acknowledges) cannot depend on a role-dependent or skill URI.
     fn accepted_subscription_filter(
         &self,
         requested: &SubscriptionFilter,
     ) -> Option<SubscriptionFilter> {
-        self.inner.accepted_subscription_filter(requested)
+        let policy = self.rbac.load_full();
+        if !policy.is_enabled() {
+            return self.inner.accepted_subscription_filter(requested);
+        }
+        let sanitized = sanitized_filter(&policy, requested);
+        let candidate = self.inner.accepted_subscription_filter(&sanitized)?;
+        let mut accepted = sanitized.intersection(&candidate);
+        accepted.resource_subscriptions =
+            universally_allowed_uris(&policy, accepted.resource_subscriptions);
+        Some(accepted)
     }
 
     // SECURITY FUTURE-WATCH: rmcp 3.2.0 rejects
@@ -330,12 +577,52 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     // fails when that upstream change lands.
     // cancel-safe: scopes the subscription identity around the inner call;
     // cancellation drops only the scoped future.
+    //
+    // Second boundary: a policy reload between acceptance and `listen` must
+    // not let an accepted resource URI through, so it is re-checked here
+    // against a fresh policy snapshot.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let policy = self.rbac.load_full();
         let identity = identity_from_subscription(&context);
+        if policy.is_enabled() {
+            let role = identity.as_ref().map(|auth| auth.role.clone());
+            if context
+                .accepted()
+                .resource_subscriptions
+                .iter()
+                .flatten()
+                .any(|uri| !policy.resource_access(role.as_deref(), uri))
+            {
+                log_denial("subscriptions/listen", role.as_deref());
+                return Err(resource_not_found());
+            }
+        }
         scope_with_identity(identity, || self.inner.listen(context)).await
     }
 
-    delegate_request!(subscribe, SubscribeRequestParams, ());
+    // cancel-safe: the policy check runs before the delegated await;
+    // cancellation drops only the scoped future.
+    #[expect(
+        deprecated,
+        reason = "deliberate: rmcp::handler::server::ServerHandler::subscribe - the legacy subscription must stay gated per role until rmcp removes it"
+    )]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let policy = self.rbac.load_full();
+        let identity = identity_from_request(&context);
+        if policy.is_enabled() {
+            let role = identity.as_ref().map(|auth| auth.role.clone());
+            if !policy.resource_access(role.as_deref(), &request.uri) {
+                log_denial("resources/subscribe", role.as_deref());
+                return Err(resource_not_found());
+            }
+        }
+        scope_with_identity(identity, || self.inner.subscribe(request, context)).await
+    }
+
     delegate_request!(unsubscribe, UnsubscribeRequestParams, ());
     // cancel-safe: task-ID rewriting happens on local values after the
     // delegated await; cancellation drops only those locals.
@@ -378,7 +665,34 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         self.inner.get_tool(name)
     }
 
-    delegate_request!(on_custom_request, CustomRequest, CustomResult);
+    // A skill or resource request whose params fail rmcp's typed variant
+    // falls through to `CustomRequest` and skips the typed per-role checks,
+    // so under RBAC the reserved names are refused here regardless of grants.
+    // Every other method forwards.
+    // cancel-safe: the policy check runs before the delegated await;
+    // cancellation drops only the scoped future.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        if let Some(method) = RESERVED_CUSTOM_METHODS
+            .iter()
+            .copied()
+            .find(|name| *name == request.method)
+            && self.rbac.load_full().is_enabled()
+        {
+            let identity = identity_from_request(&context);
+            log_denial(
+                method,
+                identity.as_ref().map(|auth| auth.role.clone()).as_deref(),
+            );
+            return Err(ErrorData::new(ErrorCode::METHOD_NOT_FOUND, method, None));
+        }
+        let identity = identity_from_request(&context);
+        scope_with_identity(identity, || self.inner.on_custom_request(request, context)).await
+    }
+
     delegate_notification!(on_cancelled, CancelledNotificationParam);
     delegate_notification!(on_progress, ProgressNotificationParam);
 
@@ -499,20 +813,21 @@ mod tests {
             ArgumentInfo, CallToolRequest, CancelTaskRequest, CancelledNotification,
             ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest,
             CompleteRequest, CreateTaskResult, DetailedTask, DiscoverRequest,
-            DiscoverRequestParams, ErrorCode, GetExtensions as _, GetSkillRequest, GetTaskRequest,
+            DiscoverRequestParams, GetExtensions as _, GetSkillRequest, GetTaskRequest,
             Implementation, InitializeRequest, InputResponses, JsonObject, JsonRpcMessage,
             ListPromptsRequest, ListSkillsRequest, ListToolsRequest, ListToolsRequestMethod,
             NotificationNoParam, NumberOrString, PingRequest, Prompt, PromptReference,
-            ReadResourceDirectoryRequest, Reference, RequestMetaObject, ServerCapabilities,
-            ServerJsonRpcMessage, ServerNotification, ServerResult, SubscriptionsListenRequest,
-            SubscriptionsListenRequestParams, Task, TaskPayload, TaskStatus,
-            TaskStatusNotification, TaskStatusNotificationParams, UpdateTaskRequest,
+            ReadResourceDirectoryRequest, Reference, RequestMetaObject, Resource,
+            ServerCapabilities, ServerJsonRpcMessage, ServerNotification, ServerResult,
+            SkillFrontmatter, SubscriptionsListenRequest, SubscriptionsListenRequestParams, Task,
+            TaskPayload, TaskStatus, TaskStatusNotification, TaskStatusNotificationParams,
+            UpdateTaskRequest,
         },
         service::serve_directly,
         transport::Transport,
     };
     use tokio::{
-        sync::Notify,
+        sync::{Notify, mpsc},
         task::yield_now,
         time::{sleep, timeout},
     };
@@ -522,6 +837,8 @@ mod tests {
         auth::AuthMethod,
         rbac::{AllowOperationMatching, RbacConfig, RoleConfig},
     };
+
+    mod resource_rbac;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ObservedRole {
@@ -1531,7 +1848,6 @@ mod tests {
             .enable_tools()
             .enable_tool_list_changed()
             .enable_tasks()
-            .enable_skills_with_directory_read()
             .build()
     }
 
@@ -1666,42 +1982,6 @@ mod tests {
             )]))
         }
 
-        async fn list_skills(
-            &self,
-            _request: Option<PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<ListSkillsResult, ErrorData> {
-            self.record("list_skills");
-            Err(ErrorData::invalid_request(
-                "forwarding-probe:list_skills",
-                None,
-            ))
-        }
-
-        async fn get_skill(
-            &self,
-            _request: GetSkillRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<GetSkillResult, ErrorData> {
-            self.record("get_skill");
-            Err(ErrorData::invalid_request(
-                "forwarding-probe:get_skill",
-                None,
-            ))
-        }
-
-        async fn read_resource_directory(
-            &self,
-            _request: ReadResourceDirectoryRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<ReadResourceDirectoryResult, ErrorData> {
-            self.record("read_resource_directory");
-            Err(ErrorData::invalid_request(
-                "forwarding-probe:read_resource_directory",
-                None,
-            ))
-        }
-
         async fn on_cancelled(
             &self,
             _notification: CancelledNotificationParam,
@@ -1766,7 +2046,7 @@ mod tests {
     ///
     /// Parsed by `tests/integration/delegation_guard.rs`, which asserts this table covers
     /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification -
-    /// so a method cannot be added or reclassified without a driver. The twelve
+    /// so a method cannot be added or reclassified without a driver. The eight
     /// methods attributed to the macro-body drivers are each discharged by that
     /// driver plus the guard's macro-origin pin.
     const SEMANTIC_DRIVERS: &[(&str, &str)] = &[
@@ -1808,7 +2088,7 @@ mod tests {
         ),
         (
             "list_resources",
-            "rbac_context_handler_forwards_macro_request_option_arm",
+            "rbac_disabled_forwards_every_resource_and_skill_method_unchanged",
         ),
         (
             "list_resource_templates",
@@ -1816,25 +2096,25 @@ mod tests {
         ),
         (
             "read_resource",
-            "rbac_context_handler_forwards_macro_request_plain_arm",
+            "rbac_disabled_forwards_every_resource_and_skill_method_unchanged",
         ),
         (
             "read_resource_directory",
-            "rbac_context_handler_forwards_skill_methods",
+            "rbac_context_handler_forwards_read_resource_directory",
         ),
-        ("list_skills", "rbac_context_handler_forwards_skill_methods"),
-        ("get_skill", "rbac_context_handler_forwards_skill_methods"),
+        ("list_skills", "rbac_context_handler_forwards_list_skills"),
+        ("get_skill", "rbac_context_handler_forwards_get_skill"),
         (
             "accepted_subscription_filter",
-            "task_status_notifications_remain_unroutable_until_binding_is_added",
+            "accepted_subscription_filter_sanitizes_inputs_and_outputs",
         ),
         (
             "listen",
-            "task_status_notifications_remain_unroutable_until_binding_is_added",
+            "listen_rechecks_a_policy_reloaded_after_acknowledgement",
         ),
         (
             "subscribe",
-            "rbac_context_handler_forwards_macro_request_plain_arm",
+            "rbac_disabled_forwards_every_resource_and_skill_method_unchanged",
         ),
         (
             "unsubscribe",
@@ -1854,7 +2134,7 @@ mod tests {
         ),
         (
             "on_custom_request",
-            "rbac_context_handler_forwards_macro_request_plain_arm",
+            "rbac_context_handler_on_custom_request_refuses_reserved_names",
         ),
         (
             "on_cancelled",
@@ -2192,48 +2472,544 @@ mod tests {
         Ok(())
     }
 
+    // ----------------------------------------------------------------------
+    // SEP-2640 skills drivers
+    //
+    // `SkillProbe::get_info` advertises exactly `resources` plus skills with
+    // `directoryRead` and records nothing: rmcp's skills gate calls it on every
+    // request. Each probe method records the identity and role it observes, so
+    // the exact log proves forwarding and identity scoping together.
+    // ----------------------------------------------------------------------
+
+    const SENTINEL_SKILL_URI: &str = "skill://driver-sentinel-skill/SKILL.md";
+
+    /// The custom-fallback names `on_custom_request` must refuse under RBAC
+    /// (plan B-D4). Written out here, not imported, so dropping a name from
+    /// the production list fails the driver.
+    const RESERVED_NAMES: [&str; 9] = [
+        "skills/list",
+        "skills/get",
+        "resources/directory/read",
+        "resources/read",
+        "resources/list",
+        "resources/templates/list",
+        "resources/subscribe",
+        "resources/unsubscribe",
+        "subscriptions/listen",
+    ];
+
+    fn sentinel_skill() -> Skill {
+        Skill::new(
+            SENTINEL_SKILL_URI,
+            SkillFrontmatter::new("driver-sentinel-skill", "driver sentinel"),
+            SkillResources::Dynamic,
+        )
+    }
+
+    fn sentinel_directory_entry() -> Resource {
+        Resource::new(
+            "test://sentinel-directory/entry",
+            "driver-sentinel-resource",
+        )
+    }
+
+    fn custom_sentinel(method: &str) -> CustomResult {
+        CustomResult::new(serde_json::json!({ "sentinel": method }))
+    }
+
+    fn skills_capabilities() -> ServerCapabilities {
+        ServerCapabilities::builder()
+            .enable_resources()
+            .enable_skills_with_directory_read()
+            .build()
+    }
+
+    /// `(method, current_identity(), current_role())` observed inside a call.
+    type SkillCall = (String, Option<String>, Option<String>);
+
+    /// The log entry of a call made inside the [`viewer`] identity scope.
+    fn scoped(method: &str) -> SkillCall {
+        (
+            method.to_owned(),
+            Some("viewer-key".to_owned()),
+            Some("viewer".to_owned()),
+        )
+    }
+
+    #[derive(Clone)]
+    struct SkillProbe {
+        capabilities: ServerCapabilities,
+        seen: Arc<Mutex<Vec<SkillCall>>>,
+    }
+
+    impl Default for SkillProbe {
+        fn default() -> Self {
+            Self::with_capabilities(skills_capabilities())
+        }
+    }
+
+    impl SkillProbe {
+        fn with_capabilities(capabilities: ServerCapabilities) -> Self {
+            Self {
+                capabilities,
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn record(&self, method: String) {
+            let call = (method, rbac::current_identity(), rbac::current_role());
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(call);
+        }
+
+        fn seen(&self) -> Vec<SkillCall> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "deliberate: src/rbac_context.rs::tests::SkillProbe implements rmcp's async ServerHandler; the in-memory probe returns immediately"
+    )]
+    impl ServerHandler for SkillProbe {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(self.capabilities.clone())
+        }
+
+        async fn list_skills(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListSkillsResult, ErrorData> {
+            self.record("list_skills".to_owned());
+            Ok(ListSkillsResult::with_all_items(vec![sentinel_skill()]))
+        }
+
+        async fn get_skill(
+            &self,
+            _request: GetSkillRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetSkillResult, ErrorData> {
+            self.record("get_skill".to_owned());
+            Ok(GetSkillResult::new(sentinel_skill()))
+        }
+
+        async fn read_resource_directory(
+            &self,
+            _request: ReadResourceDirectoryRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+            self.record("read_resource_directory".to_owned());
+            Ok(ListResourcesResult::with_all_items(vec![
+                sentinel_directory_entry(),
+            ]))
+        }
+
+        async fn on_custom_request(
+            &self,
+            request: CustomRequest,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CustomResult, ErrorData> {
+            self.record(format!("on_custom_request:{}", request.method));
+            Ok(custom_sentinel(&request.method))
+        }
+    }
+
+    fn disabled_policy() -> Arc<ArcSwap<RbacPolicy>> {
+        Arc::new(ArcSwap::from_pointee(RbacPolicy::disabled()))
+    }
+
+    fn list_skills_request() -> ClientRequest {
+        ClientRequest::ListSkillsRequest(ListSkillsRequest::with_param(
+            PaginatedRequestParams::default(),
+        ))
+    }
+
+    fn get_skill_request() -> ClientRequest {
+        ClientRequest::GetSkillRequest(GetSkillRequest::new(GetSkillRequestParams::new(
+            SENTINEL_SKILL_URI,
+        )))
+    }
+
+    fn read_directory_request() -> ClientRequest {
+        ClientRequest::ReadResourceDirectoryRequest(ReadResourceDirectoryRequest::new(
+            ReadResourceDirectoryRequestParams::new("test://sentinel-directory/"),
+        ))
+    }
+
+    fn read_skill_directory_request() -> ClientRequest {
+        ClientRequest::ReadResourceDirectoryRequest(ReadResourceDirectoryRequest::new(
+            ReadResourceDirectoryRequestParams::new("skill://driver-sentinel-skill/"),
+        ))
+    }
+
+    fn custom_request(method: &str) -> ClientRequest {
+        ClientRequest::CustomRequest(CustomRequest::new(method, None))
+    }
+
+    /// `request` as JSON-RPC id `id`, carrying the [`viewer`] identity.
+    fn as_viewer(request: ClientRequest, id: i64) -> anyhow::Result<ClientJsonRpcMessage> {
+        let mut message = request_message(request, id);
+        attach_identity(&mut message, viewer())?;
+        Ok(message)
+    }
+
+    /// Dispatch one message through a real service around `probe` and return
+    /// the frame answering JSON-RPC id 1.
+    async fn dispatch_skill(
+        probe: SkillProbe,
+        rbac: Arc<ArcSwap<RbacPolicy>>,
+        message: ClientJsonRpcMessage,
+    ) -> anyhow::Result<ServerJsonRpcMessage> {
+        let outbound = drive_coverage_requests(probe, rbac, None, vec![message]).await?;
+        frame_for(&outbound, 1)
+    }
+
     #[tokio::test]
-    /// Pins that the SEP-2640 skill methods forward inside the identity scope.
-    async fn rbac_context_handler_forwards_skill_methods() -> anyhow::Result<()> {
-        // Mechanism 1 (ambient-silent probe): each run drives one request, so
-        // the expected log is exactly that method, observed with the role.
-        type SkillCase = (&'static str, &'static str, fn() -> ClientRequest);
-        let cases: [SkillCase; 3] = [
-            ("list_skills", "forwarding-probe:list_skills", || {
-                ClientRequest::ListSkillsRequest(ListSkillsRequest::with_param(
-                    PaginatedRequestParams::default(),
-                ))
-            }),
-            ("get_skill", "forwarding-probe:get_skill", || {
-                ClientRequest::GetSkillRequest(GetSkillRequest::new(GetSkillRequestParams::new(
-                    "skill://sentinel/SKILL.md",
-                )))
-            }),
+    /// Pins that `skills/list` forwards inside the identity scope with RBAC disabled.
+    async fn rbac_context_handler_forwards_list_skills() -> anyhow::Result<()> {
+        let probe = SkillProbe::default();
+        let frame = dispatch_skill(
+            probe.clone(),
+            disabled_policy(),
+            as_viewer(list_skills_request(), 1)?,
+        )
+        .await?;
+        let result = expect_response(frame)?;
+        let ServerResult::ListSkillsResult(listed) = result else {
+            anyhow::bail!("expected a skills/list result, got {result:?}")
+        };
+        assert_eq!(listed.skills, vec![sentinel_skill()]);
+        assert_eq!(probe.seen(), vec![scoped("list_skills")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that `skills/get` forwards inside the identity scope with RBAC disabled.
+    async fn rbac_context_handler_forwards_get_skill() -> anyhow::Result<()> {
+        let probe = SkillProbe::default();
+        let frame = dispatch_skill(
+            probe.clone(),
+            disabled_policy(),
+            as_viewer(get_skill_request(), 1)?,
+        )
+        .await?;
+        let result = expect_response(frame)?;
+        let ServerResult::GetSkillResult(fetched) = result else {
+            anyhow::bail!("expected a skills/get result, got {result:?}")
+        };
+        assert_eq!(fetched.skill, sentinel_skill());
+        assert_eq!(probe.seen(), vec![scoped("get_skill")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that `resources/directory/read` forwards inside the identity scope with RBAC disabled.
+    async fn rbac_context_handler_forwards_read_resource_directory() -> anyhow::Result<()> {
+        let probe = SkillProbe::default();
+        let frame = dispatch_skill(
+            probe.clone(),
+            disabled_policy(),
+            as_viewer(read_directory_request(), 1)?,
+        )
+        .await?;
+        let result = expect_response(frame)?;
+        let ServerResult::ListResourcesResult(listed) = result else {
+            anyhow::bail!("expected a resources/directory/read result, got {result:?}")
+        };
+        assert_eq!(listed.resources, vec![sentinel_directory_entry()]);
+        assert_eq!(probe.seen(), vec![scoped("read_resource_directory")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that RBAC enabled refuses every typed skills method for a role without a skills grant, without calling the inner handler.
+    async fn rbac_context_handler_refuses_skills_while_rbac_enabled() -> anyhow::Result<()> {
+        // `viewer_policy` lets the role call every tool but grants no skills:
+        // the refusal does not depend on tool grants. A directory read is a
+        // skills method only for a skill directory.
+        type DenyCase = (fn() -> ClientRequest, ErrorData);
+        let cases: [DenyCase; 3] = [
             (
-                "read_resource_directory",
-                "forwarding-probe:read_resource_directory",
-                || {
-                    ClientRequest::ReadResourceDirectoryRequest(ReadResourceDirectoryRequest::new(
-                        ReadResourceDirectoryRequestParams::new("test://sentinel-directory/"),
-                    ))
-                },
+                list_skills_request,
+                ErrorData::method_not_found::<ListSkillsRequestMethod>(),
+            ),
+            (
+                get_skill_request,
+                ErrorData::method_not_found::<GetSkillRequestMethod>(),
+            ),
+            (
+                read_skill_directory_request,
+                ErrorData::method_not_found::<ReadResourceDirectoryRequestMethod>(),
             ),
         ];
-        for (method, sentinel, build) in cases {
-            let (outbound, probe, control_outbound) = forward_once(
-                || {
-                    let mut message = request_message(build(), 1);
-                    attach_identity(&mut message, viewer())?;
-                    Ok(message)
-                },
-                None,
+        for (build, expected) in cases {
+            let probe = SkillProbe::default();
+            let frame =
+                dispatch_skill(probe.clone(), viewer_policy(), as_viewer(build(), 1)?).await?;
+            assert_eq!(expect_error(frame)?, expected);
+            assert_eq!(probe.seen(), Vec::<SkillCall>::new());
+        }
+        Ok(())
+    }
+
+    /// A transport fed request by request, so one service (one handler
+    /// instance) can answer several requests with state changes in between.
+    struct ChannelTransport {
+        inbound: mpsc::UnboundedReceiver<ClientJsonRpcMessage>,
+        outbound: mpsc::UnboundedSender<ServerJsonRpcMessage>,
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "deliberate: src/rbac_context.rs::tests::ChannelTransport implements rmcp's async Transport; close returns immediately"
+    )]
+    impl Transport<RoleServer> for ChannelTransport {
+        type Error = Infallible;
+
+        fn send(
+            &mut self,
+            item: ServerJsonRpcMessage,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let sent = self.outbound.send(item);
+            async move {
+                // A dropped receiver only means the test stopped listening.
+                let _receiver_gone = sent.is_err();
+                Ok(())
+            }
+        }
+
+        async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+            self.inbound.recv().await
+        }
+
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    /// Pins that one handler instance follows the reloadable policy on every skills call.
+    async fn rbac_context_handler_skills_follow_policy_reload() -> anyhow::Result<()> {
+        let rbac = disabled_policy();
+        let probe = SkillProbe::default();
+        let (inbound_tx, inbound) = mpsc::unbounded_channel();
+        let (outbound, mut outbound_rx) = mpsc::unbounded_channel();
+        let handler = RbacContextHandler::new(probe.clone(), Arc::clone(&rbac), false);
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(
+            handler,
+            ChannelTransport { inbound, outbound },
+            None,
+        );
+
+        let enabled = viewer_policy().load_full();
+        let disabled = Arc::new(RbacPolicy::disabled());
+        let mut frames = Vec::new();
+        for (id, installed) in [(1, &disabled), (2, &enabled), (3, &disabled)] {
+            rbac.store(Arc::clone(installed));
+            inbound_tx
+                .send(as_viewer(list_skills_request(), id)?)
+                .map_err(|_closed| anyhow::anyhow!("service stopped receiving"))?;
+            let frame = timeout(Duration::from_secs(1), outbound_rx.recv())
+                .await
+                .context("bounded wait for the skills/list answer")?
+                .context("service closed before answering")?;
+            frames.push(frame);
+        }
+        drop(inbound_tx);
+        let _quit_reason = running.waiting().await.context("service task joins")?;
+
+        let [first, second, third] = <[ServerJsonRpcMessage; 3]>::try_from(frames)
+            .map_err(|got| anyhow::anyhow!("expected three frames, got {got:?}"))?;
+        for forwarded in [first, third] {
+            let result = expect_response(forwarded)?;
+            let ServerResult::ListSkillsResult(listed) = result else {
+                anyhow::bail!("expected a skills/list result, got {result:?}")
+            };
+            assert_eq!(listed.skills, vec![sentinel_skill()]);
+        }
+        assert_eq!(
+            expect_error(second)?,
+            ErrorData::method_not_found::<ListSkillsRequestMethod>()
+        );
+        assert_eq!(
+            probe.seen(),
+            vec![scoped("list_skills"), scoped("list_skills")]
+        );
+        Ok(())
+    }
+
+    /// A policy granting `viewer` every tool, every skill and every resource.
+    fn fully_granted_viewer_policy() -> Arc<ArcSwap<RbacPolicy>> {
+        policy(
+            RoleConfig::new("viewer", vec!["*".to_owned()], vec!["*".to_owned()])
+                .with_skills(vec!["*".to_owned()]),
+        )
+    }
+
+    /// A `resources/read` whose params fail rmcp's typed variant.
+    fn malformed_read_resource() -> anyhow::Result<ClientJsonRpcMessage> {
+        let mut message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1_i64,
+            "method": "resources/read",
+            "params": { "uri": 7_i64 }
+        }))?;
+        attach_identity(&mut message, viewer())?;
+        Ok(message)
+    }
+
+    #[tokio::test]
+    /// Case 11: under RBAC `on_custom_request` refuses the nine reserved names even for a fully granted role, and forwards the rest.
+    async fn rbac_context_handler_on_custom_request_refuses_reserved_names() -> anyhow::Result<()> {
+        let probe = SkillProbe::default();
+        let allowed_frame = dispatch_skill(
+            probe.clone(),
+            fully_granted_viewer_policy(),
+            as_viewer(custom_request("x-sentinel/custom"), 1)?,
+        )
+        .await?;
+        let allowed = expect_response(allowed_frame)?;
+        let ServerResult::CustomResult(allowed_custom) = allowed else {
+            anyhow::bail!("expected a custom result, got {allowed:?}")
+        };
+        assert_eq!(allowed_custom, custom_sentinel("x-sentinel/custom"));
+        assert_eq!(
+            probe.seen(),
+            vec![scoped("on_custom_request:x-sentinel/custom")]
+        );
+
+        for name in RESERVED_NAMES {
+            let refused = SkillProbe::default();
+            let refused_frame = dispatch_skill(
+                refused.clone(),
+                fully_granted_viewer_policy(),
+                as_viewer(custom_request(name), 1)?,
             )
             .await?;
-            let error = expect_error(frame_for(&outbound, 1)?)?;
-            assert_eq!(error.message, sentinel);
-            assert_eq!(probe.seen(), vec![(method, Some("viewer".to_owned()))]);
-            let default_error = expect_error(frame_for(&control_outbound, 1)?)?;
-            assert_eq!(default_error.code, ErrorCode::METHOD_NOT_FOUND);
+            assert_eq!(
+                expect_error(refused_frame)?,
+                ErrorData::new(ErrorCode::METHOD_NOT_FOUND, name, None),
+                "{name}"
+            );
+            assert_eq!(refused.seen(), Vec::<SkillCall>::new(), "{name}");
+
+            let forwarded = SkillProbe::default();
+            let forwarded_frame = dispatch_skill(
+                forwarded.clone(),
+                disabled_policy(),
+                as_viewer(custom_request(name), 1)?,
+            )
+            .await?;
+            let forwarded_result = expect_response(forwarded_frame)?;
+            let ServerResult::CustomResult(forwarded_custom) = forwarded_result else {
+                anyhow::bail!("expected a custom result, got {forwarded_result:?}")
+            };
+            assert_eq!(forwarded_custom, custom_sentinel(name));
+            assert_eq!(
+                forwarded.seen(),
+                vec![scoped(&format!("on_custom_request:{name}"))]
+            );
+        }
+
+        // A malformed `resources/read` falls through to the custom fallback
+        // and never reaches the probe.
+        let malformed = SkillProbe::default();
+        let malformed_frame = dispatch_skill(
+            malformed.clone(),
+            fully_granted_viewer_policy(),
+            malformed_read_resource()?,
+        )
+        .await?;
+        assert_eq!(
+            expect_error(malformed_frame)?,
+            ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "resources/read", None)
+        );
+        assert_eq!(malformed.seen(), Vec::<SkillCall>::new());
+        Ok(())
+    }
+
+    /// A `skills/get` whose params fail rmcp's typed variant, parsed from raw
+    /// JSON-RPC exactly as a transport would.
+    fn malformed_get_skill() -> anyhow::Result<ClientJsonRpcMessage> {
+        let mut message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1_i64,
+            "method": "skills/get",
+            "params": { "uri": 7_i64 }
+        }))?;
+        attach_identity(&mut message, viewer())?;
+        Ok(message)
+    }
+
+    #[tokio::test]
+    /// Pins how a malformed `skills/get` is dispatched, and that RBAC refuses its custom fallback.
+    async fn rbac_context_handler_refuses_malformed_skills_fallback() -> anyhow::Result<()> {
+        let refused = SkillProbe::default();
+        let refused_frame =
+            dispatch_skill(refused.clone(), viewer_policy(), malformed_get_skill()?).await?;
+        assert_eq!(
+            expect_error(refused_frame)?,
+            ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "skills/get", None)
+        );
+        assert_eq!(refused.seen(), Vec::<SkillCall>::new());
+
+        // rmcp 3.11 observed behaviour with RBAC disabled: the untagged
+        // `ClientRequest` falls through to `CustomRequest`, skipping the
+        // skills gate, and the consumer's `on_custom_request` answers.
+        let forwarded = SkillProbe::default();
+        let forwarded_frame =
+            dispatch_skill(forwarded.clone(), disabled_policy(), malformed_get_skill()?).await?;
+        let result = expect_response(forwarded_frame)?;
+        let ServerResult::CustomResult(custom) = result else {
+            anyhow::bail!("expected a custom result, got {result:?}")
+        };
+        assert_eq!(custom, custom_sentinel("skills/get"));
+        assert_eq!(
+            forwarded.seen(),
+            vec![scoped("on_custom_request:skills/get")]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins rmcp's skills capability gate: each row is refused before the inner handler.
+    async fn rbac_context_handler_skills_gate_negatives() -> anyhow::Result<()> {
+        type GateRow = (ServerCapabilities, fn() -> ClientRequest, ErrorData);
+        let rows: [GateRow; 3] = [
+            (
+                ServerCapabilities::builder().enable_resources().build(),
+                list_skills_request,
+                ErrorData::method_not_found::<ListSkillsRequestMethod>(),
+            ),
+            (
+                ServerCapabilities::builder().enable_skills().build(),
+                list_skills_request,
+                ErrorData::internal_error(
+                    "the skills extension requires the resources capability",
+                    None,
+                ),
+            ),
+            (
+                ServerCapabilities::builder()
+                    .enable_resources()
+                    .enable_skills()
+                    .build(),
+                read_directory_request,
+                ErrorData::method_not_found::<ReadResourceDirectoryRequestMethod>(),
+            ),
+        ];
+        for (capabilities, build, expected) in rows {
+            let probe = SkillProbe::with_capabilities(capabilities);
+            let frame =
+                dispatch_skill(probe.clone(), disabled_policy(), as_viewer(build(), 1)?).await?;
+            assert_eq!(expect_error(frame)?, expected);
+            assert_eq!(probe.seen(), Vec::<SkillCall>::new());
         }
         Ok(())
     }

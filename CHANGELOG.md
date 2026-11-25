@@ -17,14 +17,32 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   unmaintained), RUSTSEC-2026-0542 (`humantime` unmaintained) and RUSTSEC-2026-0387
   (`crypto-bigint` timing, via `jsonwebtoken`), each with the reason it does not
   apply and the real fix noted next to it.
-- `rmcp` moved from 3.6.0 to 3.11.0. Its `ServerHandler` gained `list_skills`,
-  `get_skill` (SEP-2640 skills) and `read_resource_directory`; `HookedHandler`
-  forwards all three unchanged, and `RbacContextHandler` runs them inside the
-  RBAC identity scope like `list_resources` / `read_resource`, so an inner
-  handler's overrides are no longer shadowed by rmcp's `method_not_found`
-  defaults. Upstream, the `complete`, `list_prompts`, `list_resources`,
-  `list_resource_templates` and `list_tools` defaults now answer
-  method-not-found when the matching capability is not advertised.
+- `rmcp` moved from 3.6.0 to 3.11.0. Consumer notes:
+  - rmcp now answers `-32601` for `complete`, `prompts/list`, `resources/list`,
+    `resources/templates/list` and `tools/list` when the handler inherits rmcp's
+    default and `get_info` does not advertise the matching capability
+    (rust-sdk #1446). Explicit overrides keep their own behaviour.
+  - Skills need both the skills extension and the `resources` capability
+    advertised; otherwise rmcp answers `-32601` or `-32603` before the handler.
+- With RBAC enabled, `RbacContextHandler::on_custom_request` no longer forwards
+  the nine skill and resource method names (`skills/list`, `skills/get`,
+  `resources/directory/read`, `resources/read`, `resources/list`,
+  `resources/templates/list`, `resources/subscribe`, `resources/unsubscribe`,
+  `subscriptions/listen`). A request with one of these names whose params fail
+  rmcp's typed variant answers `-32601` without reaching the consumer, whatever
+  the role. With RBAC disabled the fallback forwards as before.
+- With RBAC enabled, `accepted_subscription_filter` passes the consumer only
+  resource URIs every caller may use (ordinary URIs outside restrict mode) and
+  returns only such URIs. `subscriptions/listen` therefore never delivers
+  skill-URI updates, and in restrict mode no resource-URI updates (the consumer
+  sees an empty resource filter; a consumer that accepts only URIs it knows gets
+  rmcp's refusal, `-32601` with no acknowledgement). Legacy `resources/subscribe`
+  is gated per role. A `listen` whose accepted URIs fail a fresh policy check
+  answers resource-not-found.
+- With RBAC enabled, filtered and gated skill and resource results (`skills/list`,
+  `skills/get`, `resources/list`, `resources/read`, `resources/directory/read`)
+  carry `cache_scope = Private`, overriding an explicit `Public`.
+
 - MSRV raised from Rust 1.99.0 to 1.100.0 (`rust-version`, the GitHub and GitLab
   MSRV jobs, the GitLab `CI_IMAGE` tag `rust-1.100.0`, and the docs). Consumers on
   1.99 must upgrade their toolchain; `rust:rust-1.100.0` must exist in the
@@ -37,6 +55,45 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   162 and 166 of the 170 minutes allowed, because a mutant costs about 3 minutes
   here, not the 1.7 minutes assumed, so 4 shards no longer fit. The default-feature
   `mutants` job is unchanged.
+
+### Added
+
+- Per-role RBAC for skills (SEP-2640) and resources. New config fields, all
+  `#[serde(default)]` and no new environment variables:
+  - `RbacConfig::skill_roots` (extra skill namespace roots; `skill://` is
+    always registered) and `RbacConfig::restrict_resources` (default `false`);
+  - `RoleConfig::skills` (glob patterns over the skill path; empty grants no
+    skills) and `RoleConfig::resources` (`Option` of glob patterns over the
+    canonical URI; effective only in restrict mode).
+  - Builders `RbacConfig::with_skill_roots`, `RbacConfig::with_restrict_resources`,
+    `RoleConfig::with_skills` and `RoleConfig::with_resources`.
+  - `RbacConfig::validate()` returns `RmcpServerKitError::Config` for an invalid
+    root or pattern or a `resources` setting without `restrict_resources`. Call
+    it at startup: `RbacPolicy::new` stays infallible, only warns, and denies
+    every resource and skill when a root is invalid.
+- With RBAC enabled, `RbacContextHandler` enforces those settings per role for
+  `skills/list`, `skills/get`, `resources/directory/read`, `resources/read`,
+  `resources/list`, legacy `resources/subscribe` and `subscriptions/listen`.
+  Skills are denied unless the role has `skills`; ordinary resources stay
+  unrestricted unless restrict mode is on (`restrict_resources`, or any role
+  setting `resources`). A role without `skills` gets `-32601` for `skills/list`
+  and `skills/get`; a denied or missing resource answers the same
+  resource-not-found (`-32002`, or `-32602` for 2026-07-28 peers) and a denied
+  or missing skill the same `-32602` "unknown skill". Lists are filtered, a
+  read whose contents include a denied URI is refused whole, and URIs that are
+  not lexically safe (`%`, `\`, `.`/`..` segments, `//`) are denied. With RBAC
+  disabled every method forwards unchanged. See the
+  [GUIDE](docs/GUIDE.md#skills-and-resources) and
+  [MIGRATION](docs/MIGRATION.md#migrating-to-the-rmcp-311-release-default-method-not-found-and-skills).
+
+### Security
+
+- The lockfile now resolves `rustls-webpki` 0.103.17.
+- The `rmcp` bump picks up the fixes behind the upstream "Merge commit from fork"
+  entries: GHSA-5p52-q7pq-9fq2 (OAuth authorization-server metadata SSRF, fixed
+  in rmcp 3.7.0) and GHSA-c9f9-cp8h-jcj5 (unbounded Streamable HTTP client
+  response buffering, fixed in rmcp 3.9.0). Both are in rmcp's client and OAuth
+  modules, which this crate does not use.
 
 ## [3.21.1] - 2026-10-22
 

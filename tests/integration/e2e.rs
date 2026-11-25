@@ -28,6 +28,8 @@
     )
 )]
 #[cfg(test)]
+// On an inline module `path` names the directory of its file submodules.
+#[path = "e2e"]
 mod tests {
     extern crate alloc;
 
@@ -63,9 +65,13 @@ mod tests {
     use rmcp::{
         handler::server::ServerHandler,
         model::{
-            CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
-            ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-            ServerConfig as RmcpServerConfig, Tool,
+            CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+            GetSkillRequestParams, GetSkillResult, JsonObject, ListResourcesResult,
+            ListSkillsResult, ListToolsResult, PaginatedRequestParams,
+            ReadResourceDirectoryRequestParams, ReadResourceDirectoryResult,
+            ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+            ResourceContents, ServerCapabilities, ServerConfig as RmcpServerConfig, Skill,
+            SkillFrontmatter, SkillResources, Tool,
         },
         service::{MaybeSendFuture, RequestContext, RoleServer},
         transport::streamable_http_server::session::{
@@ -88,6 +94,7 @@ mod tests {
     use rsa::{pkcs8, pkcs8::EncodePrivateKey as _, rand_core, traits::PublicKeyParts as _};
     use rustls::crypto::ring;
     use secrecy::SecretString;
+    use serde::de::DeserializeOwned;
     #[cfg(feature = "oauth")]
     use tokio::io::AsyncWriteExt as _;
     use tokio::{
@@ -8041,4 +8048,439 @@ mod tests {
             assert_accepted(&server.base, Signer::Es384AtJwt, &claims).await
         }
     }
+
+    // ==========================================================================
+    // SEP-2640 skills through serve() (rmcp 3.11)
+    // ==========================================================================
+
+    const SKILL_URI: &str = "skill://driver-sentinel-skill/SKILL.md";
+    const SKILL_BODY: &str = "driver-sentinel-skill body";
+
+    fn sentinel_skill() -> Skill {
+        Skill::new(
+            SKILL_URI,
+            SkillFrontmatter::new("driver-sentinel-skill", "driver sentinel"),
+            SkillResources::Dynamic,
+        )
+    }
+
+    fn sentinel_directory_entry() -> Resource {
+        Resource::new(
+            "test://sentinel-directory/entry",
+            "driver-sentinel-resource",
+        )
+    }
+
+    /// `(method, current_identity(), current_role())` seen inside a call.
+    type SkillsCall = (&'static str, Option<String>, Option<String>);
+
+    /// Serves the SEP-2640 sentinels and the `SKILL.md` body, recording the
+    /// identity and role each call observes. `get_info` records nothing.
+    #[derive(Clone, Default)]
+    struct SkillsE2eHandler {
+        calls: Arc<StdMutex<Vec<SkillsCall>>>,
+    }
+
+    impl SkillsE2eHandler {
+        fn record(&self, method: &'static str) {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((method, current_identity(), current_role()));
+        }
+
+        fn calls(&self) -> Vec<SkillsCall> {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ServerHandler for SkillsE2eHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(
+                ServerCapabilities::builder()
+                    .enable_resources()
+                    .enable_skills_with_directory_read()
+                    .build(),
+            )
+        }
+
+        fn list_skills(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListSkillsResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            self.record("list_skills");
+            ready(Ok(ListSkillsResult::with_all_items(vec![sentinel_skill()])))
+        }
+
+        fn get_skill(
+            &self,
+            _request: GetSkillRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<GetSkillResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            self.record("get_skill");
+            ready(Ok(GetSkillResult::new(sentinel_skill())))
+        }
+
+        fn read_resource_directory(
+            &self,
+            _request: ReadResourceDirectoryRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ReadResourceDirectoryResult, rmcp::ErrorData>>
+        + MaybeSendFuture
+        + '_ {
+            self.record("read_resource_directory");
+            ready(Ok(ListResourcesResult::with_all_items(vec![
+                sentinel_directory_entry(),
+            ])))
+        }
+
+        fn read_resource(
+            &self,
+            _request: ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            self.record("read_resource");
+            ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                SKILL_BODY, SKILL_URI,
+            )])
+            .into()))
+        }
+    }
+
+    /// One `/mcp` POST on a legacy session, optionally authenticated.
+    async fn skills_post(
+        client: &reqwest::Client,
+        base: &str,
+        auth: (Option<&str>, Option<&str>),
+        body: &serde_json::Value,
+    ) -> anyhow::Result<reqwest::Response> {
+        let (bearer, session) = auth;
+        let mut request = client
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(token) = bearer {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(id) = session {
+            request = request.header("mcp-session-id", id);
+        }
+        Ok(request.body(body.to_string()).send().await?)
+    }
+
+    fn skills_list_body(id: u32) -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "skills/list" })
+    }
+
+    fn skills_get_body(id: u32, uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "skills/get", "params": { "uri": uri }
+        })
+    }
+
+    fn directory_read_body(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "resources/directory/read",
+            "params": { "uri": "test://sentinel-directory/" }
+        })
+    }
+
+    /// A directory read of a skill directory: refused for a role without a
+    /// skills grant, unlike an ordinary directory.
+    fn skill_directory_read_body(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "resources/directory/read",
+            "params": { "uri": "skill://guessed-skill/" }
+        })
+    }
+
+    fn resource_read_body(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "resources/read", "params": { "uri": SKILL_URI }
+        })
+    }
+
+    /// The exact JSON-RPC method-not-found error frame for `method`.
+    fn method_not_found_frame(id: u32, method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "error": { "code": -32601_i32, "message": method }
+        })
+    }
+
+    /// POST on a session and decode the single JSON-RPC frame of a 200 reply.
+    async fn skills_frame(
+        client: &reqwest::Client,
+        base: &str,
+        auth: (Option<&str>, Option<&str>),
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let response = skills_post(client, base, auth, body).await?;
+        assert_eq!(response.status(), 200, "request {body}");
+        mcp_response_json(response).await
+    }
+
+    fn frame_result<T>(frame: &serde_json::Value) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let result = frame
+            .get("result")
+            .cloned()
+            .with_context(|| format!("expected a result frame, got {frame}"))?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    fn viewer_key_auth() -> anyhow::Result<(String, AuthConfig)> {
+        let (token, hash) = generate_api_key()?;
+        Ok((
+            token,
+            test_auth_config(vec![ApiKeyEntry::new("viewer-key", hash, "viewer")]),
+        ))
+    }
+
+    /// A policy where `viewer` may call only `allowed_tool`.
+    fn restricted_viewer_policy() -> RbacPolicy {
+        RbacPolicy::new(&RbacConfig::with_roles(vec![RoleConfig::new(
+            "viewer",
+            vec!["allowed_tool".into()],
+            vec!["*".into()],
+        )]))
+    }
+
+    fn viewer_call(method: &'static str) -> SkillsCall {
+        (
+            method,
+            Some("viewer-key".to_owned()),
+            Some("viewer".to_owned()),
+        )
+    }
+
+    /// Assert the three skills methods answer method-not-found on `session`.
+    async fn assert_skills_refused(
+        client: &reqwest::Client,
+        base: &str,
+        auth: (Option<&str>, Option<&str>),
+    ) -> anyhow::Result<()> {
+        let guessed = "skill://guessed-skill/SKILL.md";
+        for (body, method) in [
+            (skills_list_body(2), "skills/list"),
+            (skills_get_body(2, guessed), "skills/get"),
+            (skill_directory_read_body(2), "resources/directory/read"),
+        ] {
+            let frame = skills_frame(client, base, auth, &body).await?;
+            assert_eq!(frame, method_not_found_frame(2, method));
+        }
+        Ok(())
+    }
+
+    /// Pins assertion 1: with auth on and RBAC disabled, every skills method
+    /// and the `SKILL.md` read return their sentinels inside the identity scope.
+    #[tokio::test]
+    async fn skills_forward_with_identity_when_rbac_disabled() -> anyhow::Result<()> {
+        let (token, key_auth) = viewer_key_auth()?;
+        let handler = SkillsE2eHandler::default();
+        let factory_handler = handler.clone();
+        let base = spawn_server_with(config_on_port(0).with_auth(key_auth), move || {
+            factory_handler.clone()
+        })
+        .await?;
+        let client = reqwest::Client::new();
+        let session = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+        let auth = (Some(token.as_str()), Some(session.as_str()));
+
+        let listed: ListSkillsResult =
+            frame_result(&skills_frame(&client, &base.base, auth, &skills_list_body(2)).await?)?;
+        assert_eq!(listed.skills, vec![sentinel_skill()]);
+        let fetched: GetSkillResult = frame_result(
+            &skills_frame(&client, &base.base, auth, &skills_get_body(3, SKILL_URI)).await?,
+        )?;
+        assert_eq!(fetched.skill, sentinel_skill());
+        let directory: ListResourcesResult =
+            frame_result(&skills_frame(&client, &base.base, auth, &directory_read_body(4)).await?)?;
+        assert_eq!(directory.resources, vec![sentinel_directory_entry()]);
+        let body: ReadResourceResult =
+            frame_result(&skills_frame(&client, &base.base, auth, &resource_read_body(5)).await?)?;
+        assert_eq!(
+            body.contents,
+            vec![ResourceContents::text(SKILL_BODY, SKILL_URI)]
+        );
+
+        assert_eq!(
+            handler.calls(),
+            vec![
+                viewer_call("list_skills"),
+                viewer_call("get_skill"),
+                viewer_call("read_resource_directory"),
+                viewer_call("read_resource"),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Pins assertion 2: with RBAC enabled and tool-list filtering on, a
+    /// restricted role gets `-32601` from all three methods and the handler is
+    /// never called.
+    #[tokio::test]
+    async fn skills_refused_for_restricted_role_when_rbac_enabled() -> anyhow::Result<()> {
+        let (token, auth) = viewer_key_auth()?;
+        let handler = SkillsE2eHandler::default();
+        let factory_handler = handler.clone();
+        let cfg = config_on_port(0)
+            .with_auth(auth)
+            .with_rbac(Arc::new(restricted_viewer_policy()))
+            .with_tool_list_filtering(true);
+        let base = spawn_server_with(cfg, move || factory_handler.clone()).await?;
+        let client = reqwest::Client::new();
+        let session = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+
+        assert_skills_refused(
+            &client,
+            &base.base,
+            (Some(token.as_str()), Some(session.as_str())),
+        )
+        .await?;
+        assert_eq!(handler.calls(), Vec::<SkillsCall>::new());
+        Ok(())
+    }
+
+    /// Pins assertion 3: `ReloadHandle::reload_rbac` flips the running
+    /// server disabled -> enabled -> disabled without a restart.
+    #[tokio::test]
+    async fn skills_follow_rbac_reload_without_restart() -> anyhow::Result<()> {
+        let (token, key_auth) = viewer_key_auth()?;
+        let handler = SkillsE2eHandler::default();
+        let factory_handler = handler.clone();
+        let (reload_tx, reload_rx) = oneshot::channel();
+        let cfg = config_on_port(0)
+            .with_auth(key_auth)
+            .with_rbac(Arc::new(RbacPolicy::disabled()))
+            .with_reload_callback(move |reload| drop(reload_tx.send(reload)));
+        let base = spawn_server_with(cfg, move || factory_handler.clone()).await?;
+        let reload = timeout(Duration::from_secs(10), reload_rx)
+            .await
+            .context("reload handle within the bound")?
+            .context("reload callback ran")?;
+        let client = reqwest::Client::new();
+        let session = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+        let auth = (Some(token.as_str()), Some(session.as_str()));
+
+        let first: ListSkillsResult =
+            frame_result(&skills_frame(&client, &base.base, auth, &skills_list_body(2)).await?)?;
+        assert_eq!(first.skills, vec![sentinel_skill()]);
+
+        reload.reload_rbac(restricted_viewer_policy());
+        let refused = skills_frame(&client, &base.base, auth, &skills_list_body(3)).await?;
+        assert_eq!(refused, method_not_found_frame(3, "skills/list"));
+
+        reload.reload_rbac(RbacPolicy::disabled());
+        let third: ListSkillsResult =
+            frame_result(&skills_frame(&client, &base.base, auth, &skills_list_body(4)).await?)?;
+        assert_eq!(third.skills, vec![sentinel_skill()]);
+
+        assert_eq!(
+            handler.calls(),
+            vec![viewer_call("list_skills"), viewer_call("list_skills")]
+        );
+        Ok(())
+    }
+
+    /// Pins assertion 4: on a legacy session with RBAC disabled, identity B
+    /// reusing identity A's session id gets 404 and the handler is not called.
+    #[tokio::test]
+    async fn skills_session_is_bound_to_initiating_identity() -> anyhow::Result<()> {
+        let (token_a, hash_a) = generate_api_key()?;
+        let (token_b, hash_b) = generate_api_key()?;
+        let auth = test_auth_config(vec![
+            ApiKeyEntry::new("viewer-key", hash_a, "viewer"),
+            ApiKeyEntry::new("other-key", hash_b, "viewer"),
+        ]);
+        let handler = SkillsE2eHandler::default();
+        let factory_handler = handler.clone();
+        let base = spawn_server_with(config_on_port(0).with_auth(auth), move || {
+            factory_handler.clone()
+        })
+        .await?;
+        let client = reqwest::Client::new();
+        let session = mcp_initialize_with_bearer(&client, &base.base, Some(&token_a)).await?;
+
+        let own: ListSkillsResult = frame_result(
+            &skills_frame(
+                &client,
+                &base.base,
+                (Some(token_a.as_str()), Some(session.as_str())),
+                &skills_list_body(2),
+            )
+            .await?,
+        )?;
+        assert_eq!(own.skills, vec![sentinel_skill()]);
+
+        let foreign = skills_post(
+            &client,
+            &base.base,
+            (Some(token_b.as_str()), Some(session.as_str())),
+            &skills_list_body(3),
+        )
+        .await?;
+        assert_eq!(foreign.status(), 404);
+        assert_eq!(handler.calls(), vec![viewer_call("list_skills")]);
+        Ok(())
+    }
+
+    /// Pins assertion 5: a skills request without credentials is 401 and one
+    /// from a disallowed `Origin` is 403, both before the handler.
+    #[tokio::test]
+    async fn skills_require_credentials_and_allowed_origin() -> anyhow::Result<()> {
+        let (token, auth) = viewer_key_auth()?;
+        let handler = SkillsE2eHandler::default();
+        let factory_handler = handler.clone();
+        let cfg = config_on_port(0)
+            .with_auth(auth)
+            .with_allowed_origins(["http://localhost:3000"]);
+        let base = spawn_server_with(cfg, move || factory_handler.clone()).await?;
+        let client = reqwest::Client::new();
+
+        let anonymous =
+            skills_post(&client, &base.base, (None, None), &skills_list_body(1)).await?;
+        assert_eq!(anonymous.status(), 401);
+
+        let cross_origin = client
+            .post(format!("{}/mcp", base.base))
+            .header("authorization", format!("Bearer {token}"))
+            .header("origin", "http://evil.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(skills_list_body(1).to_string())
+            .send()
+            .await?;
+        assert_eq!(cross_origin.status(), 403);
+        assert_eq!(handler.calls(), Vec::<SkillsCall>::new());
+        Ok(())
+    }
+
+    /// Pins assertion 6: a handler that does not advertise skills answers
+    /// `skills/list` with `-32601`.
+    #[tokio::test]
+    async fn skills_not_advertised_answer_method_not_found() -> anyhow::Result<()> {
+        let base = spawn_server(config_on_port(0)).await?;
+        let client = reqwest::Client::new();
+        let session = mcp_initialize(&client, &base.base).await?;
+        let frame = skills_frame(
+            &client,
+            &base.base,
+            (None, Some(session.as_str())),
+            &skills_list_body(2),
+        )
+        .await?;
+        assert_eq!(frame, method_not_found_frame(2, "skills/list"));
+        Ok(())
+    }
+
+    mod rbac_skills;
 }

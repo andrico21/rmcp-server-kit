@@ -327,6 +327,23 @@ pub struct RoleConfig {
     /// `/`-basename) must appear in the allowlist.
     #[serde(default)]
     pub argument_allowlists: Vec<ArgumentAllowlist>,
+    /// Skill path glob patterns this role may use (SEP-2640 skills).
+    ///
+    /// Each pattern is matched against the skill path: the part of a skill
+    /// URI after its root (`skill://` or an entry of
+    /// [`RbacConfig::skill_roots`]). A pattern grants the skill directory,
+    /// its `SKILL.md`, every file below it and every nested skill below it.
+    /// Empty (the default) grants no skills; `["*"]` grants all of them.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Glob patterns over the canonical full URI of ordinary (non-skill)
+    /// resources this role may use.
+    ///
+    /// Effective only in restrict mode ([`RbacConfig::restrict_resources`]).
+    /// `None` (the default) leaves ordinary resources unrestricted for this
+    /// role; `Some(vec![])` denies every ordinary resource.
+    #[serde(default)]
+    pub resources: Option<Vec<String>>,
 }
 
 impl RoleConfig {
@@ -345,6 +362,8 @@ impl RoleConfig {
             deny: vec![],
             hosts,
             argument_allowlists: vec![],
+            skills: vec![],
+            resources: None,
         }
     }
 
@@ -361,6 +380,27 @@ impl RoleConfig {
     #[inline]
     pub fn with_argument_allowlists(mut self, allowlists: Vec<ArgumentAllowlist>) -> Self {
         self.argument_allowlists = allowlists;
+        self
+    }
+
+    /// Grant this role the skills whose path matches one of `skills`.
+    ///
+    /// See [`RoleConfig::skills`] for the matching rules.
+    #[must_use]
+    #[inline]
+    pub fn with_skills(mut self, skills: Vec<String>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// Restrict this role to the ordinary resources matching `resources`.
+    ///
+    /// Sets [`RoleConfig::resources`] to `Some`. Only effective in restrict
+    /// mode; see [`RbacConfig::restrict_resources`].
+    #[must_use]
+    #[inline]
+    pub fn with_resources(mut self, resources: Vec<String>) -> Self {
+        self.resources = Some(resources);
         self
     }
 }
@@ -608,6 +648,23 @@ pub struct RbacConfig {
     /// `Debug`/`Display`/serde and is zeroized on drop.
     #[serde(default)]
     pub redaction_salt: Option<SecretString>,
+    /// Extra skill namespace roots, in addition to the built-in `skill://`
+    /// root, which is always present and cannot be removed.
+    ///
+    /// A root is a URI prefix that contains `://` and ends in `/`, for
+    /// example `file:///srv/skills/`. Roots must not overlap each other or
+    /// `skill://`; an invalid root makes the policy deny every resource and
+    /// skill (see [`RbacConfig::validate`]).
+    #[serde(default)]
+    pub skill_roots: Vec<String>,
+    /// Restrict ordinary (non-skill) resources per role.
+    ///
+    /// `false` (the default): ordinary resources are unrestricted for every
+    /// caller. `true`: a resolved role's [`RoleConfig::resources`] applies
+    /// (`None` = unrestricted for that role), and callers without a
+    /// configured role are denied ordinary resources.
+    #[serde(default)]
+    pub restrict_resources: bool,
 }
 
 impl RbacConfig {
@@ -621,6 +678,58 @@ impl RbacConfig {
             allow_operation_matching: AllowOperationMatching::default(),
             global_deny: Vec::new(),
             redaction_salt: None,
+            skill_roots: Vec::new(),
+            restrict_resources: false,
+        }
+    }
+
+    /// Register extra skill namespace roots (see [`RbacConfig::skill_roots`]).
+    #[must_use]
+    #[inline]
+    pub fn with_skill_roots(mut self, skill_roots: Vec<String>) -> Self {
+        self.skill_roots = skill_roots;
+        self
+    }
+
+    /// Turn per-role restriction of ordinary resources on or off (see
+    /// [`RbacConfig::restrict_resources`]).
+    #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "deliberate: src/rbac.rs::RbacConfig::with_restrict_resources - matches the non-const sibling builders"
+    )]
+    #[inline]
+    pub fn with_restrict_resources(mut self, restrict_resources: bool) -> Self {
+        self.restrict_resources = restrict_resources;
+        self
+    }
+
+    /// Check the skills and resources settings.
+    ///
+    /// Required before building a policy from operator input:
+    /// [`RbacPolicy::new`] stays infallible and only warns, denying every
+    /// resource and skill when a root is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] listing every violation: an
+    /// empty pattern or root; a root without `://`, without a trailing `/`,
+    /// lexically unsafe, containing `?` or `#`, or overlapping another root
+    /// (the built-in `skill://` included); a `skills` pattern containing
+    /// `://` or ending with `SKILL.md`; a `resources` pattern that starts
+    /// with a root or whose scheme is not lowercase; and any role with
+    /// `resources` set while `restrict_resources` is `false`.
+    #[inline]
+    pub fn validate(&self) -> Result<(), RmcpServerKitError> {
+        let mut violations = root_violations(&self.skill_roots);
+        violations.extend(grant_violations(self));
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(RmcpServerKitError::Config(format!(
+                "rbac: {}",
+                violations.join("; ")
+            )))
         }
     }
 
@@ -718,6 +827,14 @@ pub struct RbacPolicy {
     /// HMAC key used to redact argument values in deny logs.
     /// Either a configured stable salt or a per-process random salt.
     redaction_salt: Arc<SecretString>,
+    /// Skill namespace roots with the scheme lowercased, the built-in
+    /// `skill://` first.
+    skill_roots: Vec<String>,
+    /// Effective restrict mode for ordinary resources.
+    restrict_resources: bool,
+    /// Set when a configured root is invalid: every resource and skill is
+    /// then denied while RBAC is enabled.
+    namespace_invalid: bool,
 }
 
 impl RbacPolicy {
@@ -729,16 +846,31 @@ impl RbacPolicy {
         warn_on_optional_value_allowlists(&config.roles);
         warn_on_literal_allow_globs(&config.roles, config.allow_operation_matching);
         warn_on_inert_global_deny(config);
+        let root_problems = root_violations(&config.skill_roots);
+        for violation in root_problems.iter().chain(&grant_violations(config)) {
+            tracing::warn!(
+                violation = %violation,
+                "invalid rbac skills/resources setting; run RbacConfig::validate \
+                 at startup - an invalid root denies every resource and skill, \
+                 an invalid pattern never matches"
+            );
+        }
         let salt = config
             .redaction_salt
             .clone()
             .unwrap_or_else(|| process_redaction_salt().clone());
+        let mut skill_roots = vec![BUILTIN_SKILL_ROOT.to_owned()];
+        skill_roots.extend(config.skill_roots.iter().map(|root| lowercase_scheme(root)));
         Self {
             roles: config.roles.clone(),
             enabled: config.enabled,
             allow_operation_matching: config.allow_operation_matching,
             global_deny: config.global_deny.clone(),
             redaction_salt: Arc::new(salt),
+            skill_roots,
+            restrict_resources: config.restrict_resources
+                || config.roles.iter().any(|role| role.resources.is_some()),
+            namespace_invalid: !root_problems.is_empty(),
         }
     }
 
@@ -752,6 +884,9 @@ impl RbacPolicy {
             allow_operation_matching: AllowOperationMatching::default(),
             global_deny: Vec::new(),
             redaction_salt: Arc::new(process_redaction_salt().clone()),
+            skill_roots: vec![BUILTIN_SKILL_ROOT.to_owned()],
+            restrict_resources: false,
+            namespace_invalid: false,
         }
     }
 
@@ -1147,6 +1282,276 @@ impl RbacPolicy {
     pub fn redact_arg(&self, value: &str) -> String {
         redact_with_salt(self.redaction_salt.expose_secret().as_bytes(), value)
     }
+
+    /// The role config for a resolved caller: `None` for a missing, empty
+    /// or unknown role.
+    fn resolved_role(&self, role: Option<&str>) -> Option<&RoleConfig> {
+        let name = role.filter(|name| !name.is_empty())?;
+        self.find_role(name)
+    }
+
+    /// Classify a canonical URI against the registered skill roots.
+    fn classify<'uri>(&self, canonical_uri: &'uri str) -> UriClass<'uri> {
+        if !canonical_uri.contains("://") {
+            let scheme = canonical_uri.split(':').next().unwrap_or_default();
+            if self
+                .skill_roots
+                .iter()
+                .any(|root| root.split("://").next() == Some(scheme))
+            {
+                return UriClass::Denied;
+            }
+        }
+        if let Some(remainder) = self
+            .skill_roots
+            .iter()
+            .find_map(|root| canonical_uri.strip_prefix(root.as_str()))
+        {
+            if canonical_uri.contains(['?', '#']) {
+                return UriClass::Denied;
+            }
+            return UriClass::Skill(remainder);
+        }
+        if names_skill_manifest(canonical_uri) {
+            return UriClass::Denied;
+        }
+        UriClass::Ordinary
+    }
+
+    /// Whether `role` may access the resource or skill file at `uri`.
+    ///
+    /// Always `true` while RBAC is disabled. Otherwise the URI is put in
+    /// canonical form (lexically unsafe URIs are denied), skill URIs need a
+    /// matching [`RoleConfig::skills`] grant, unregistered `SKILL.md`
+    /// manifests are denied, and ordinary URIs follow restrict mode.
+    pub(crate) fn resource_access(&self, role: Option<&str>, uri: &str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if self.namespace_invalid {
+            return false;
+        }
+        let Some(canonical_uri) = canonical(uri) else {
+            return false;
+        };
+        match self.classify(&canonical_uri) {
+            UriClass::Denied => false,
+            UriClass::Skill(remainder) => {
+                !remainder.is_empty()
+                    && self.resolved_role(role).is_some_and(|role_cfg| {
+                        role_cfg
+                            .skills
+                            .iter()
+                            .filter(|pattern| skill_pattern_valid(pattern))
+                            .any(|pattern| {
+                                glob_match(pattern, remainder)
+                                    || glob_match(&format!("{pattern}/*"), remainder)
+                            })
+                    })
+            }
+            UriClass::Ordinary => {
+                if !self.restrict_resources {
+                    return true;
+                }
+                self.resolved_role(role).is_some_and(|role_cfg| {
+                    role_cfg.resources.as_ref().is_none_or(|patterns| {
+                        patterns
+                            .iter()
+                            .filter(|pattern| self.resource_pattern_valid(pattern))
+                            .any(|pattern| glob_match(pattern, &canonical_uri))
+                    })
+                })
+            }
+        }
+    }
+
+    /// Whether `uri` is a SKILL URI: safe and under a registered root.
+    ///
+    /// Callers check this only while RBAC is enabled.
+    pub(crate) fn is_skill_uri(&self, uri: &str) -> bool {
+        !self.namespace_invalid
+            && canonical(uri).is_some_and(|canonical_uri| {
+                matches!(self.classify(&canonical_uri), UriClass::Skill(_))
+            })
+    }
+
+    /// Whether `role` may use skills at all.
+    pub(crate) fn skills_granted(&self, role: Option<&str>) -> bool {
+        !self.enabled
+            || (!self.namespace_invalid
+                && self
+                    .resolved_role(role)
+                    .is_some_and(|role_cfg| !role_cfg.skills.is_empty()))
+    }
+
+    /// Whether every caller, whatever its role, may access `uri`: true for
+    /// a safe ordinary URI outside restrict mode.
+    pub(crate) fn universally_allowed(&self, uri: &str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        !self.namespace_invalid
+            && !self.restrict_resources
+            && canonical(uri).is_some_and(|canonical_uri| {
+                matches!(self.classify(&canonical_uri), UriClass::Ordinary)
+            })
+    }
+
+    /// Whether a `resources` pattern is well formed (see
+    /// [`RbacConfig::validate`]); an invalid pattern never matches.
+    fn resource_pattern_valid(&self, pattern: &str) -> bool {
+        resource_pattern_problem(pattern, &self.skill_roots).is_none()
+    }
+}
+
+/// The built-in skill namespace root.
+const BUILTIN_SKILL_ROOT: &str = "skill://";
+
+/// Classification of a canonical URI by [`RbacPolicy::resource_access`].
+enum UriClass<'uri> {
+    /// Denied whatever the role.
+    Denied,
+    /// Under a skill root; carries the remainder after that root.
+    Skill(&'uri str),
+    /// An ordinary resource URI.
+    Ordinary,
+}
+
+/// Lexical canonical form of a resource URI, or `None` when it is unsafe.
+///
+/// Only the scheme is lowercased; nothing is trimmed or decoded. A URI is
+/// unsafe when the text after the scheme contains `%`, `\` or a `.`/`..`
+/// segment, when a hierarchical URI contains `//` after `scheme://`, or
+/// when there is no scheme at all.
+pub(crate) fn canonical(uri: &str) -> Option<String> {
+    if let Some((scheme, rest)) = uri.split_once("://") {
+        if !lexically_safe(rest) || rest.contains("//") {
+            return None;
+        }
+        return Some(format!("{}://{rest}", scheme.to_ascii_lowercase()));
+    }
+    let (scheme, rest) = uri.split_once(':')?;
+    if !lexically_safe(rest) {
+        return None;
+    }
+    Some(format!("{}:{rest}", scheme.to_ascii_lowercase()))
+}
+
+/// No percent-encoding, no backslash and no `.` or `..` segment.
+fn lexically_safe(text: &str) -> bool {
+    !text.contains(['%', '\\'])
+        && !text
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+}
+
+/// Lowercase the scheme (the text before the first `:`), if any.
+fn lowercase_scheme(text: &str) -> String {
+    match text.split_once(':') {
+        Some((scheme, rest)) => format!("{}:{rest}", scheme.to_ascii_lowercase()),
+        None => text.to_owned(),
+    }
+}
+
+/// Whether an ordinary canonical URI names a `SKILL.md` manifest outside
+/// every registered root (case-insensitive).
+fn names_skill_manifest(canonical_uri: &str) -> bool {
+    let cut = canonical_uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if cut.contains("://") {
+        return cut.ends_with("/skill.md");
+    }
+    let opaque = cut.split_once(':').map_or("", |(_, rest)| rest);
+    opaque == "skill.md" || opaque.ends_with("/skill.md")
+}
+
+/// Whether a `skills` pattern is well formed; an invalid one never matches.
+fn skill_pattern_valid(pattern: &str) -> bool {
+    !pattern.is_empty() && !pattern.contains("://") && !pattern.ends_with("SKILL.md")
+}
+
+/// Why a `resources` pattern is invalid against `roots` (scheme
+/// lowercased, built-in included), or `None` when it is valid.
+fn resource_pattern_problem(pattern: &str, roots: &[String]) -> Option<&'static str> {
+    if pattern.is_empty() {
+        return Some("empty resources pattern");
+    }
+    let lowered = lowercase_scheme(pattern);
+    if roots.iter().any(|root| lowered.starts_with(root.as_str())) {
+        return Some("resources pattern starts with a skill root");
+    }
+    if lowered != pattern {
+        return Some("resources pattern scheme is not lowercase");
+    }
+    None
+}
+
+/// Every invalid extra skill root, with the reason. Any entry makes the
+/// namespace invalid.
+fn root_violations(roots: &[String]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut lowered: Vec<String> = vec![BUILTIN_SKILL_ROOT.to_owned()];
+    for root in roots {
+        let problem = if root.is_empty() {
+            Some("empty skill root")
+        } else if !root.contains("://") {
+            Some("skill root has no '://'")
+        } else if !root.ends_with('/') {
+            Some("skill root does not end with '/'")
+        } else if root.contains(['?', '#']) {
+            Some("skill root contains '?' or '#'")
+        } else if canonical(root).is_none() {
+            Some("skill root is lexically unsafe")
+        } else {
+            None
+        };
+        if let Some(reason) = problem {
+            violations.push(format!("{reason}: {root:?}"));
+        }
+        let candidate = lowercase_scheme(root);
+        if lowered.iter().any(|existing| {
+            existing.starts_with(candidate.as_str()) || candidate.starts_with(existing.as_str())
+        }) {
+            violations.push(format!("skill root overlaps another root: {root:?}"));
+        }
+        lowered.push(candidate);
+    }
+    violations
+}
+
+/// Every invalid `skills` / `resources` pattern and every role that sets
+/// `resources` outside restrict mode, with the reason.
+fn grant_violations(config: &RbacConfig) -> Vec<String> {
+    let mut roots = vec![BUILTIN_SKILL_ROOT.to_owned()];
+    roots.extend(config.skill_roots.iter().map(|root| lowercase_scheme(root)));
+    let mut violations = Vec::new();
+    for role in &config.roles {
+        for pattern in role
+            .skills
+            .iter()
+            .filter(|pattern| !skill_pattern_valid(pattern))
+        {
+            violations.push(format!(
+                "role {:?}: invalid skills pattern {pattern:?} (empty, contains '://' or ends with 'SKILL.md')",
+                role.name
+            ));
+        }
+        for pattern in role.resources.iter().flatten() {
+            if let Some(reason) = resource_pattern_problem(pattern, &roots) {
+                violations.push(format!("role {:?}: {reason}: {pattern:?}", role.name));
+            }
+        }
+        if role.resources.is_some() && !config.restrict_resources {
+            violations.push(format!(
+                "role {:?}: resources is set but restrict_resources is false",
+                role.name
+            ));
+        }
+    }
+    violations
 }
 
 /// Warn about `allow` entries that contain a `*` while
@@ -2263,6 +2668,10 @@ mod tests {
             arguments: Option<Map<String, JsonValue>>,
         },
         CustomToolsCall,
+        ListSkills,
+        GetSkill,
+        ReadResourceDirectory,
+        OtherCustom(String),
         OtherRequest,
         Notification,
         Response,
@@ -2285,6 +2694,12 @@ mod tests {
                 ClientRequest::CustomRequest(custom) if custom.method == "tools/call" => {
                     RmcpOutcome::CustomToolsCall
                 }
+                ClientRequest::CustomRequest(custom) => RmcpOutcome::OtherCustom(custom.method),
+                ClientRequest::ListSkillsRequest(_) => RmcpOutcome::ListSkills,
+                ClientRequest::GetSkillRequest(_) => RmcpOutcome::GetSkill,
+                ClientRequest::ReadResourceDirectoryRequest(_) => {
+                    RmcpOutcome::ReadResourceDirectory
+                }
                 _ => RmcpOutcome::OtherRequest,
             },
             Ok(JsonRpcMessage::Notification(_)) => RmcpOutcome::Notification,
@@ -2306,6 +2721,17 @@ mod tests {
         CustomToolsCall,
         Notification,
         ToolCall(&'static str, Option<&'static str>),
+        /// A SEP-2640 request (or its custom fallback) that RBAC must not
+        /// treat as a tool call.
+        NotAToolCall(RmcpOutcomeKind),
+    }
+
+    #[derive(Clone, Copy)]
+    enum RmcpOutcomeKind {
+        ListSkills,
+        GetSkill,
+        ReadResourceDirectory,
+        OtherCustom(&'static str),
     }
 
     const DIFFERENTIAL_CORPUS: &[(&str, &str, Expected)] = &[
@@ -2395,6 +2821,28 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"denied"}}"#,
             Expected::Notification,
         ),
+        (
+            "row 18 skills/list",
+            r#"{"jsonrpc":"2.0","id":1,"method":"skills/list","params":{}}"#,
+            Expected::NotAToolCall(RmcpOutcomeKind::ListSkills),
+        ),
+        (
+            "row 19 skills/get",
+            r#"{"jsonrpc":"2.0","id":1,"method":"skills/get","params":{"uri":"skill://a/SKILL.md"}}"#,
+            Expected::NotAToolCall(RmcpOutcomeKind::GetSkill),
+        ),
+        (
+            "row 20 resources/directory/read",
+            r#"{"jsonrpc":"2.0","id":1,"method":"resources/directory/read","params":{"uri":"test://dir/"}}"#,
+            Expected::NotAToolCall(RmcpOutcomeKind::ReadResourceDirectory),
+        ),
+        // A typed-param failure falls through to `CustomRequest`, skipping
+        // rmcp's skills gate; `RbacContextHandler::on_custom_request` refuses it.
+        (
+            "row 21 malformed skills/get",
+            r#"{"jsonrpc":"2.0","id":1,"method":"skills/get","params":{"uri":7}}"#,
+            Expected::NotAToolCall(RmcpOutcomeKind::OtherCustom("skills/get")),
+        ),
     ];
 
     fn check_differential_invariant(raw: &str, outcome: RmcpOutcome) -> anyhow::Result<()> {
@@ -2427,6 +2875,16 @@ mod tests {
                     );
                 }
             }
+            RmcpOutcome::ListSkills
+            | RmcpOutcome::GetSkill
+            | RmcpOutcome::ReadResourceDirectory
+            | RmcpOutcome::OtherCustom(_) => {
+                assert_eq!(
+                    extracted,
+                    Vec::<JsonValue>::new(),
+                    "a non-tools/call request must not be inspected as a tool call: {raw}"
+                );
+            }
             RmcpOutcome::OtherRequest
             | RmcpOutcome::Notification
             | RmcpOutcome::Response
@@ -2447,6 +2905,14 @@ mod tests {
                 Expected::ToolCall(name, arguments) => RmcpOutcome::ToolCall {
                     name: name.to_owned(),
                     arguments: arguments.map(serde_json::from_str).transpose()?,
+                },
+                Expected::NotAToolCall(kind) => match kind {
+                    RmcpOutcomeKind::ListSkills => RmcpOutcome::ListSkills,
+                    RmcpOutcomeKind::GetSkill => RmcpOutcome::GetSkill,
+                    RmcpOutcomeKind::ReadResourceDirectory => RmcpOutcome::ReadResourceDirectory,
+                    RmcpOutcomeKind::OtherCustom(method) => {
+                        RmcpOutcome::OtherCustom(method.to_owned())
+                    }
                 },
             };
             // When: rmcp parses the same bytes that RBAC inspects.
@@ -3027,6 +3493,8 @@ mod tests {
                     deny: vec![],
                     hosts: vec!["*".into()],
                     argument_allowlists: vec![],
+                    skills: vec![],
+                    resources: None,
                 },
                 RoleConfig {
                     name: "deploy".into(),
@@ -3044,6 +3512,8 @@ mod tests {
                     deny: vec!["resource_delete".into(), "resource_exec".into()],
                     hosts: vec!["web-*".into(), "api-*".into()],
                     argument_allowlists: vec![],
+                    skills: vec![],
+                    resources: None,
                 },
                 RoleConfig {
                     name: "ops".into(),
@@ -3052,6 +3522,8 @@ mod tests {
                     deny: vec![],
                     hosts: vec!["*".into()],
                     argument_allowlists: vec![],
+                    skills: vec![],
+                    resources: None,
                 },
                 RoleConfig {
                     name: "restricted-exec".into(),
@@ -3072,6 +3544,8 @@ mod tests {
                         required: false,
                         deny_unknown_arguments: false,
                     }],
+                    skills: vec![],
+                    resources: None,
                 },
             ],
             redaction_salt: None,
@@ -6998,6 +7472,678 @@ mod tests {
             "error must name the offending key: {msg}"
         );
         Ok(())
+    }
+
+    // - Phase B: skills and resources RBAC (canonical, resource_access,
+    //   skills_granted, universally_allowed, validation) -
+
+    fn skill_role(name: &str, skills: &[&str]) -> RoleConfig {
+        RoleConfig::new(name, vec![], vec!["*".into()])
+            .with_skills(skills.iter().map(|pattern| (*pattern).to_owned()).collect())
+    }
+
+    fn resource_role(name: &str, resources: &[&str]) -> RoleConfig {
+        RoleConfig::new(name, vec![], vec!["*".into()]).with_resources(
+            resources
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+        )
+    }
+
+    fn roots(list: &[&str]) -> Vec<String> {
+        list.iter().map(|root| (*root).to_owned()).collect()
+    }
+
+    /// Unsafe skill URIs denied by the lexical canonical form.
+    const UNSAFE_SKILL_URIS: [&str; 9] = [
+        "skill://acme%2Fbilling/SKILL.md",
+        "skill://../x/SKILL.md",
+        "skill://./x/SKILL.md",
+        "skill://acme/../x/SKILL.md",
+        "skill://acme//x/SKILL.md",
+        "skill://a//",
+        "skill://acme/./x",
+        "skill://a\\b",
+        "noscheme",
+    ];
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::canonical_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins the lexical canonical form: safe URIs keep their text with the scheme lowercased, unsafe ones are `None`.
+    fn canonical_table() -> anyhow::Result<()> {
+        let rows: [(&str, Option<&str>); 20] = [
+            (
+                "skill://acme/billing/SKILL.md",
+                Some("skill://acme/billing/SKILL.md"),
+            ),
+            ("skill://acme/billing/", Some("skill://acme/billing/")),
+            ("file:///pub/a.txt", Some("file:///pub/a.txt")),
+            ("urn:x:y", Some("urn:x:y")),
+            (
+                "SKILL://acme/billing/SKILL.md",
+                Some("skill://acme/billing/SKILL.md"),
+            ),
+            (
+                "skill:acme/billing/SKILL.md",
+                Some("skill:acme/billing/SKILL.md"),
+            ),
+            ("skill://a?b", Some("skill://a?b")),
+            ("skill://a#b", Some("skill://a#b")),
+            ("skill://acme%2Fbilling/SKILL.md", None),
+            ("skill://../x/SKILL.md", None),
+            ("skill://./x/SKILL.md", None),
+            ("skill://acme/../x/SKILL.md", None),
+            ("skill://acme//x/SKILL.md", None),
+            ("skill://a//", None),
+            ("skill://acme/./x", None),
+            ("skill://a\\b", None),
+            ("file:///pub/../priv/b.txt", None),
+            ("file:///pub/%2e%2e/priv/b.txt", None),
+            ("file:///pub//b.txt", None),
+            ("noscheme", None),
+        ];
+        for (uri, expected) in rows {
+            assert_eq!(canonical(uri).as_deref(), expected, "canonical({uri:?})");
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::resource_access_skill_rule_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins the skill rule: subtree grants, sibling and parent denials, trailing `*`, and step 3a.
+    fn resource_access_skill_rule_table() -> anyhow::Result<()> {
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            skill_role("billing", &["acme/billing"]),
+            skill_role("acme", &["acme/*"]),
+            skill_role("all", &["*"]),
+            skill_role("none", &[]),
+        ]));
+        let mut rows: Vec<(Option<&str>, &str, bool)> = vec![
+            (Some("billing"), "skill://acme/billing/SKILL.md", true),
+            (Some("billing"), "SKILL://acme/billing/SKILL.md", true),
+            (Some("billing"), "skill://acme/billing/", true),
+            (Some("billing"), "skill://acme/billing", true),
+            (Some("billing"), "skill://acme/billing/scripts/run.sh", true),
+            (
+                Some("billing"),
+                "skill://acme/billing/nested/SKILL.md",
+                true,
+            ),
+            (Some("billing"), "skill://acme/billing-evil/SKILL.md", false),
+            (Some("billing"), "skill://acme/SKILL.md", false),
+            (Some("billing"), "skill://other/x/SKILL.md", false),
+            (Some("acme"), "skill://acme/SKILL.md", true),
+            (Some("acme"), "skill://acme/hr/SKILL.md", true),
+            (Some("acme"), "skill://other/SKILL.md", false),
+            (Some("all"), "skill://acme/billing/SKILL.md", true),
+            (Some("all"), "skill://", false),
+            (Some("all"), "skill://a?b", false),
+            (Some("all"), "skill://a#b", false),
+            (Some("all"), "skill:acme/billing/SKILL.md", false),
+            (Some("none"), "skill://acme/billing/SKILL.md", false),
+            (None, "skill://acme/billing/SKILL.md", false),
+            (Some(""), "skill://acme/billing/SKILL.md", false),
+            (Some("ghost"), "skill://acme/billing/SKILL.md", false),
+        ];
+        rows.extend(UNSAFE_SKILL_URIS.map(|uri| (Some("all"), uri, false)));
+        for (role, uri, expected) in rows {
+            assert_eq!(
+                policy.resource_access(role, uri),
+                expected,
+                "resource_access({role:?}, {uri:?})"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::resource_access_extra_root_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins the extra-root rows: grants under `file:///srv/skills/`, step 3a, and the same opaque URI as ordinary without the root.
+    fn resource_access_extra_root_table() -> anyhow::Result<()> {
+        let with_root = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![
+                skill_role("hr", &["hr"]),
+                skill_role("billing", &["acme/billing"]),
+            ])
+            .with_skill_roots(roots(&["file:///srv/skills/"])),
+        );
+        let without_root =
+            RbacPolicy::new(&RbacConfig::with_roles(vec![skill_role("hr", &["hr"])]));
+        let rows: [(&RbacPolicy, &str, &str, bool); 9] = [
+            (&with_root, "hr", "file:///srv/skills/hr/SKILL.md", true),
+            (&with_root, "hr", "file:///srv/skills/hr/x.txt", true),
+            (&with_root, "hr", "FILE:///srv/skills/hr/x.txt", true),
+            (
+                &with_root,
+                "billing",
+                "file:///srv/skills/hr/SKILL.md",
+                false,
+            ),
+            (&with_root, "billing", "file:///srv/skills/hr/x.txt", false),
+            (&with_root, "hr", "file:/srv/skills/hr/x", false),
+            (&with_root, "hr", "file:///srv/skills/hr/x?y", false),
+            (&with_root, "hr", "skill://hr/SKILL.md", true),
+            (&without_root, "hr", "file:/srv/skills/hr/x", true),
+        ];
+        for (policy, role, uri, expected) in rows {
+            assert_eq!(
+                policy.resource_access(Some(role), uri),
+                expected,
+                "resource_access({role:?}, {uri:?})"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::invalid_root_denies_everything_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that every invalid root sets `namespace_invalid` and then denies every URI and every skills grant.
+    fn invalid_root_denies_everything_table() -> anyhow::Result<()> {
+        let invalid_root_sets: [&[&str]; 11] = [
+            &["skill://acme/"],
+            &["SKILL://acme/"],
+            &["file:///srv/skills"],
+            &[""],
+            &["srv/skills/"],
+            &["file:///srv/../skills/"],
+            &["file:///srv/%2e/"],
+            &["file:///srv/skills?x/"],
+            &["file:///srv/skills#x/"],
+            &["file:///srv/", "file:///srv/skills/"],
+            &["file:///srv/skills/", "FILE:///srv/skills/"],
+        ];
+        let uris = [
+            "skill://acme/x/SKILL.md",
+            "file:///srv/skills/hr/secret.txt",
+            "file:///pub/a.txt",
+            "urn:x:y",
+        ];
+        for root_set in invalid_root_sets {
+            let policy = RbacPolicy::new(
+                &RbacConfig::with_roles(vec![skill_role("all", &["*", "acme/*", "hr"])])
+                    .with_skill_roots(roots(root_set)),
+            );
+            assert!(policy.namespace_invalid, "roots {root_set:?}");
+            assert!(!policy.skills_granted(Some("all")), "roots {root_set:?}");
+            assert!(!policy.is_skill_uri("skill://acme/x/SKILL.md"));
+            for uri in uris {
+                assert!(
+                    !policy.resource_access(Some("all"), uri),
+                    "roots {root_set:?}, uri {uri:?}"
+                );
+                assert!(
+                    !policy.universally_allowed(uri),
+                    "roots {root_set:?}, uri {uri:?}"
+                );
+            }
+        }
+        let valid = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![]).with_skill_roots(roots(&["file:///srv/skills/"])),
+        );
+        assert!(!valid.namespace_invalid);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::unregistered_skill_manifest_is_denied_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins rule 5: an unregistered `SKILL.md` manifest is denied even for a role with unrestricted resources.
+    fn unregistered_skill_manifest_is_denied_table() -> anyhow::Result<()> {
+        let open = RbacPolicy::new(&RbacConfig::with_roles(vec![skill_role("all", &["*"])]));
+        let restricted = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new("open", vec![], vec!["*".into()])])
+                .with_restrict_resources(true),
+        );
+        let uris = [
+            "file:///x/y/SKILL.md",
+            "file:///x/y/SKILL.md?a",
+            "file:///x/y/skill.md",
+            "urn:SKILL.md",
+            "urn:a/skill.md#frag",
+        ];
+        for uri in uris {
+            assert!(!open.resource_access(Some("all"), uri), "{uri:?}");
+            assert!(!open.resource_access(None, uri), "{uri:?}");
+            assert!(!restricted.resource_access(Some("open"), uri), "{uri:?}");
+        }
+        assert!(open.resource_access(Some("all"), "urn:NOTSKILL.md"));
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::resource_access_ordinary_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins ordinary URIs outside and inside restrict mode, including unresolved callers.
+    fn resource_access_ordinary_table() -> anyhow::Result<()> {
+        let unrestricted =
+            RbacPolicy::new(&RbacConfig::with_roles(vec![skill_role("viewer", &[])]));
+        let restricted = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![
+                RoleConfig::new("open", vec![], vec!["*".into()]),
+                resource_role("pub", &["file:///pub/*"]),
+                resource_role("nothing", &[]),
+            ])
+            .with_restrict_resources(true),
+        );
+        let rows: [(&RbacPolicy, Option<&str>, &str, bool); 16] = [
+            (&unrestricted, Some("viewer"), "file:///pub/a.txt", true),
+            (&unrestricted, Some("viewer"), "file:///priv/b.txt", true),
+            (&unrestricted, None, "file:///priv/b.txt", true),
+            (&unrestricted, Some(""), "file:///priv/b.txt", true),
+            (&unrestricted, Some("ghost"), "urn:x:y", true),
+            (
+                &unrestricted,
+                Some("viewer"),
+                "file:///pub/../priv/b.txt",
+                false,
+            ),
+            (&restricted, Some("open"), "file:///priv/b.txt", true),
+            (&restricted, Some("pub"), "file:///pub/a.txt", true),
+            (&restricted, Some("pub"), "FILE:///pub/a.txt", true),
+            (&restricted, Some("pub"), "file:///priv/b.txt", false),
+            (
+                &restricted,
+                Some("pub"),
+                "file:///pub/%2e%2e/priv/b.txt",
+                false,
+            ),
+            (&restricted, Some("nothing"), "file:///pub/a.txt", false),
+            (&restricted, None, "file:///pub/a.txt", false),
+            (&restricted, Some(""), "file:///pub/a.txt", false),
+            (&restricted, Some("ghost"), "file:///pub/a.txt", false),
+            (&restricted, Some("open"), "skill://acme/x/SKILL.md", false),
+        ];
+        for (policy, role, uri, expected) in rows {
+            assert_eq!(
+                policy.resource_access(role, uri),
+                expected,
+                "resource_access({role:?}, {uri:?})"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::resource_access_deletion_and_implicit_restrict_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that deleting a role never widens access in restrict mode, explicit or implicit.
+    fn resource_access_deletion_and_implicit_restrict_table() -> anyhow::Result<()> {
+        let explicit = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new("open", vec![], vec!["*".into()])])
+                .with_restrict_resources(true),
+        );
+        // A role with `resources` while the switch is off: validate rejects
+        // it, and the policy still applies restrict mode (fail closed).
+        let implicit = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("open", vec![], vec!["*".into()]),
+            resource_role("pub", &["file:///pub/*"]),
+        ]));
+        let rows: [(&RbacPolicy, &str, &str, bool); 7] = [
+            (&explicit, "analyst", "file:///pub/a.txt", false),
+            (&explicit, "analyst", "file:///priv/b.txt", false),
+            (&explicit, "open", "file:///priv/b.txt", true),
+            (&implicit, "analyst", "file:///pub/a.txt", false),
+            (&implicit, "pub", "file:///pub/a.txt", true),
+            (&implicit, "pub", "file:///priv/b.txt", false),
+            (&implicit, "open", "file:///priv/b.txt", true),
+        ];
+        for (policy, role, uri, expected) in rows {
+            assert_eq!(
+                policy.resource_access(Some(role), uri),
+                expected,
+                "resource_access({role:?}, {uri:?})"
+            );
+        }
+        assert!(!implicit.universally_allowed("file:///pub/a.txt"));
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::skills_granted_truth_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins the full `skills_granted` truth table.
+    fn skills_granted_truth_table() -> anyhow::Result<()> {
+        let roles = vec![
+            skill_role("billing", &["acme/billing"]),
+            skill_role("none", &[]),
+        ];
+        let enabled = RbacPolicy::new(&RbacConfig::with_roles(roles.clone()));
+        let mut disabled_config = RbacConfig::with_roles(roles.clone());
+        disabled_config.enabled = false;
+        let disabled = RbacPolicy::new(&disabled_config);
+        let invalid = RbacPolicy::new(
+            &RbacConfig::with_roles(roles).with_skill_roots(roots(&["skill://acme/"])),
+        );
+        let rows: [(&RbacPolicy, Option<&str>, bool); 13] = [
+            (&enabled, Some("billing"), true),
+            (&enabled, Some("none"), false),
+            (&enabled, Some("ghost"), false),
+            (&enabled, Some(""), false),
+            (&enabled, None, false),
+            (&invalid, Some("billing"), false),
+            (&invalid, None, false),
+            (&disabled, Some("billing"), true),
+            (&disabled, Some("none"), true),
+            (&disabled, None, true),
+            (&disabled, Some("ghost"), true),
+            (&RbacPolicy::disabled(), None, true),
+            (&RbacPolicy::disabled(), Some("billing"), true),
+        ];
+        for (policy, role, expected) in rows {
+            assert_eq!(
+                policy.skills_granted(role),
+                expected,
+                "skills_granted({role:?})"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::universally_allowed_truth_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins `universally_allowed`: false for skill URIs and in restrict mode, true for safe ordinary URIs otherwise.
+    fn universally_allowed_truth_table() -> anyhow::Result<()> {
+        let unrestricted = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![skill_role("all", &["*"])])
+                .with_skill_roots(roots(&["file:///srv/skills/"])),
+        );
+        let restricted = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new("open", vec![], vec!["*".into()])])
+                .with_restrict_resources(true),
+        );
+        let rows: [(&RbacPolicy, &str, bool); 11] = [
+            (&unrestricted, "file:///pub/a.txt", true),
+            (&unrestricted, "urn:x:y", true),
+            (&unrestricted, "skill://acme/x/SKILL.md", false),
+            (&unrestricted, "file:///srv/skills/hr/x.txt", false),
+            (&unrestricted, "file:/srv/skills/hr/x", false),
+            (&unrestricted, "file:///x/y/SKILL.md", false),
+            (&unrestricted, "file:///pub/../priv/b.txt", false),
+            (&unrestricted, "noscheme", false),
+            (&restricted, "file:///pub/a.txt", false),
+            (&restricted, "urn:x:y", false),
+            (&RbacPolicy::disabled(), "skill://acme/x/SKILL.md", true),
+        ];
+        for (policy, uri, expected) in rows {
+            assert_eq!(policy.universally_allowed(uri), expected, "{uri:?}");
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::disabled_policy_allows_every_uri_table keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that with RBAC disabled every check is `true`, including for unsafe URIs.
+    fn disabled_policy_allows_every_uri_table() -> anyhow::Result<()> {
+        let mut config = RbacConfig::with_roles(vec![resource_role("pub", &[])])
+            .with_restrict_resources(true)
+            .with_skill_roots(roots(&["skill://acme/"]));
+        config.enabled = false;
+        let configured = RbacPolicy::new(&config);
+        let plain = RbacPolicy::disabled();
+        let mut uris = vec![
+            "skill://acme/billing/SKILL.md",
+            "file:///pub/a.txt",
+            "file:///x/y/SKILL.md",
+            "skill://a?b",
+            "skill:acme/billing/SKILL.md",
+            "file:///pub/%2e%2e/priv/b.txt",
+        ];
+        uris.extend(UNSAFE_SKILL_URIS);
+        for policy in [&configured, &plain] {
+            for role in [None, Some(""), Some("pub"), Some("ghost")] {
+                assert!(policy.skills_granted(role), "{role:?}");
+                for uri in &uris {
+                    assert!(policy.resource_access(role, uri), "{role:?} {uri:?}");
+                    assert!(policy.universally_allowed(uri), "{uri:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins that `Default`, `with_roles` and a TOML `[rbac]` without the new keys agree on the skills/resources defaults.
+    #[test]
+    fn skills_resources_defaults_agree() -> anyhow::Result<()> {
+        let from_toml: RbacConfig = toml::from_str(
+            r#"
+            enabled = true
+            [[roles]]
+            name = "viewer"
+            allow = ["run"]
+            "#,
+        )
+        .context("config without the new keys parses")?;
+        let configs = [
+            RbacConfig::default(),
+            RbacConfig::with_roles(vec![RoleConfig::new("viewer", vec![], vec![])]),
+            from_toml,
+        ];
+        for config in &configs {
+            assert_eq!(config.skill_roots, Vec::<String>::new());
+            assert!(!config.restrict_resources);
+            for role in &config.roles {
+                assert_eq!(role.skills, Vec::<String>::new());
+                assert_eq!(role.resources, None);
+            }
+            let policy = RbacPolicy::new(config);
+            assert!(policy.is_skill_uri("skill://acme/x"));
+            assert!(!policy.is_skill_uri("file:///pub/a.txt"));
+            assert!(!policy.namespace_invalid);
+            assert!(!policy.restrict_resources);
+        }
+        Ok(())
+    }
+
+    /// Pins that `RbacConfig::validate` rejects every B-D1 violation class with `Config` and accepts a good config.
+    #[test]
+    fn validate_rejects_each_violation_class() -> anyhow::Result<()> {
+        let restricted =
+            |roles: Vec<RoleConfig>| RbacConfig::with_roles(roles).with_restrict_resources(true);
+        let with_roots =
+            |list: &[&str]| RbacConfig::with_roles(vec![]).with_skill_roots(roots(list));
+        let rows: Vec<(&str, RbacConfig)> = vec![
+            (
+                "empty skills pattern",
+                RbacConfig::with_roles(vec![skill_role("r", &[""])]),
+            ),
+            (
+                "empty resources pattern",
+                restricted(vec![resource_role("r", &[""])]),
+            ),
+            ("empty root", with_roots(&[""])),
+            ("root without ://", with_roots(&["srv/skills/"])),
+            (
+                "root without trailing /",
+                with_roots(&["file:///srv/skills"]),
+            ),
+            ("unsafe root", with_roots(&["file:///srv/../skills/"])),
+            ("root with ?", with_roots(&["file:///srv/skills?x/"])),
+            ("root with #", with_roots(&["file:///srv/skills#x/"])),
+            ("root overlaps built-in", with_roots(&["skill://acme/"])),
+            (
+                "root overlaps built-in, scheme case",
+                with_roots(&["SKILL://acme/"]),
+            ),
+            (
+                "roots overlap",
+                with_roots(&["file:///srv/", "file:///srv/skills/"]),
+            ),
+            ("duplicate roots", with_roots(&["file:///a/", "FILE:///a/"])),
+            (
+                "skills pattern with ://",
+                RbacConfig::with_roles(vec![skill_role("r", &["skill://x"])]),
+            ),
+            (
+                "skills pattern ending SKILL.md",
+                RbacConfig::with_roles(vec![skill_role("r", &["x/SKILL.md"])]),
+            ),
+            (
+                "resources pattern under built-in root",
+                restricted(vec![resource_role("r", &["skill://acme/*"])]),
+            ),
+            (
+                "resources pattern under extra root",
+                restricted(vec![resource_role("r", &["FILE:///srv/skills/*"])])
+                    .with_skill_roots(roots(&["file:///srv/skills/"])),
+            ),
+            (
+                "resources pattern scheme not lowercase",
+                restricted(vec![resource_role("r", &["FILE:///pub/*"])]),
+            ),
+            (
+                "resources without restrict_resources",
+                RbacConfig::with_roles(vec![resource_role("r", &["file:///pub/*"])]),
+            ),
+        ];
+        for (label, config) in rows {
+            let Err(RmcpServerKitError::Config(_)) = config.validate() else {
+                anyhow::bail!("{label}: validate must return Config");
+            };
+        }
+        let good = RbacConfig::with_roles(vec![
+            skill_role("analyst", &["acme/billing", "hr/*"])
+                .with_resources(vec!["file:///pub/*".into(), "urn:x:*".into()]),
+            skill_role("legacy", &[]),
+        ])
+        .with_skill_roots(roots(&["file:///srv/skills/", "https://skills.example/"]))
+        .with_restrict_resources(true);
+        good.validate().context("a good config validates")?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::invalid_skills_pattern_never_matches keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that an invalid `skills` pattern never matches in a programmatic policy.
+    fn invalid_skills_pattern_never_matches() -> anyhow::Result<()> {
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            skill_role("scheme", &["skill://x"]),
+            skill_role("manifest", &["x/SKILL.md"]),
+            skill_role("empty", &[""]),
+        ]));
+        let rows: [(&str, &str, bool); 4] = [
+            ("scheme", "skill://x/SKILL.md", false),
+            ("manifest", "skill://x/SKILL.md", false),
+            ("empty", "skill:///x/SKILL.md", false),
+            ("empty", "skill://x/SKILL.md", false),
+        ];
+        for (role, uri, expected) in rows {
+            assert_eq!(
+                policy.resource_access(Some(role), uri),
+                expected,
+                "{role} {uri}"
+            );
+        }
+        let restricted = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![resource_role("upper", &["FILE:///pub/*"])])
+                .with_restrict_resources(true),
+        );
+        assert!(!restricted.resource_access(Some("upper"), "file:///pub/a.txt"));
+        Ok(())
+    }
+
+    /// Pins that every new key parses from TOML and an unknown role key is still rejected.
+    #[test]
+    fn skills_resources_toml_keys_parse() -> anyhow::Result<()> {
+        let cfg: RbacConfig = toml::from_str(
+            r#"
+            enabled = true
+            skill_roots = ["file:///srv/skills/"]
+            restrict_resources = true
+            [[roles]]
+            name = "analyst"
+            skills = ["acme/billing"]
+            resources = ["file:///pub/*"]
+            [[roles]]
+            name = "legacy"
+            "#,
+        )
+        .context("config with the new keys parses")?;
+        assert_eq!(cfg.skill_roots, vec!["file:///srv/skills/".to_owned()]);
+        assert!(cfg.restrict_resources);
+        let [analyst, legacy] = cfg.roles.as_slice() else {
+            anyhow::bail!("expected two roles, got {:?}", cfg.roles);
+        };
+        assert_eq!(analyst.skills, vec!["acme/billing".to_owned()]);
+        assert_eq!(analyst.resources, Some(vec!["file:///pub/*".to_owned()]));
+        assert_eq!(legacy.skills, Vec::<String>::new());
+        assert_eq!(legacy.resources, None);
+        cfg.validate().context("the parsed config validates")?;
+
+        let Err(_unknown) = toml::from_str::<RbacConfig>(
+            r#"
+            enabled = true
+            [[roles]]
+            name = "analyst"
+            skill = ["acme/billing"]
+            "#,
+        ) else {
+            anyhow::bail!("an unknown role key must be rejected");
+        };
+        Ok(())
+    }
+
+    proptest! {
+        /// Any skill path with an unsafe lexical shape is denied whatever the role config.
+        #[test]
+        fn unsafe_skill_paths_are_always_denied(
+            prefix in "[a-z/.]{0,6}",
+            suffix in "[a-z/.]{0,6}",
+            shape in 0_usize..7,
+            patterns in collection::vec("[a-z/*.%]{0,6}", 0..4),
+            role_name in prop_oneof![Just("granted"), Just("ghost"), Just("")],
+            restrict in any::<bool>(),
+        ) {
+            let remainder = match shape {
+                0 => format!("{prefix}%{suffix}"),
+                1 => format!("{prefix}\\{suffix}"),
+                2 => format!("{prefix}//{suffix}"),
+                3 => format!("./{suffix}"),
+                4 => format!("../{suffix}"),
+                5 => format!("{prefix}/./{suffix}"),
+                _ => format!("{prefix}/../{suffix}"),
+            };
+            let mut skills = patterns;
+            skills.push("*".to_owned());
+            let policy = RbacPolicy::new(
+                &RbacConfig::with_roles(vec![
+                    RoleConfig::new("granted", vec!["*".into()], vec!["*".into()])
+                        .with_skills(skills),
+                ])
+                .with_restrict_resources(restrict),
+            );
+            let uri = format!("skill://{remainder}");
+            prop_assert!(!policy.resource_access(Some(role_name), &uri));
+        }
     }
 
     fn evaluator_policy(strict: bool) -> RbacPolicy {
