@@ -13,6 +13,18 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- `rmcp` moved from 3.6.0 to 3.11.0. Its `ServerHandler` gained `list_skills`,
+  `get_skill` (SEP-2640 skills) and `read_resource_directory`; `HookedHandler`
+  forwards all three unchanged, and `RbacContextHandler` runs them inside the
+  RBAC identity scope like `list_resources` / `read_resource`, so an inner
+  handler's overrides are no longer shadowed by rmcp's `method_not_found`
+  defaults. Upstream, the `complete`, `list_prompts`, `list_resources`,
+  `list_resource_templates` and `list_tools` defaults now answer
+  method-not-found when the matching capability is not advertised.
+- MSRV raised from Rust 1.99.0 to 1.100.0 (`rust-version`, the GitHub and GitLab
+  MSRV jobs, the GitLab `CI_IMAGE` tag `rust-1.100.0`, and the docs). Consumers on
+  1.99 must upgrade their toolchain; `rust:rust-1.100.0` must exist in the
+  private rust-ci-images registry before the GitLab pipeline runs.
 - CI only: the nightly `mutants-oauth` jobs (GitHub and GitLab) raise the
   per-test-run timeout from 360 s to 600 s and run 8 shards instead of 4. The
   oauth-feature suite takes about 250 s on a healthy runner, and on 22 October

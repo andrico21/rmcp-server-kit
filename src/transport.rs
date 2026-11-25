@@ -2561,8 +2561,7 @@ where
             let challenge = auth_config
                 .oauth
                 .as_ref()
-                .map(ChallengeConfig::from_oauth)
-                .unwrap_or_default();
+                .map_or_default(ChallengeConfig::from_oauth);
             #[cfg(not(feature = "oauth"))]
             let challenge = ChallengeConfig::default();
 
@@ -3234,10 +3233,6 @@ impl Drop for CancelOnDrop {
 /// Forwards an externally-supplied shutdown token into the server-internal one.
 ///
 /// Returns the task handle so the wiring can be exercised directly in tests.
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 fn spawn_external_shutdown_bridge(
     external: CancellationToken,
     internal: CancellationToken,
@@ -3467,10 +3462,6 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
     clippy::too_many_arguments,
     clippy::cognitive_complexity,
     reason = "server start-up threads TLS, reload state, and graceful shutdown through one flow"
-)]
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
 )]
 // NOT cancel-safe: external cancellation is modeled by `ct`. Dropping/aborting
 // can skip `session_ct.cancel()` and leave the spawned shutdown trigger or CRL
@@ -4540,10 +4531,6 @@ async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
 /// Wait for SIGINT (ctrl-c) or SIGTERM (container stop).
 ///
 /// On non-Unix platforms, only SIGINT is handled.
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 // cancel-safe: signal-listener futures are cancel-safe per tokio docs and no
 // partial state is carried across the select.
 async fn shutdown_signal() {
@@ -6222,7 +6209,7 @@ mod tests {
 
     impl CapturedLogs {
         fn contents(&self) -> String {
-            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let bytes = self.0.lock().map_or_default(|guard| guard.clone());
             String::from_utf8(bytes).unwrap_or_default()
         }
 
@@ -7041,13 +7028,11 @@ mod tests {
             let ci = req
                 .extensions()
                 .get::<ConnectInfo<SocketAddr>>()
-                .map(|info| info.0.to_string())
-                .unwrap_or_default();
+                .map_or_default(|info| info.0.to_string());
             let pa = req
                 .extensions()
                 .get::<PeerAddr>()
-                .map(|peer| peer.addr.to_string())
-                .unwrap_or_default();
+                .map_or_default(|peer| peer.addr.to_string());
             format!("{ci}|{pa}")
         }
         axum::Router::new()
@@ -8087,13 +8072,11 @@ mod tests {
             let peer_ip = req
                 .extensions()
                 .get::<PeerAddr>()
-                .map(|peer| peer.addr.ip().to_string())
-                .unwrap_or_default();
+                .map_or_default(|peer| peer.addr.ip().to_string());
             let client_ip = req
                 .extensions()
                 .get::<ClientIp>()
-                .map(|client| client.ip.to_string())
-                .unwrap_or_default();
+                .map_or_default(|client| client.ip.to_string());
             format!("{peer_ip}|{client_ip}")
         }
         use axum::{middleware::from_fn, routing::get};
@@ -8108,9 +8091,7 @@ mod tests {
 
     fn request_id_probe_router(resolver: Option<Arc<ForwardResolver>>) -> axum::Router {
         async fn probe(req: Request<Body>) -> String {
-            request_id_for_log(req.extensions())
-                .map(|id| id.to_string())
-                .unwrap_or_default()
+            request_id_for_log(req.extensions()).map_or_default(|id| id.to_string())
         }
         use axum::{middleware::from_fn, routing::get};
 

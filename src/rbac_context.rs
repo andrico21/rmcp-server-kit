@@ -25,12 +25,13 @@ use rmcp::{
         CacheScope, CallToolRequestParams, CallToolResponse, CancelTaskParams,
         CancelledNotificationParam, CompleteRequestParams, CompleteResult, CustomNotification,
         CustomRequest, CustomResult, DiscoverResult, Extensions, GetPromptRequestParams,
-        GetPromptResponse, GetTaskParams, GetTaskResult, InitializeRequestParams, InitializeResult,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-        PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ServerConfig, SetLevelRequestParams,
-        SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
-        UpdateTaskParams,
+        GetPromptResponse, GetSkillRequestParams, GetSkillResult, GetTaskParams, GetTaskResult,
+        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListSkillsResult, ListToolsResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProtocolVersion, ReadResourceDirectoryRequestParams,
+        ReadResourceDirectoryResult, ReadResourceRequestParams, ReadResourceResponse, ServerConfig,
+        SetLevelRequestParams, SubscribeRequestParams, SubscriptionFilter, Tool,
+        UnsubscribeRequestParams, UpdateTaskParams,
     },
     service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext},
 };
@@ -295,6 +296,20 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         ReadResourceRequestParams,
         ReadResourceResponse
     );
+    // SEP-2640 skills and directory reads are resource reads: the inner
+    // handler may decide visibility from `current_identity()`, so they run
+    // inside the identity scope like `list_resources` / `read_resource`.
+    delegate_request!(
+        read_resource_directory,
+        ReadResourceDirectoryRequestParams,
+        ReadResourceDirectoryResult
+    );
+    delegate_request!(
+        list_skills,
+        Option<PaginatedRequestParams>,
+        ListSkillsResult
+    );
+    delegate_request!(get_skill, GetSkillRequestParams, GetSkillResult);
 
     fn accepted_subscription_filter(
         &self,
@@ -484,10 +499,11 @@ mod tests {
             ArgumentInfo, CallToolRequest, CancelTaskRequest, CancelledNotification,
             ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest,
             CompleteRequest, CreateTaskResult, DetailedTask, DiscoverRequest,
-            DiscoverRequestParams, ErrorCode, GetExtensions as _, GetTaskRequest, Implementation,
-            InitializeRequest, InputResponses, JsonObject, JsonRpcMessage, ListPromptsRequest,
-            ListToolsRequest, ListToolsRequestMethod, NotificationNoParam, NumberOrString,
-            PingRequest, Prompt, PromptReference, Reference, RequestMetaObject, ServerCapabilities,
+            DiscoverRequestParams, ErrorCode, GetExtensions as _, GetSkillRequest, GetTaskRequest,
+            Implementation, InitializeRequest, InputResponses, JsonObject, JsonRpcMessage,
+            ListPromptsRequest, ListSkillsRequest, ListToolsRequest, ListToolsRequestMethod,
+            NotificationNoParam, NumberOrString, PingRequest, Prompt, PromptReference,
+            ReadResourceDirectoryRequest, Reference, RequestMetaObject, ServerCapabilities,
             ServerJsonRpcMessage, ServerNotification, ServerResult, SubscriptionsListenRequest,
             SubscriptionsListenRequestParams, Task, TaskPayload, TaskStatus,
             TaskStatusNotification, TaskStatusNotificationParams, UpdateTaskRequest,
@@ -914,10 +930,7 @@ mod tests {
 
     impl TaskProbeHandler {
         fn seen(&self) -> Vec<String> {
-            self.seen
-                .lock()
-                .map(|stored| stored.clone())
-                .unwrap_or_default()
+            self.seen.lock().map_or_default(|stored| stored.clone())
         }
     }
 
@@ -1518,6 +1531,7 @@ mod tests {
             .enable_tools()
             .enable_tool_list_changed()
             .enable_tasks()
+            .enable_skills_with_directory_read()
             .build()
     }
 
@@ -1558,17 +1572,11 @@ mod tests {
         }
 
         fn seen(&self) -> Vec<(&'static str, Option<String>)> {
-            self.seen
-                .lock()
-                .map(|seen| seen.clone())
-                .unwrap_or_default()
+            self.seen.lock().map_or_default(|seen| seen.clone())
         }
 
         fn task_ids(&self) -> Vec<String> {
-            self.task_ids
-                .lock()
-                .map(|ids| ids.clone())
-                .unwrap_or_default()
+            self.task_ids.lock().map_or_default(|ids| ids.clone())
         }
 
         async fn wait_for_seen_count(&self, count: usize) -> anyhow::Result<()> {
@@ -1658,6 +1666,42 @@ mod tests {
             )]))
         }
 
+        async fn list_skills(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListSkillsResult, ErrorData> {
+            self.record("list_skills");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:list_skills",
+                None,
+            ))
+        }
+
+        async fn get_skill(
+            &self,
+            _request: GetSkillRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetSkillResult, ErrorData> {
+            self.record("get_skill");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:get_skill",
+                None,
+            ))
+        }
+
+        async fn read_resource_directory(
+            &self,
+            _request: ReadResourceDirectoryRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+            self.record("read_resource_directory");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:read_resource_directory",
+                None,
+            ))
+        }
+
         async fn on_cancelled(
             &self,
             _notification: CancelledNotificationParam,
@@ -1722,7 +1766,7 @@ mod tests {
     ///
     /// Parsed by `tests/integration/delegation_guard.rs`, which asserts this table covers
     /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification -
-    /// so a method cannot be added or reclassified without a driver. The nine
+    /// so a method cannot be added or reclassified without a driver. The twelve
     /// methods attributed to the macro-body drivers are each discharged by that
     /// driver plus the guard's macro-origin pin.
     const SEMANTIC_DRIVERS: &[(&str, &str)] = &[
@@ -1774,6 +1818,12 @@ mod tests {
             "read_resource",
             "rbac_context_handler_forwards_macro_request_plain_arm",
         ),
+        (
+            "read_resource_directory",
+            "rbac_context_handler_forwards_skill_methods",
+        ),
+        ("list_skills", "rbac_context_handler_forwards_skill_methods"),
+        ("get_skill", "rbac_context_handler_forwards_skill_methods"),
         (
             "accepted_subscription_filter",
             "task_status_notifications_remain_unroutable_until_binding_is_added",
@@ -2090,12 +2140,11 @@ mod tests {
         assert_eq!(error.message, "forwarding-probe:complete");
         assert_eq!(probe.seen(), vec![("complete", Some("viewer".to_owned()))]);
 
-        // The default answers `Ok`, so the sentinel error cannot come from it.
-        let default_response = expect_response(frame_for(&control_outbound, 1)?)?;
-        let ServerResult::CompleteResult(completed) = default_response else {
-            anyhow::bail!("expected a completion result, got {default_response:?}")
-        };
-        assert_eq!(completed.completion.values, Vec::<String>::new());
+        // Since rmcp 3.11 the default gates on the `completions` capability,
+        // which `PassthroughDefaults` does not advertise: it answers
+        // method-not-found, never the sentinel.
+        let default_error = expect_error(frame_for(&control_outbound, 1)?)?;
+        assert_eq!(default_error.code, ErrorCode::METHOD_NOT_FOUND);
         Ok(())
     }
 
@@ -2136,12 +2185,56 @@ mod tests {
             vec![("list_prompts", Some("viewer".to_owned()))]
         );
 
-        // The default returns an empty page.
-        let option_default_response = expect_response(frame_for(&control_outbound, 1)?)?;
-        let ServerResult::ListPromptsResult(default_listed) = option_default_response else {
-            anyhow::bail!("expected a prompts/list result, got {option_default_response:?}")
-        };
-        assert_eq!(default_listed.prompts, Vec::new());
+        // Since rmcp 3.11 the default gates on the `prompts` capability, which
+        // `PassthroughDefaults` does not advertise: it answers method-not-found.
+        let option_default_error = expect_error(frame_for(&control_outbound, 1)?)?;
+        assert_eq!(option_default_error.code, ErrorCode::METHOD_NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that the SEP-2640 skill methods forward inside the identity scope.
+    async fn rbac_context_handler_forwards_skill_methods() -> anyhow::Result<()> {
+        // Mechanism 1 (ambient-silent probe): each run drives one request, so
+        // the expected log is exactly that method, observed with the role.
+        type SkillCase = (&'static str, &'static str, fn() -> ClientRequest);
+        let cases: [SkillCase; 3] = [
+            ("list_skills", "forwarding-probe:list_skills", || {
+                ClientRequest::ListSkillsRequest(ListSkillsRequest::with_param(
+                    PaginatedRequestParams::default(),
+                ))
+            }),
+            ("get_skill", "forwarding-probe:get_skill", || {
+                ClientRequest::GetSkillRequest(GetSkillRequest::new(GetSkillRequestParams::new(
+                    "skill://sentinel/SKILL.md",
+                )))
+            }),
+            (
+                "read_resource_directory",
+                "forwarding-probe:read_resource_directory",
+                || {
+                    ClientRequest::ReadResourceDirectoryRequest(ReadResourceDirectoryRequest::new(
+                        ReadResourceDirectoryRequestParams::new("test://sentinel-directory/"),
+                    ))
+                },
+            ),
+        ];
+        for (method, sentinel, build) in cases {
+            let (outbound, probe, control_outbound) = forward_once(
+                || {
+                    let mut message = request_message(build(), 1);
+                    attach_identity(&mut message, viewer())?;
+                    Ok(message)
+                },
+                None,
+            )
+            .await?;
+            let error = expect_error(frame_for(&outbound, 1)?)?;
+            assert_eq!(error.message, sentinel);
+            assert_eq!(probe.seen(), vec![(method, Some("viewer".to_owned()))]);
+            let default_error = expect_error(frame_for(&control_outbound, 1)?)?;
+            assert_eq!(default_error.code, ErrorCode::METHOD_NOT_FOUND);
+        }
         Ok(())
     }
 

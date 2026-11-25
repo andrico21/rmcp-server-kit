@@ -199,8 +199,7 @@ pub(super) fn check_layout(section: &str, cases: &[Case]) -> anyhow::Result<()> 
             .first_line
             .iter()
             .find(|(name, _)| name == heading)
-            .map(|(_, line)| line.as_str())
-            .unwrap_or_default();
+            .map_or_default(|(_, line)| line.as_str());
         let proxy = is_proxy(&toml::Value::Table(toml::from_str::<toml::Table>(
             &case.toml,
         )?));

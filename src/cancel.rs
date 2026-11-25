@@ -178,10 +178,6 @@ pub enum DetachOutcome<T> {
 /// paths run; nothing else will help it clean up.
 #[must_use = "DetachOutcome must be inspected to distinguish completion from cancel/timeout/panic"]
 #[inline]
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 // cancel-safe: under composition, the inner future is moved into a
 // `tokio::spawn` before we await anything, so the cancel/timeout arms can
 // only ever drop the `JoinHandle` (a no-op for the task) - never the inner

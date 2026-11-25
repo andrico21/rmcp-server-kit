@@ -240,10 +240,6 @@ mod tests {
             RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         }
 
-        #[expect(
-            clippy::integer_division_remainder_used,
-            reason = "external macro: tokio::select"
-        )]
         async fn call_tool(
             &self,
             request: CallToolRequestParams,

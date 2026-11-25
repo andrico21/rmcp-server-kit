@@ -48,7 +48,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` - `src/transport.rs:3285`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:5916`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` - `src/transport.rs:5903`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -108,7 +108,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `build_app_router` (`src/transport.rs:2399`) and in each module.
 
 ```
-TCP / TLS handshake                         `TlsListener` src/transport.rs:3973
+TCP / TLS handshake                         `TlsListener` src/transport.rs:4006
    │  - Handshakes run CONCURRENTLY on a background acceptor task
 │    (`run_tls_acceptor`, src/transport.rs:4106): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -119,11 +119,11 @@ TCP / TLS handshake                         `TlsListener` src/transport.rs:3973
    ▼
 axum Router                                  src/transport.rs:2399  (build_app_router)
    │
-├── 0. Security headers                   `security_headers_middleware` src/transport.rs:4732
+├── 0. Security headers                   `security_headers_middleware` src/transport.rs:4719
    │      Outermost response-only decoration: HSTS, CSP,
    │      X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
-├── 1. Origin check                       `origin_check_middleware` src/transport.rs:5556
+├── 1. Origin check                       `origin_check_middleware` src/transport.rs:5543
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
    ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
@@ -461,7 +461,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:3973`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:4006`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -787,7 +787,7 @@ pub trait ToolHooks: Send + Sync + 'static {
 ```
 
 `HookedHandler<H>` implements `rmcp::ServerHandler` for any inner `H: ServerHandler`,
-delegating every method while intercepting `call_tool` (`src/tool_hooks.rs:681`):
+delegating every method while intercepting `call_tool` (`src/tool_hooks.rs:715`):
 1. Captures current identity from task-locals.
 2. Calls `before_call` - may rewrite args, may return early with an error.
 3. Calls inner handler.
@@ -1032,7 +1032,7 @@ Examples worth reading:
 jobs: `fmt` (pinned `nightly-2026-10-03`), `clippy`, `test` (Linux/macOS/Windows
 + doctests), the five-row feature matrix, `cargo-semver-checks`, `cargo-deny`,
 `cargo-audit`, `cargo-vet`, `taplo`, `cargo-machete`, `Rustdoc` (pinned nightly
-with `--cfg docsrs`), `Rustdoc (stable)`, `MSRV (1.99.0)` (lint-capped),
+with `--cfg docsrs`), `Rustdoc (stable)`, `MSRV (1.100.0)` (lint-capped),
 `Memory bounds`, `Validate docs (citations + links)`, the `lint-ratchet`
 self-tests, and the five permanent lint gates. `cargo-geiger` and the nightly
 `Rustdoc (latest nightly canary)` run informational; `cargo-mutants` is
@@ -1088,7 +1088,7 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
 Wired in `build_app_router` (`src/transport.rs:2399`);
-`origin_check_middleware` is at `src/transport.rs:5556`.
+`origin_check_middleware` is at `src/transport.rs:5543`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
    to evaluate. `build_app_router` installs the auth layer before the RBAC

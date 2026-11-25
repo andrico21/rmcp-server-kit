@@ -4329,10 +4329,6 @@ impl JwksCache {
     }
 }
 
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 /// Run one detached refresh until upstream completion or cache shutdown.
 // cancel-safe: the refresh task owns this future; cancellation is driven only by the cache shutdown token branch.
 async fn run_detached_refresh(shared: Arc<JwksCacheShared>) -> RefreshResult {
@@ -4345,10 +4341,6 @@ async fn run_detached_refresh(shared: Arc<JwksCacheShared>) -> RefreshResult {
     }
 }
 
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 /// Wait for a refresh generation to publish or for cache shutdown.
 // cancel-safe: waits only on watch notification or shutdown cancellation; dropping this waiter does not affect the detached refresh task.
 async fn wait_for_refresh_generation(
@@ -5793,10 +5785,6 @@ pub async fn exchange_token_with_cancel(
 }
 
 /// Await the detached exchange result under cancellation and the optional timeout.
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 // cancel-safe: awaits the detached receiver; on cancel/timeout the spawned task audits an eventual success.
 async fn receive_exchange_result_with_cancel(
     rx: oneshot::Receiver<Result<ExchangedToken, RmcpServerKitError>>,
@@ -11817,7 +11805,7 @@ role = "admin"
 
     impl CapturedLogs {
         fn contents(&self) -> String {
-            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let bytes = self.0.lock().map_or_default(|guard| guard.clone());
             String::from_utf8(bytes).unwrap_or_default()
         }
     }

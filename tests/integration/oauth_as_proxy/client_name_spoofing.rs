@@ -733,14 +733,8 @@ impl UriShape {
 
     /// The clean URI, `extra` bytes short of the shape's total size when it has one.
     fn clean(&self, extra: usize) -> String {
-        let query = self
-            .query
-            .map(|query| format!("?{query}"))
-            .unwrap_or_default();
-        let fragment = self
-            .fragment
-            .map(|frag| format!("#{frag}"))
-            .unwrap_or_default();
+        let query = self.query.map_or_default(|query| format!("?{query}"));
+        let fragment = self.fragment.map_or_default(|frag| format!("#{frag}"));
         [self.authority, &self.path_with(extra), &query, &fragment].concat()
     }
 

@@ -1375,8 +1375,8 @@ pub(crate) async fn rbac_middleware(
 
     // Extract caller identity and role (may be absent when auth is off).
     let identity = req.extensions().get::<AuthIdentity>();
-    let identity_name = identity.map(|id| id.name.clone()).unwrap_or_default();
-    let role = identity.map(|id| id.role.clone()).unwrap_or_default();
+    let identity_name = identity.map_or_default(|id| id.name.clone());
+    let role = identity.map_or_default(|id| id.role.clone());
     // Clone the SecretString end-to-end; an absent token becomes an empty
     // SecretString sentinel (current_token() filters this out as None).
     let raw_token: SecretString = identity
@@ -2243,7 +2243,7 @@ mod tests {
     use anyhow::Context as _;
     #[cfg(feature = "metrics")]
     use axum::extract::ConnectInfo;
-    use axum::{Router, http::header::RETRY_AFTER, middleware, routing};
+    use axum::{Router, http::header, middleware, routing};
     use proptest::{collection, prelude::*};
     use serde_json::{Map, Number, Value as JsonValue};
     use tower::ServiceExt as _;
@@ -2625,7 +2625,7 @@ mod tests {
 
     impl CapturedLogs {
         fn contents(&self) -> String {
-            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let bytes = self.0.lock().map_or_default(|guard| guard.clone());
             String::from_utf8(bytes).unwrap_or_default()
         }
     }
@@ -2977,7 +2977,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
-            .get(RETRY_AFTER)
+            .get(header::RETRY_AFTER)
             .context("Retry-After present")?
             .to_str()
             .context("unexpected value")?
@@ -3006,7 +3006,7 @@ mod tests {
             .context("unseen key must be rejected at capacity")?;
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(resp.headers().get(RETRY_AFTER).is_none());
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
         Ok(())
     }
 
