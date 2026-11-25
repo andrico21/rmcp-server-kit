@@ -139,6 +139,49 @@ enabling it changes the wire format of `taskId` values.
   `task_status_notifications_remain_unroutable_until_binding_is_added` fails
   when that upstream change lands.
 
+## Skills and resources under RBAC
+
+A skills catalogue exposes descriptions, frontmatter, file names, digests and
+resource URIs, and resources expose their contents. The core RBAC middleware
+authorizes only `tools/call`, so `RbacContextHandler` enforces skills and
+resource access per role at the typed handler boundary, where it sees rmcp's
+parsed params (no second JSON parser). Trust model:
+
+- **Skills are denied unless the role has `RoleConfig::skills`.** A missing,
+  empty or unknown role gets none. Ordinary resources are unrestricted unless
+  `RbacConfig::restrict_resources` is on (or any role sets `resources`); in
+  restrict mode an unresolved role is denied, and deleting a role never widens
+  access.
+- A denied resource answers the same fixed resource-not-found error as a missing
+  one, and a denied skill the same "unknown skill" error, without calling the
+  consumer. A read whose result contains any denied URI is refused whole.
+  Filtered and gated results are `Private` cache scope.
+- **Canonical-string contract.** The kit authorizes the exact string it receives,
+  with only the scheme lowercased, and denies URIs that are not lexically safe
+  (`%`, `\`, `.`/`..` segments, `//` after `scheme://`, no scheme). A consumer
+  MUST resolve that same string: trimming, percent-decoding, path
+  normalization or case-folding before resolving can serve a resource other
+  than the one that was authorized. The same applies to every URI in a result.
+- Call `RbacConfig::validate()` at startup. An invalid root makes the policy deny
+  every resource and skill; an invalid pattern never matches.
+- Register every skill namespace in `skill_roots` and do not serve protected
+  skill files through unregistered aliases. Nested skills inherit their parent's
+  grant.
+
+Limits, by design:
+
+- `resources/templates/list` (names, descriptions, metadata) and
+  `completion/complete` (can disclose concrete identifiers and counts) are not
+  gated; the existence-oracle guarantee covers only the gated methods.
+- A policy reload governs admission and every later request. It does not revoke
+  an established subscription, a legacy subscription the consumer holds, or a
+  response a client already cached.
+- Under RBAC, `subscriptions/listen` never delivers skill-URI updates, and in
+  restrict mode no resource-URI updates. Legacy `resources/subscribe` is gated
+  per role. The consumer never sees a role-dependent URI in
+  `accepted_subscription_filter`, so its answer cannot reveal a denied resource.
+- `global_deny` still applies to tools only.
+
 ## Argon2id verification admission control
 
 Every bearer-token attempt runs one Argon2id verification per configured

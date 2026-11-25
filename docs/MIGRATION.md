@@ -3,6 +3,54 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to the rmcp 3.11 release: default method-not-found and skills
+
+- rmcp 3.11 (rust-sdk #1446): if your handler does not override `complete`,
+  `list_prompts`, `list_resources`, `list_resource_templates` or `list_tools`,
+  the inherited default now answers `-32601` unless `get_info` advertises the
+  matching capability (`completions`, `prompts`, `resources`, `tools`). Before,
+  it answered with an empty result. Advertise the capability, or override the
+  method, if clients relied on the empty answer.
+- Skills (SEP-2640) and resources under RBAC. With RBAC disabled nothing
+  changes: `skills/list`, `skills/get`, `resources/directory/read` and every
+  resource method reach your handler unchanged. With RBAC enabled, skills are
+  **denied unless the role has `skills`** (`-32601` for `skills/list` and
+  `skills/get`), and ordinary resources stay unrestricted unless restrict mode
+  is on. A deployment that enables RBAC and serves skills must opt in:
+  - **Opt a role into skills.** Add `skills = ["acme/billing"]` (or `["*"]`) to
+    the role: `RoleConfig::with_skills(vec![...])`. Patterns are glob-matched
+    over the skill path (the part after the root) and grant the directory, its
+    `SKILL.md`, every file below it and nested skills.
+  - **Register roots.** `skill://` is built in. For skills served under another
+    scheme, set `skill_roots = ["file:///srv/skills/"]`
+    (`RbacConfig::with_skill_roots`). A root contains `://`, ends in `/` and
+    must not overlap another root. Unregistered `SKILL.md` manifests are denied.
+  - **Turn on restrict mode (optional).** `restrict_resources = true`
+    (`RbacConfig::with_restrict_resources(true)`) applies each role's
+    `resources` globs to ordinary resources, leaves a role with no `resources`
+    unrestricted, and denies callers without a configured role. Setting
+    `resources` on any role without `restrict_resources = true` is rejected by
+    `validate`.
+  - **Call `RbacConfig::validate()` at startup.** `RbacPolicy::new` only warns,
+    and an invalid root then denies every resource and skill.
+  - **Custom fallback.** With RBAC enabled, `on_custom_request` no longer
+    forwards the nine names `skills/list`, `skills/get`,
+    `resources/directory/read`, `resources/read`, `resources/list`,
+    `resources/templates/list`, `resources/subscribe`, `resources/unsubscribe`
+    and `subscriptions/listen`: they answer `-32601`. If your consumer handled
+    one of them as a custom request, implement the typed method instead.
+  - **Directory reads.** An earlier iteration of this change rejected every
+    directory read under RBAC. Now ordinary directories are forwarded (with
+    entries filtered per role); a skill directory needs the role's grant. A
+    denied directory is resource-not-found, not `-32601`.
+  - **`listen` reduction.** Under RBAC `subscriptions/listen` delivers no
+    skill-URI updates, and in restrict mode no resource-URI updates. Legacy
+    `resources/subscribe` is gated per role. Resolve the exact URI string you
+    receive in your handlers.
+  - Filtered and gated results now carry `cache_scope = Private`.
+  See [Skills extension (SEP-2640)](GUIDE.md#skills-extension-sep-2640) and
+  [Skills and resources](GUIDE.md#skills-and-resources).
+
 ## Migrating to 3.21.1: no CORS at the OAuth navigation endpoints
 
 **No action required** for integrations that already navigate to the

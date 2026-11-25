@@ -106,15 +106,17 @@ mod tests {
     /// task ID to bind.
     const RBAC_CONTEXT_HANDLER_DIRECTLY_DELEGATED: &[&str] = &[
         "supported_protocol_versions",
-        "accepted_subscription_filter",
         "get_tool",
         "get_info",
         "negotiate_initialize",
     ];
 
     /// Everything else scopes the request/notification identity, binds task IDs
-    /// (`get_task` / `update_task` / `cancel_task`), or filters tool lists.
+    /// (`get_task` / `update_task` / `cancel_task`), filters tool lists, or
+    /// enforces per-role skills/resources access (including the subscription
+    /// filter sanitization in `accepted_subscription_filter`).
     const RBAC_CONTEXT_HANDLER_BEHAVIORAL_WRAPPED: &[&str] = &[
+        "accepted_subscription_filter",
         "ping",
         "initialize",
         "discover",
@@ -168,8 +170,8 @@ mod tests {
     /// Methods the `HookedHandler` impl defines (all literal `fn` declarations).
     const HOOKED_HANDLER_IMPL_METHOD_COUNT: usize = 32;
 
-    /// Methods the `RbacContextHandler` impl defines: 17 literal `fn` declarations
-    /// plus 15 `delegate_request!` / `delegate_notification!` invocations.
+    /// Methods the `RbacContextHandler` impl defines: 24 literal `fn` declarations
+    /// plus 8 `delegate_request!` / `delegate_notification!` invocations.
     const RBAC_CONTEXT_HANDLER_IMPL_METHOD_COUNT: usize = 32;
 
     /// Pins that `HookedHandler`'s classification matches rmcp's `ServerHandler` surface and impl.
@@ -735,28 +737,16 @@ mod tests {
         DelegateNotification,
     }
 
-    /// Origin pins for the fifteen macro-generated `RbacContextHandler` methods:
-    /// twelve discharged by the three macro-body drivers, plus the three SEP-2640
-    /// skill methods, whose driver proves forwarding and identity scoping but
-    /// relies on the macro for the scope's shape. If one of these becomes a
+    /// Origin pins for the eight macro-generated `RbacContextHandler` methods
+    /// discharged by the three macro-body drivers. If one of these becomes a
     /// literal `fn`, the macro-body argument no longer covers it, so this gate
     /// fails until the method gains its own semantic driver.
     const RBAC_CONTEXT_HANDLER_MACRO_ORIGINS: &[(&str, MethodOrigin)] = &[
         ("complete", MethodOrigin::DelegateRequestPlainArm),
         ("set_level", MethodOrigin::DelegateRequestPlainArm),
         ("get_prompt", MethodOrigin::DelegateRequestPlainArm),
-        ("read_resource", MethodOrigin::DelegateRequestPlainArm),
-        ("subscribe", MethodOrigin::DelegateRequestPlainArm),
         ("unsubscribe", MethodOrigin::DelegateRequestPlainArm),
-        ("on_custom_request", MethodOrigin::DelegateRequestPlainArm),
-        (
-            "read_resource_directory",
-            MethodOrigin::DelegateRequestPlainArm,
-        ),
-        ("get_skill", MethodOrigin::DelegateRequestPlainArm),
-        ("list_skills", MethodOrigin::DelegateRequestOptionArm),
         ("list_prompts", MethodOrigin::DelegateRequestOptionArm),
-        ("list_resources", MethodOrigin::DelegateRequestOptionArm),
         (
             "list_resource_templates",
             MethodOrigin::DelegateRequestOptionArm,

@@ -1040,12 +1040,15 @@ mod tests {
     use anyhow::Context as _;
     use rmcp::{
         model::{
-            ClientCapabilities, CompletionInfo, DetailedTask, GetPromptResult, Implementation,
-            JsonObject, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContents,
-            ResourceTemplate, Role, ServerCapabilities, Task, TaskPayload, TaskStatus,
+            ClientCapabilities, CompletionInfo, DetailedTask, GetPromptResult,
+            GetSkillRequestMethod, Implementation, JsonObject, ListSkillsRequestMethod, Prompt,
+            PromptMessage, ReadResourceDirectoryRequestMethod, ReadResourceResult, Resource,
+            ResourceContents, ResourceTemplate, Role, ServerCapabilities, Skill, SkillFrontmatter,
+            SkillResources, Task, TaskPayload, TaskStatus,
         },
         service::{RunningService, serve_directly},
     };
+    use serde::de::DeserializeOwned;
     use serde_json::json;
     use tokio::{
         io::{
@@ -1303,7 +1306,6 @@ mod tests {
             .enable_tools()
             .enable_tool_list_changed()
             .enable_tasks()
-            .enable_skills_with_directory_read()
             .build()
     }
 
@@ -1531,42 +1533,6 @@ mod tests {
                 "test://sentinel-resource",
             )])
             .into())
-        }
-
-        async fn list_skills(
-            &self,
-            _request: Option<PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<ListSkillsResult, ErrorData> {
-            self.record("list_skills");
-            Err(ErrorData::invalid_request(
-                "forwarding-probe:list_skills",
-                None,
-            ))
-        }
-
-        async fn get_skill(
-            &self,
-            _request: GetSkillRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<GetSkillResult, ErrorData> {
-            self.record("get_skill");
-            Err(ErrorData::invalid_request(
-                "forwarding-probe:get_skill",
-                None,
-            ))
-        }
-
-        async fn read_resource_directory(
-            &self,
-            _request: ReadResourceDirectoryRequestParams,
-            _context: RequestContext<RoleServer>,
-        ) -> Result<ReadResourceDirectoryResult, ErrorData> {
-            self.record("read_resource_directory");
-            Err(ErrorData::invalid_request(
-                "forwarding-probe:read_resource_directory",
-                None,
-            ))
         }
 
         fn accepted_subscription_filter(
@@ -2005,11 +1971,11 @@ mod tests {
             "read_resource",
             "hooked_handler_forwards_prompt_and_resource_reads",
         ),
-        ("list_skills", "hooked_handler_forwards_skill_methods"),
-        ("get_skill", "hooked_handler_forwards_skill_methods"),
+        ("list_skills", "hooked_handler_forwards_list_skills"),
+        ("get_skill", "hooked_handler_forwards_get_skill"),
         (
             "read_resource_directory",
-            "hooked_handler_forwards_skill_methods",
+            "hooked_handler_forwards_read_resource_directory",
         ),
         (
             "accepted_subscription_filter",
@@ -2386,63 +2352,180 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    /// Pins that the SEP-2640 skill methods forward and the passthrough rejects them.
-    async fn hooked_handler_forwards_skill_methods() -> anyhow::Result<()> {
-        // Mechanism 1 (ambient-silent probe): the expected log is exactly the
-        // driven methods. Each answer is a sentinel error no default can build.
-        let requests = || -> anyhow::Result<[serde_json::Value; 3]> {
-            Ok([
-                coverage_request(1, "skills/list", json!({}))?,
-                coverage_request(
-                    2,
-                    "skills/get",
-                    json!({ "uri": "skill://sentinel/SKILL.md" }),
-                )?,
-                coverage_request(
-                    3,
-                    "resources/directory/read",
-                    json!({ "uri": "test://sentinel-directory/" }),
-                )?,
-            ])
-        };
+    /// The SEP-2640 sentinel skill: it passes rmcp's `validate`,
+    /// `validate_skills` and request-URI checks, so a forwarded answer reaches
+    /// the wire intact.
+    fn sentinel_skill() -> Skill {
+        Skill::new(
+            SENTINEL_SKILL_URI,
+            SkillFrontmatter::new("driver-sentinel-skill", "driver sentinel"),
+            SkillResources::Dynamic,
+        )
+    }
 
-        let probe = ForwardingProbe::default();
+    const SENTINEL_SKILL_URI: &str = "skill://driver-sentinel-skill/SKILL.md";
+
+    fn sentinel_directory_entry() -> Resource {
+        Resource::new(
+            "test://sentinel-directory/entry",
+            "driver-sentinel-resource",
+        )
+    }
+
+    /// Answers the three SEP-2640 methods with sentinels and records each call.
+    /// `get_info` advertises exactly `resources` plus skills with
+    /// `directoryRead` and records nothing: rmcp's skills gate calls it on
+    /// every request.
+    #[derive(Clone, Default)]
+    struct SkillProbe {
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SkillProbe {
+        fn record(&self, method: &'static str) {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(method);
+        }
+
+        fn seen(&self) -> Vec<&'static str> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "deliberate: src/tool_hooks.rs::tests::SkillProbe implements rmcp's async ServerHandler; the in-memory probe returns immediately"
+    )]
+    impl ServerHandler for SkillProbe {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
+                ServerCapabilities::builder()
+                    .enable_resources()
+                    .enable_skills_with_directory_read()
+                    .build(),
+            )
+        }
+
+        async fn list_skills(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListSkillsResult, ErrorData> {
+            self.record("list_skills");
+            Ok(ListSkillsResult::with_all_items(vec![sentinel_skill()]))
+        }
+
+        async fn get_skill(
+            &self,
+            _request: GetSkillRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetSkillResult, ErrorData> {
+            self.record("get_skill");
+            Ok(GetSkillResult::new(sentinel_skill()))
+        }
+
+        async fn read_resource_directory(
+            &self,
+            _request: ReadResourceDirectoryRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+            self.record("read_resource_directory");
+            Ok(ListResourcesResult::with_all_items(vec![
+                sentinel_directory_entry(),
+            ]))
+        }
+    }
+
+    /// Send `request` through the real wrapper and through
+    /// [`PassthroughDefaults`]. The control must answer exactly
+    /// `control_error` with the probe untouched; that is a reachability
+    /// control, not the per-method mutation proof.
+    async fn drive_skill_request(
+        request: impl Fn() -> anyhow::Result<serde_json::Value>,
+        control_error: ErrorData,
+    ) -> anyhow::Result<(serde_json::Value, Vec<&'static str>)> {
+        let probe = SkillProbe::default();
         let (mut reader, mut writer, _service) =
             forwarding_transport(probe.clone(), coverage_hooks());
-        let mut messages = Vec::new();
-        for request in requests()? {
-            messages.push(send_json_rpc(&mut writer, &mut reader, request).await?);
-        }
-        let expected = [
-            "forwarding-probe:list_skills",
-            "forwarding-probe:get_skill",
-            "forwarding-probe:read_resource_directory",
-        ];
-        for (response, sentinel) in messages.iter().zip(expected) {
-            assert_eq!(
-                response.get("error").and_then(|error| error.get("message")),
-                Some(&json!(sentinel))
-            );
-        }
-        assert_eq!(
-            probe.seen(),
-            vec!["list_skills", "get_skill", "read_resource_directory"]
-        );
+        let response = send_json_rpc(&mut writer, &mut reader, request()?).await?;
 
-        // Negative control: the defaults reject with method-not-found and the
-        // probe is never entered.
-        let control = ForwardingProbe::default();
+        let control = SkillProbe::default();
         let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
-        for request in requests()? {
-            let response = send_json_rpc(&mut control_writer, &mut control_reader, request).await?;
-            assert_eq!(
-                response.get("error").and_then(|error| error.get("code")),
-                Some(&json!(-32601_i32))
-            );
-        }
+        let control_response =
+            send_json_rpc(&mut control_writer, &mut control_reader, request()?).await?;
+        let error: ErrorData = serde_json::from_value(
+            control_response
+                .get("error")
+                .cloned()
+                .context("the passthrough control answers with an error")?,
+        )?;
+        assert_eq!(error, control_error);
         assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok((response, probe.seen()))
+    }
+
+    fn response_result<T>(response: &serde_json::Value) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let result = response
+            .get("result")
+            .cloned()
+            .with_context(|| format!("expected a result, got {response}"))?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    #[tokio::test]
+    /// Pins that `skills/list` forwards the inner sentinel skill.
+    async fn hooked_handler_forwards_list_skills() -> anyhow::Result<()> {
+        let (response, seen) = drive_skill_request(
+            || coverage_request(1, "skills/list", json!({})),
+            ErrorData::method_not_found::<ListSkillsRequestMethod>(),
+        )
+        .await?;
+        let listed: ListSkillsResult = response_result(&response)?;
+        assert_eq!(listed.skills, vec![sentinel_skill()]);
+        assert_eq!(seen, vec!["list_skills"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that `skills/get` forwards the inner sentinel skill.
+    async fn hooked_handler_forwards_get_skill() -> anyhow::Result<()> {
+        let (response, seen) = drive_skill_request(
+            || coverage_request(1, "skills/get", json!({ "uri": SENTINEL_SKILL_URI })),
+            ErrorData::method_not_found::<GetSkillRequestMethod>(),
+        )
+        .await?;
+        let fetched: GetSkillResult = response_result(&response)?;
+        assert_eq!(fetched.skill, sentinel_skill());
+        assert_eq!(seen, vec!["get_skill"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that `resources/directory/read` forwards the inner sentinel entry.
+    async fn hooked_handler_forwards_read_resource_directory() -> anyhow::Result<()> {
+        let (response, seen) = drive_skill_request(
+            || {
+                coverage_request(
+                    1,
+                    "resources/directory/read",
+                    json!({ "uri": "test://sentinel-directory/" }),
+                )
+            },
+            ErrorData::method_not_found::<ReadResourceDirectoryRequestMethod>(),
+        )
+        .await?;
+        let listed: ReadResourceDirectoryResult = response_result(&response)?;
+        assert_eq!(listed.resources, vec![sentinel_directory_entry()]);
+        assert_eq!(seen, vec!["read_resource_directory"]);
         Ok(())
     }
 

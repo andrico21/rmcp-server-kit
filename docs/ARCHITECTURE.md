@@ -161,7 +161,7 @@ axum Router                                  src/transport.rs:2399  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:1354 (`rbac_middleware`) + 1527 (`enforce_tool_policy`)
+├── 8. RBAC middleware                    src/rbac.rs:1759 (`rbac_middleware`) + 2041 (`enforce_tool_policy`)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -258,7 +258,7 @@ pub struct AuthIdentity {
 }
 ```
 
-### `RbacPolicy` - `src/rbac.rs:709`
+### `RbacPolicy` - `src/rbac.rs:818`
 Holds:
 - `roles: HashMap<String, RoleConfig>` - per-role tool allow/deny rules
 - default-deny semantics with explicit overrides
@@ -386,7 +386,7 @@ See [§8](#8-oauth-21--jwks-feature-oauth).
 ### Policy model
 ```
 RbacPolicy {
-roles: HashMap<String, RoleConfig>,   // `RbacPolicy` src/rbac.rs:709
+roles: HashMap<String, RoleConfig>,   // `RbacPolicy` src/rbac.rs:818
 }
 
 RoleConfig {                              // `RoleConfig` src/rbac.rs:310
@@ -396,16 +396,16 @@ RoleConfig {                              // `RoleConfig` src/rbac.rs:310
     rate_limit: Option<RateLimit>,         // optional per-role override
 }
 
-ArgumentAllowlist {                       // `ArgumentAllowlist` src/rbac.rs:435
+ArgumentAllowlist {                       // `ArgumentAllowlist` src/rbac.rs:475
     fields: HashMap<String, FieldRule>,    // per JSON-RPC argument key
 }
 ```
 
 ### Decision function
-- `RbacPolicy::check` (`src/rbac.rs:869`) - pure allow/deny
-- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`argument_allowed`, `src/rbac.rs:954`)
+- `RbacPolicy::check` (`src/rbac.rs:1004`) - pure allow/deny
+- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`argument_allowed`, `src/rbac.rs:1089`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
-the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac.rs:1244`).
+the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac.rs:1649`).
   Used to keep raw argument values out of deny logs.
 - `enforce_tool_policy(policy, identity_name, role, params)` - combines
   allow/deny + argument-allowlist checks, emitting structured deny logs.
@@ -413,13 +413,13 @@ the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:1354`):
+`rbac_middleware` (`src/rbac.rs:1759`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
    JSON-RPC, and inspects `method`. Only enforces on `tools/call`.
 3. Calls `enforce_tool_policy(&policy, &identity_name, &role, params)`
-(`enforce_tool_policy`, `src/rbac.rs:1636`).
+(`enforce_tool_policy`, `src/rbac.rs:2041`).
 4. Calls the per-IP tool rate limiter
    (`build_tool_rate_limiter_with_policy`, `src/rbac.rs:71`), returning
    `429` if exceeded. The limiter is backed
@@ -427,6 +427,29 @@ the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac
    memory via LRU prune.
 5. On success, propagates the request downstream. The body is restored
    into the request so rmcp can read it again.
+
+### Skills and resources enforcement
+`rbac_middleware` inspects only `tools/call`. Skills and resource methods are
+enforced one layer in, in `RbacContextHandler` (`src/rbac_context.rs`), on rmcp's
+typed params, using the policy in `src/rbac.rs`:
+- `canonical(uri)` - lexical canonical form (scheme lowercased, unsafe URIs
+  `None`); no configuration, same output for the same input.
+- `RbacPolicy::resource_access(role, uri)` - the single decision function:
+  disabled -> allow; invalid root namespace -> deny; skill URIs need a matching
+  `RoleConfig::skills` glob; unregistered `SKILL.md` -> deny; ordinary URIs
+  follow restrict mode (`restrict_resources`, or any role with `resources`).
+- `RbacPolicy::skills_granted(role)` - whether the role may use skills at all;
+  `RbacPolicy::universally_allowed(uri)` - an ordinary URI outside restrict mode.
+- Overrides: `list_skills`, `get_skill`, `read_resource_directory`,
+  `read_resource`, `list_resources`, `subscribe`, `accepted_subscription_filter`
+  (sanitizes the request and the answer, before rmcp acknowledges), `listen` (a
+  second boundary against a fresh snapshot after a reload) and
+  `on_custom_request` (refuses the nine reserved names). Each loads the policy
+  once per call; filtered and gated results are `Private`.
+- Settings: `RbacConfig::skill_roots`, `restrict_resources`,
+  `RoleConfig::skills`, `resources`; `RbacConfig::validate` checks them.
+  `HookedHandler` stays a pure forwarder. Behaviour and limits:
+  [GUIDE](GUIDE.md#skills-and-resources) and `SECURITY.md`.
 
 ### Argument-value redaction
 Deny logs for argument-allowlist violations never contain the raw value.
@@ -436,7 +459,7 @@ logged under the `arg_hmac` field. The salt is taken from
 hashes) or, when absent, from a process-wide random salt generated on
 first use. 32 bits is enough entropy for log-line correlation while
 making preimage recovery infeasible. See
-`redact_with_salt` (`src/rbac.rs:1244`).
+`redact_with_salt` (`src/rbac.rs:1649`).
 
 ### Task-locals
 The `tokio::task_local!` block (`CURRENT_ROLE`, `src/rbac.rs:118`) defines four task-locals; the accessors start at `current_role` (`src/rbac.rs:158`):
@@ -969,7 +992,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:802`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:1162`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:2173`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:2578`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:92`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain
@@ -1060,7 +1083,7 @@ prove different things:
 - **Presence and origin** - `tests/integration/delegation_guard.rs` parses the upstream
   `ServerHandler` surface out of the rmcp source pinned in `Cargo.lock`, asserts
   each wrapper's impl contains a method for every classified name, pins the
-  origin of every macro-generated `RbacContextHandler` method (a
+  origin of each of the eight macro-generated `RbacContextHandler` methods (a
   `delegate_request!` invocation is not the same as a hand-written `fn` of the
   same name), and asserts the in-crate `SEMANTIC_DRIVERS` tables cover the whole
   classification.
