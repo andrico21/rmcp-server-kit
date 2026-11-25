@@ -13,6 +13,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- Supply chain only: `deny.toml` and `.cargo/audit.toml` ignore RUSTSEC-2026-0543 (`chrono`
+  unmaintained), RUSTSEC-2026-0542 (`humantime` unmaintained) and RUSTSEC-2026-0387
+  (`crypto-bigint` timing, via `jsonwebtoken`), each with the reason it does not
+  apply and the real fix noted next to it.
 - `rmcp` moved from 3.6.0 to 3.11.0. Its `ServerHandler` gained `list_skills`,
   `get_skill` (SEP-2640 skills) and `read_resource_directory`; `HookedHandler`
   forwards all three unchanged, and `RbacContextHandler` runs them inside the
