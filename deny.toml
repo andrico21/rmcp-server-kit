@@ -20,6 +20,9 @@ yanked = "deny"
 # Mirrored in .cargo/audit.toml; the two ignore sets must stay equal.
 ignore = [
   { id = "RUSTSEC-2023-0071", reason = "Marvin timing sidechannel in `rsa` 0.9.x with no upstream fix; rmcp-server-kit verifies JWTs with public keys only and never performs RSA decryption, so the sidechannel does not apply" },
+  { id = "RUSTSEC-2026-0543", reason = "`chrono` is unmaintained (all versions) but has no known vulnerability; it is used for timestamp formatting and is also a dependency of rmcp and schemars. Real fix: move to `jiff` or `time` once rmcp drops chrono; revisit on every rmcp bump" },
+  { id = "RUSTSEC-2026-0542", reason = "`humantime` is unmaintained because it wraps chrono's lineage, with no known vulnerability; used only for duration parsing in config. Real fix: replace `humantime` and `humantime-serde` with a small in-crate duration parser or a maintained crate, and drop both dependencies" },
+  { id = "RUSTSEC-2026-0387", reason = "`crypto-bigint` 0.5.5 timing variability in constant-time operations, reached through jsonwebtoken -> p256/p384 -> elliptic-curve; rmcp-server-kit only verifies JWT signatures with public keys and never handles ECDSA secret material, so the secret-dependent timing does not apply. Real fix: upgrade to crypto-bigint >= 0.7.6, which needs a jsonwebtoken release built on the newer RustCrypto elliptic-curve stack; revisit on every jsonwebtoken bump" },
 ]
 
 [licenses]

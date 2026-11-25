@@ -59,7 +59,7 @@ mod tests {
     /// `ServerHandler` method count in the rmcp version `Cargo.lock` pins. Bump
     /// together with an rmcp upgrade, after reviewing the upstream diff and
     /// updating both wrappers.
-    const EXPECTED_UPSTREAM_METHOD_COUNT: usize = 29;
+    const EXPECTED_UPSTREAM_METHOD_COUNT: usize = 32;
 
     /// `HookedHandler`: every method except `call_tool` forwards unchanged.
     const HOOKED_HANDLER_DIRECTLY_DELEGATED: &[&str] = &[
@@ -75,6 +75,9 @@ mod tests {
         "list_resources",
         "list_resource_templates",
         "read_resource",
+        "read_resource_directory",
+        "list_skills",
+        "get_skill",
         "accepted_subscription_filter",
         "listen",
         "subscribe",
@@ -122,6 +125,9 @@ mod tests {
         "list_resources",
         "list_resource_templates",
         "read_resource",
+        "read_resource_directory",
+        "list_skills",
+        "get_skill",
         "listen",
         "subscribe",
         "unsubscribe",
@@ -160,11 +166,11 @@ mod tests {
         "impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {";
 
     /// Methods the `HookedHandler` impl defines (all literal `fn` declarations).
-    const HOOKED_HANDLER_IMPL_METHOD_COUNT: usize = 29;
+    const HOOKED_HANDLER_IMPL_METHOD_COUNT: usize = 32;
 
     /// Methods the `RbacContextHandler` impl defines: 17 literal `fn` declarations
-    /// plus 12 `delegate_request!` / `delegate_notification!` invocations.
-    const RBAC_CONTEXT_HANDLER_IMPL_METHOD_COUNT: usize = 29;
+    /// plus 15 `delegate_request!` / `delegate_notification!` invocations.
+    const RBAC_CONTEXT_HANDLER_IMPL_METHOD_COUNT: usize = 32;
 
     /// Pins that `HookedHandler`'s classification matches rmcp's `ServerHandler` surface and impl.
     #[test]
@@ -729,10 +735,12 @@ mod tests {
         DelegateNotification,
     }
 
-    /// Origin pins for the twelve `RbacContextHandler` methods the three
-    /// macro-body drivers discharge. If one of these becomes a literal `fn`, none
-    /// of those drivers covers it any more, so this gate fails until the method
-    /// gains its own semantic driver.
+    /// Origin pins for the fifteen macro-generated `RbacContextHandler` methods:
+    /// twelve discharged by the three macro-body drivers, plus the three SEP-2640
+    /// skill methods, whose driver proves forwarding and identity scoping but
+    /// relies on the macro for the scope's shape. If one of these becomes a
+    /// literal `fn`, the macro-body argument no longer covers it, so this gate
+    /// fails until the method gains its own semantic driver.
     const RBAC_CONTEXT_HANDLER_MACRO_ORIGINS: &[(&str, MethodOrigin)] = &[
         ("complete", MethodOrigin::DelegateRequestPlainArm),
         ("set_level", MethodOrigin::DelegateRequestPlainArm),
@@ -741,6 +749,12 @@ mod tests {
         ("subscribe", MethodOrigin::DelegateRequestPlainArm),
         ("unsubscribe", MethodOrigin::DelegateRequestPlainArm),
         ("on_custom_request", MethodOrigin::DelegateRequestPlainArm),
+        (
+            "read_resource_directory",
+            MethodOrigin::DelegateRequestPlainArm,
+        ),
+        ("get_skill", MethodOrigin::DelegateRequestPlainArm),
+        ("list_skills", MethodOrigin::DelegateRequestOptionArm),
         ("list_prompts", MethodOrigin::DelegateRequestOptionArm),
         ("list_resources", MethodOrigin::DelegateRequestOptionArm),
         (

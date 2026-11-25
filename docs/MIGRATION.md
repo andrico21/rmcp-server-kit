@@ -1440,7 +1440,7 @@ Both are opt-in to keep the default dependency footprint small.
 
 ## 6. Minimum supported Rust
 
-`rmcp-server-kit` targets stable Rust **1.99** or newer (`edition = "2024"`).
+`rmcp-server-kit` targets stable Rust **1.100** or newer (`edition = "2024"`).
 The project does not treat an MSRV bump as a breaking change: a bump can ship in
 a patch release, and it is always called out in `CHANGELOG.md` and in this
 guide.

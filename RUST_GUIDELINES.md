@@ -177,9 +177,9 @@ entry in the same PR that introduces a deviation.
    `default-src 'none'`, stricter than `http-services.md:30`
    (`default-src 'self'`). Stricter is allowed; recorded so no one "aligns" it.
 6. **2026-10-04 - MSRV job lint-capped (compile compatibility only).** The
-   GitHub `MSRV (1.99.0)` job and the GitLab `msrv` job run with
+   GitHub `MSRV (1.100.0)` job and the GitLab `msrv` job run with
    `RUSTFLAGS="--cap-lints=warn"` and `CARGO_BUILD_WARNINGS=allow`. They prove
-   that the crate compiles on `rust-version = "1.99.0"`; they do not enforce
+   that the crate compiles on `rust-version = "1.100.0"`; they do not enforce
    lint cleanliness. Lints stay enforced on the latest stable by the `clippy`
    and feature-matrix jobs, so a warning is still an error everywhere except in
    the minimum-version proof. This is the core Version Policy's MSRV job
@@ -187,7 +187,7 @@ entry in the same PR that introduces a deviation.
    migration record (capped build log, CI check list).
 7. **2026-10-04 - GitLab image tag not verified by the executor.** `CI_IMAGE`
    switched to
-   `gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.99.0` on
+   `gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.100.0` on
    the owner's explicit instruction (Q2). The private registry cannot be
    inspected without credentials: an anonymous `skopeo inspect` returns
    `manifest unknown` even for the previously in-use `rust-1.98.0` tag, so the
@@ -507,7 +507,7 @@ numbered entry only if one of these situations arises later.
 
 ## Toolchain-bump procedure
 
-Applies on the first CI run on a stable newer than 1.99.0, and on every
+Applies on the first CI run on a stable newer than 1.100.0, and on every
 deliberate nightly bump. While file lanes are open it runs as a barrier: lane
 merges pause, the drift PR owns every file, then the lanes update from `main`.
 

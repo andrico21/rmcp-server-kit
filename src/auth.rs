@@ -2914,7 +2914,7 @@ mod tests {
 
     impl CapturedLogs {
         fn contents(&self) -> String {
-            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let bytes = self.0.lock().map_or_default(|guard| guard.clone());
             String::from_utf8(bytes).unwrap_or_default()
         }
     }

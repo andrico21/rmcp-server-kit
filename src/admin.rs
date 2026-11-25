@@ -99,8 +99,7 @@ pub struct AdminStatus {
 fn admin_status(state: &AdminState) -> AdminStatus {
     let started_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+        .map_or_default(|duration| duration.as_secs())
         .saturating_sub(state.started_at.elapsed().as_secs());
     AdminStatus {
         name: state.name.clone(),

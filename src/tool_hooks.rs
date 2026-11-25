@@ -63,12 +63,13 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
         CancelledNotificationParam, CompleteRequestParams, CompleteResult, ContentBlock,
         CustomNotification, CustomRequest, CustomResult, DiscoverResult, GetPromptRequestParams,
-        GetPromptResponse, GetTaskParams, GetTaskResult, InitializeRequestParams, InitializeResult,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-        PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ServerConfig, SetLevelRequestParams,
-        SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
-        UpdateTaskParams,
+        GetPromptResponse, GetSkillRequestParams, GetSkillResult, GetTaskParams, GetTaskResult,
+        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListSkillsResult, ListToolsResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProtocolVersion, ReadResourceDirectoryRequestParams,
+        ReadResourceDirectoryResult, ReadResourceRequestParams, ReadResourceResponse, ServerConfig,
+        SetLevelRequestParams, SubscribeRequestParams, SubscriptionFilter, Tool,
+        UnsubscribeRequestParams, UpdateTaskParams,
     },
     service::{NotificationContext, RequestContext, SubscriptionContext},
 };
@@ -672,6 +673,39 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.read_resource(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
+    async fn read_resource_directory(
+        &self,
+        request: ReadResourceDirectoryRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+        self.inner.read_resource_directory(request, context).await
+    }
+
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
+    async fn list_skills(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, ErrorData> {
+        self.inner.list_skills(request, context).await
+    }
+
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, ErrorData> {
+        self.inner.get_skill(request, context).await
+    }
+
     // NOT cancel-safe: this awaits consumer-supplied before-hooks and the
     // consumer's inner handler. After-hooks are dispatched only on the normal
     // Deny/Replace/Ok/Err paths, so a cancellation between them drops the
@@ -1039,7 +1073,7 @@ mod tests {
 
     impl CapturedLogs {
         fn contents(&self) -> String {
-            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let bytes = self.0.lock().map_or_default(|guard| guard.clone());
             String::from_utf8(bytes).unwrap_or_default()
         }
     }
@@ -1108,10 +1142,7 @@ mod tests {
         }
 
         fn seen(&self) -> Vec<&'static str> {
-            self.seen
-                .lock()
-                .map(|seen| seen.clone())
-                .unwrap_or_default()
+            self.seen.lock().map_or_default(|seen| seen.clone())
         }
 
         async fn wait_for_seen_count(&self, count: usize) -> anyhow::Result<()> {
@@ -1272,6 +1303,7 @@ mod tests {
             .enable_tools()
             .enable_tool_list_changed()
             .enable_tasks()
+            .enable_skills_with_directory_read()
             .build()
     }
 
@@ -1377,10 +1409,7 @@ mod tests {
         }
 
         fn seen(&self) -> Vec<&'static str> {
-            self.seen
-                .lock()
-                .map(|seen| seen.clone())
-                .unwrap_or_default()
+            self.seen.lock().map_or_default(|seen| seen.clone())
         }
     }
 
@@ -1502,6 +1531,42 @@ mod tests {
                 "test://sentinel-resource",
             )])
             .into())
+        }
+
+        async fn list_skills(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListSkillsResult, ErrorData> {
+            self.record("list_skills");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:list_skills",
+                None,
+            ))
+        }
+
+        async fn get_skill(
+            &self,
+            _request: GetSkillRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetSkillResult, ErrorData> {
+            self.record("get_skill");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:get_skill",
+                None,
+            ))
+        }
+
+        async fn read_resource_directory(
+            &self,
+            _request: ReadResourceDirectoryRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceDirectoryResult, ErrorData> {
+            self.record("read_resource_directory");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:read_resource_directory",
+                None,
+            ))
         }
 
         fn accepted_subscription_filter(
@@ -1940,6 +2005,12 @@ mod tests {
             "read_resource",
             "hooked_handler_forwards_prompt_and_resource_reads",
         ),
+        ("list_skills", "hooked_handler_forwards_skill_methods"),
+        ("get_skill", "hooked_handler_forwards_skill_methods"),
+        (
+            "read_resource_directory",
+            "hooked_handler_forwards_skill_methods",
+        ),
         (
             "accepted_subscription_filter",
             "hooked_handler_forwards_subscription_lifecycle",
@@ -2267,8 +2338,10 @@ mod tests {
             ]
         );
 
-        // Negative control: the same four requests, answered by defaults -
-        // empty result sets, probe untouched.
+        // Negative control: the same four requests, answered by defaults. Since
+        // rmcp 3.11 the listing defaults gate on the advertised capability, and
+        // `PassthroughDefaults` advertises none, so each rejects with
+        // method-not-found; the probe stays untouched.
         let control = ForwardingProbe::default();
         let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
@@ -2296,30 +2369,79 @@ mod tests {
             coverage_request(4, "resources/templates/list", json!({}))?,
         )
         .await?;
+        for control_response in [
+            &control_tools,
+            &control_prompts,
+            &control_resources,
+            &control_templates,
+        ] {
+            assert_eq!(
+                control_response
+                    .get("error")
+                    .and_then(|error| error.get("code")),
+                Some(&json!(-32601_i32))
+            );
+        }
+        assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Pins that the SEP-2640 skill methods forward and the passthrough rejects them.
+    async fn hooked_handler_forwards_skill_methods() -> anyhow::Result<()> {
+        // Mechanism 1 (ambient-silent probe): the expected log is exactly the
+        // driven methods. Each answer is a sentinel error no default can build.
+        let requests = || -> anyhow::Result<[serde_json::Value; 3]> {
+            Ok([
+                coverage_request(1, "skills/list", json!({}))?,
+                coverage_request(
+                    2,
+                    "skills/get",
+                    json!({ "uri": "skill://sentinel/SKILL.md" }),
+                )?,
+                coverage_request(
+                    3,
+                    "resources/directory/read",
+                    json!({ "uri": "test://sentinel-directory/" }),
+                )?,
+            ])
+        };
+
+        let probe = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(probe.clone(), coverage_hooks());
+        let mut messages = Vec::new();
+        for request in requests()? {
+            messages.push(send_json_rpc(&mut writer, &mut reader, request).await?);
+        }
+        let expected = [
+            "forwarding-probe:list_skills",
+            "forwarding-probe:get_skill",
+            "forwarding-probe:read_resource_directory",
+        ];
+        for (response, sentinel) in messages.iter().zip(expected) {
+            assert_eq!(
+                response.get("error").and_then(|error| error.get("message")),
+                Some(&json!(sentinel))
+            );
+        }
         assert_eq!(
-            control_tools
-                .get("result")
-                .and_then(|result| result.get("tools")),
-            Some(&json!([]))
+            probe.seen(),
+            vec!["list_skills", "get_skill", "read_resource_directory"]
         );
-        assert_eq!(
-            control_prompts
-                .get("result")
-                .and_then(|result| result.get("prompts")),
-            Some(&json!([]))
-        );
-        assert_eq!(
-            control_resources
-                .get("result")
-                .and_then(|result| result.get("resources")),
-            Some(&json!([]))
-        );
-        assert_eq!(
-            control_templates
-                .get("result")
-                .and_then(|result| result.get("resourceTemplates")),
-            Some(&json!([]))
-        );
+
+        // Negative control: the defaults reject with method-not-found and the
+        // probe is never entered.
+        let control = ForwardingProbe::default();
+        let (mut control_reader, mut control_writer, _control_service) =
+            forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
+        for request in requests()? {
+            let response = send_json_rpc(&mut control_writer, &mut control_reader, request).await?;
+            assert_eq!(
+                response.get("error").and_then(|error| error.get("code")),
+                Some(&json!(-32601_i32))
+            );
+        }
         assert_eq!(control.seen(), Vec::<&str>::new());
         Ok(())
     }

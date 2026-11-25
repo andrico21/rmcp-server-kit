@@ -3002,8 +3002,7 @@ mod tests {
         let scanned_files = scan_production_src(|path, src| {
             let rel = path
                 .file_name()
-                .map(|name| format!("src/{}", name.to_string_lossy()))
-                .unwrap_or_default();
+                .map_or_default(|name| format!("src/{}", name.to_string_lossy()));
             for hit in find_debug_sigil_fields(src) {
                 if !is_allowlisted(&rel, &hit) {
                     offenders.push(format!("{rel}: {hit}"));

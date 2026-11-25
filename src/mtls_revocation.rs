@@ -2278,10 +2278,6 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
     clippy::cognitive_complexity,
     reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
 )]
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 // cancel-safe: results accumulate in a local map; the deadline elapsing, or
 // this future being dropped, only stops collecting further results - nothing
 // is published here, the caller commits the returned map itself.
@@ -2412,10 +2408,6 @@ fn apply_bootstrap_cache_cap(
 }
 
 /// Run the CRL refresher loop until shutdown.
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
 // Without the discovery arm's `PendingUrlGuard`, an abort would leave a stale
 // `pending_urls` marker that suppresses re-enqueue forever (see the note above
 // `seen_urls`/`pending_urls` clearing) and silently narrows revocation coverage.

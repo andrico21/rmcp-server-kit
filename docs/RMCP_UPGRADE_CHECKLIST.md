@@ -47,12 +47,12 @@ an rmcp bump changes the surface:
 
 | Constant / table | Role |
 |---|---|
-| `EXPECTED_UPSTREAM_METHOD_COUNT` | method count of the pinned rmcp `ServerHandler` (29 for 3.4.0) |
+| `EXPECTED_UPSTREAM_METHOD_COUNT` | method count of the pinned rmcp `ServerHandler` (32 for 3.11.0) |
 | `HOOKED_HANDLER_DIRECTLY_DELEGATED`, `HOOKED_HANDLER_BEHAVIORAL_WRAPPED`, `HOOKED_HANDLER_INTENTIONALLY_DEFAULTED`, `RBAC_CONTEXT_HANDLER_DIRECTLY_DELEGATED`, `RBAC_CONTEXT_HANDLER_BEHAVIORAL_WRAPPED`, `RBAC_CONTEXT_HANDLER_INTENTIONALLY_DEFAULTED` | per-wrapper classification of every upstream method |
 | `HOOKED_HANDLER_IMPL_METHOD_COUNT`, `RBAC_CONTEXT_HANDLER_IMPL_METHOD_COUNT` | how many methods each wrapper's own impl must scan to; catches a mis-scoped scanner or a silently shrunk impl |
 | `HOOKED_HANDLER_SOURCE`, `RBAC_CONTEXT_HANDLER_SOURCE`, `HOOKED_HANDLER_IMPL_ANCHOR`, `RBAC_CONTEXT_HANDLER_IMPL_ANCHOR` | the file and the column-0 full-generic impl anchor each scanner reads |
 | `HOOKED_HANDLER_SEMANTICALLY_UNPROVABLE`, `RBAC_CONTEXT_HANDLER_SEMANTICALLY_UNPROVABLE` | methods no driver can prove; asserted **empty** - every method is reachable through dispatch or a direct call |
-| `RBAC_CONTEXT_HANDLER_MACRO_ORIGINS` | per-method origin pins for the twelve macro-generated methods the three macro-body drivers discharge; a method that becomes a literal `fn` fails until it gains its own driver |
+| `RBAC_CONTEXT_HANDLER_MACRO_ORIGINS` | per-method origin pins for the fifteen macro-generated methods (twelve discharged by the three macro-body drivers, three by the skill-method driver); a method that becomes a literal `fn` fails until it gains its own driver |
 | `SEMANTIC_DRIVERS` (in the `src/tool_hooks.rs` / `src/rbac_context.rs` test modules) | method to driver-test table; the completeness gate asserts it equals `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` per wrapper |
 
 ### Semantic drivers: the rules a new driver must follow
@@ -62,7 +62,8 @@ an rmcp bump changes the surface:
   error) rmcp's defaults cannot construct. `contains`, `is_empty()` and length
   thresholds are forbidden: rmcp's self-re-entrant defaults and ambient handler
   calls (`get_info` during peer setup and capability validation,
-  `supported_protocol_versions` in the request prelude,
+  `supported_protocol_versions` in the request prelude, `get_info` inside the
+  capability-gated listing / `complete` defaults since 3.11,
   `accepted_subscription_filter` before `listen`) can otherwise make a
   non-forwarding body look green.
 - The expected log must contain the method under test; ambient entries may only

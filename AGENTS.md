@@ -29,7 +29,7 @@ shutdown.
 | Crate name    | `rmcp-server-kit`                                                  |
 | Version       | see [`Cargo.toml`](Cargo.toml) `[package].version`                 |
 | Edition       | `2024`                                                             |
-| MSRV          | Rust **1.99.0**                                                    |
+| MSRV          | Rust **1.100.0**                                                    |
 | License       | `MIT OR Apache-2.0` (dual)                                         |
 | Crate type    | **Library** (no `src/main.rs`; runnable code lives in `examples/`) |
 | Repository    | https://github.com/andrico21/rmcp-server-kit (canonical)           |
@@ -176,7 +176,7 @@ rmcp-server-kit/
 | Build docs                       | `cargo +nightly-2026-10-03 doc --no-deps --all-features`             |
 | Supply-chain audit               | `cargo audit`                                                        |
 | License/ban policy               | `cargo deny check`                                                   |
-| MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.99.0 build --all-features` |
+| MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.100.0 build --all-features` |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
 | Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce`; `dash_gate.py --enforce` |
 | Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
@@ -242,7 +242,7 @@ consumer applications and `examples/`.
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
 | **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3285)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5916) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5903) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
 | Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:990`) | Builder-style config struct                                                                       |
 | Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2071)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
@@ -254,7 +254,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3973
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:4006
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -272,7 +272,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       `origin_check_middleware` src/transport.rs:5556    │  spec: MCP origin validation
+        1. Origin check       `origin_check_middleware` src/transport.rs:5543    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -405,7 +405,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4549`) |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4536`) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2071)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
@@ -426,7 +426,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 6. **`ArcSwap` swaps are lock-free but eventually-consistent.** In-flight requests may use the previous policy. This is intentional. Do not switch to `RwLock`.
 7. **TLS session resumption is deliberately disabled for mTLS listeners.** `TlsListener::new` (`src/transport.rs`) builds its `rustls::ServerConfig` via `build_tls_server_config`, which passes `disable_resumption = mtls_config.is_some()` into `build_tls_server_config_from_verifier`. This is not an accidental omission: rustls restores a resumed handshake's peer certificate from cached session state without ever calling `ClientCertVerifier::verify_client_cert`, so resumption would let a revoked or expired certificate keep authenticating. Do not "optimize" this back on, and do not scope it to `crl_enabled` only - non-CRL mTLS still relies on the verifier for expiry and chain validation.
 8. **Warnings are errors, including locally.** `.cargo/config.toml` commits `[build] warnings = "deny"`, so a plain `cargo build` fails on any warning. For a transient work-in-progress check, prefix one command with `CARGO_BUILD_WARNINGS=allow` instead of editing the config (editing it invalidates the shared build cache). The config is excluded from the published package.
-9. **The MSRV job is lint-capped on purpose.** The GitHub `MSRV (1.99.0)` job (and the GitLab `msrv` job) run with `RUSTFLAGS="--cap-lints=warn"` and `CARGO_BUILD_WARNINGS=allow`; they prove the crate *compiles* on `rust-version = "1.99.0"`, not that it is lint-clean. Lint cleanliness is enforced on the latest stable by `clippy` and the feature matrix. Do not "fix" the cap or expect the MSRV job to fail on warnings.
+9. **The MSRV job is lint-capped on purpose.** The GitHub `MSRV (1.100.0)` job (and the GitLab `msrv` job) run with `RUSTFLAGS="--cap-lints=warn"` and `CARGO_BUILD_WARNINGS=allow`; they prove the crate *compiles* on `rust-version = "1.100.0"`, not that it is lint-clean. Lint cleanliness is enforced on the latest stable by `clippy` and the feature matrix. Do not "fix" the cap or expect the MSRV job to fail on warnings.
 10. **A feature-gated test target errors instead of skipping.** The `[[test]]` tables carry `required-features`, so `cargo test --test e2e_oauth_mtls` without `--features oauth,test-helpers,oauth-mtls-client` fails with "requires the features" rather than running an empty binary. Locally always use `--all-features`; CI's feature matrix covers the narrower builds.
 11. **The mutants job is schedule-only and lint-capped.** `cargo-mutants` runs from the nightly `schedule` event (not on PRs), with `CARGO_BUILD_WARNINGS: allow` and a 180-minute per-shard cap, because deny-level lints make mutants unviable and a single shard otherwise approaches GitHub's 6-hour ceiling. It is advisory (`continue-on-error`). The oauth-feature modules `src/oauth_as.rs` and `src/oauth_seal.rs` are covered by the separate `mutants-oauth` job (cargo-mutants ignores `cfg`, so they need `--features oauth`). On GitLab the default-feature `mutants` job covers `src/rbac.rs` and `src/auth.rs` in 4 shards; `src/oauth.rs` is mutation-tested by no job.
 
