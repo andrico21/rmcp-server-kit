@@ -11,8 +11,4 @@
 # jsonwebtoken -> p256/p384. Only public-key JWT verification happens here, so
 # secret-dependent timing does not apply. Real fix: crypto-bigint >= 0.7.6,
 # which needs a jsonwebtoken release on the newer RustCrypto stack.
-ignore = [
-  "RUSTSEC-2023-0071",
-  "RUSTSEC-2026-0543",
-  "RUSTSEC-2026-0387",
-]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0543", "RUSTSEC-2026-0387"]
