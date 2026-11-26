@@ -712,10 +712,13 @@ pub struct MtlsConfig {
     pub crl_enabled: bool,
     /// Optional fixed refresh interval for known CRLs. When omitted, refresh
     /// cadence is derived from `nextUpdate` and clamped internally.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration_text::serde_with::option")]
     pub crl_refresh_interval: Option<Duration>,
     /// Timeout for individual CRL fetches.
-    #[serde(default = "default_crl_fetch_timeout", with = "humantime_serde")]
+    #[serde(
+        default = "default_crl_fetch_timeout",
+        with = "crate::duration_text::serde_with"
+    )]
     pub crl_fetch_timeout: Duration,
     /// Retry-retention window: how long a CRL whose refresh keeps failing is
     /// retained in the cache so the background refresher can keep retrying it,
@@ -733,7 +736,7 @@ pub struct MtlsConfig {
     #[serde(
         default = "default_crl_stale_grace",
         alias = "crl_retry_retention",
-        with = "humantime_serde"
+        with = "crate::duration_text::serde_with"
     )]
     pub crl_stale_grace: Duration,
     /// When true, missing or unavailable CRLs cause revocation checks to fail
@@ -916,7 +919,10 @@ pub struct RateLimitConfig {
     pub max_tracked_keys: usize,
     /// Per-IP entries idle for longer than this are eligible for
     /// opportunistic pruning. Default: 15 minutes.
-    #[serde(default = "default_idle_eviction", with = "humantime_serde")]
+    #[serde(
+        default = "default_idle_eviction",
+        with = "crate::duration_text::serde_with"
+    )]
     pub idle_eviction: Duration,
     /// Burst capacity for the post-failure limiter: the maximum number
     /// of failed attempts admitted back-to-back before the sustained
@@ -1101,7 +1107,10 @@ pub struct AuthConfig {
     /// receiving `503 Service Unavailable` with `Retry-After: 1` instead of
     /// queuing unboundedly. Must be greater than zero; config validation
     /// enforces this at startup. Default: 1 second.
-    #[serde(default = "default_verification_wait", with = "humantime_serde")]
+    #[serde(
+        default = "default_verification_wait",
+        with = "crate::duration_text::serde_with"
+    )]
     pub verification_wait: Duration,
     /// OAuth 2.1 JWT bearer token authentication.
     #[cfg(feature = "oauth")]
@@ -2907,7 +2916,10 @@ mod tests {
     use super::*;
     #[cfg(feature = "metrics")]
     use crate::metrics::McpMetrics;
-    use crate::transport::{ClientIp, PeerAddr, RequestId};
+    use crate::{
+        duration_text::parse_duration,
+        transport::{ClientIp, PeerAddr, RequestId},
+    };
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -6744,7 +6756,7 @@ mod tests {
     #[test]
     fn auth_config_default_has_1s_verification_wait_and_no_permit_override() -> anyhow::Result<()> {
         let cfg = AuthConfig::default();
-        let expected_wait = humantime::parse_duration("1s").context("1s duration parses")?;
+        let expected_wait = parse_duration("1s").context("1s duration parses")?;
         assert_eq!(
             cfg.verification_wait, expected_wait,
             "default verification_wait must be 1 second"
@@ -6809,6 +6821,58 @@ mod tests {
         );
         // The clamp's entire purpose is that this does not panic.
         let _semaphore = Semaphore::new(resolved.get());
+        Ok(())
+    }
+
+    /// The five duration fields decode from TOML through the in-crate parser.
+    #[test]
+    fn duration_boundary_auth_serde_fields_from_toml() -> anyhow::Result<()> {
+        let defaults: AuthConfig =
+            toml::from_str("[mtls]\nca_cert_path = \"ca.pem\"\n[rate_limit]\n")?;
+        let mtls = defaults.mtls.context("mtls table present")?;
+        let limit = defaults.rate_limit.context("rate_limit table present")?;
+        anyhow::ensure!(mtls.crl_refresh_interval == None);
+        anyhow::ensure!(mtls.crl_fetch_timeout == Duration::from_secs(30));
+        anyhow::ensure!(mtls.crl_stale_grace == Duration::from_hours(24));
+        anyhow::ensure!(limit.idle_eviction == Duration::from_mins(15));
+        anyhow::ensure!(defaults.verification_wait == Duration::from_secs(1));
+
+        let set: AuthConfig = toml::from_str(
+            "verification_wait = \"18446744073709551615s\"\n\
+             [mtls]\nca_cert_path = \"ca.pem\"\ncrl_refresh_interval = \"0s\"\n\
+             crl_fetch_timeout = \"1h30m\"\ncrl_retry_retention = \"2d 500ms\"\n\
+             [rate_limit]\nidle_eviction = \"18446744073709551615s\"\n",
+        )?;
+        let set_mtls = set.mtls.context("mtls table present")?;
+        let set_limit = set.rate_limit.context("rate_limit table present")?;
+        anyhow::ensure!(set_mtls.crl_refresh_interval == Some(Duration::ZERO));
+        anyhow::ensure!(set_mtls.crl_fetch_timeout == Duration::from_mins(90));
+        anyhow::ensure!(set_mtls.crl_stale_grace == Duration::new(172_800, 500_000_000));
+        anyhow::ensure!(set_limit.idle_eviction == Duration::from_secs(u64::MAX));
+        anyhow::ensure!(set.verification_wait == Duration::from_secs(u64::MAX));
+
+        for (document, value) in [
+            ("verification_wait = \"1 0s\"", "1 0s"),
+            (
+                "[mtls]\nca_cert_path = \"ca.pem\"\ncrl_refresh_interval = \"soon\"",
+                "soon",
+            ),
+            (
+                "[rate_limit]\nidle_eviction = \"18446744073709551615s 1000000000ns\"",
+                "18446744073709551615s 1000000000ns",
+            ),
+        ] {
+            let message = toml::from_str::<AuthConfig>(document)
+                .err()
+                .map(|error| error.message().to_owned());
+            anyhow::ensure!(
+                message
+                    == Some(format!(
+                        "invalid value: string {value:?}, expected a duration"
+                    )),
+                "{document}: {message:?}"
+            );
+        }
         Ok(())
     }
 }
