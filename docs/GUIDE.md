@@ -1380,6 +1380,14 @@ extra_route_rate_limit = 60
 | `request_log_exclude_paths` | `Vec<String>` | `["/healthz", "/readyz"]` | Exact request paths skipped by the DEBUG `incoming request` line. MCP traffic, admin routes, OAuth routes, and `/version` still log unless you add them. |
 | `log_context` | `LogContextConfig` | `LogContextConfig::default()` | Per-line controls for client context fields on request, auth failure, and RBAC denial logs. See [Client-context logging (`[server.log_context]`)](#client-context-logging-serverlog_context). |
 
+Duration strings (the "Humantime duration" fields here and elsewhere) use the
+humantime-compatible format, implemented in-crate: `number unit` groups such as
+`"30s"`, `"1h30m"` or `"1.5h"`. It differs from `humantime` 2.4.0 in two ways:
+whitespace inside a number (`"1 0s"`) is rejected, and a value whose
+nanosecond carry overflows the seconds counter is an error instead of a panic.
+Months (`M`) and years (`y`) are accepted for compatibility but not
+recommended: they are calendar-ambiguous (30.44 and 365.25 days).
+
 ##### Choosing a `key_eviction_policy`
 
 Per-IP rate limiters track state in a map capped by `max_tracked_keys`
@@ -3895,7 +3903,8 @@ express: `name`, `version`, `rbac`, `readiness_check`, `extra_router`,
 
 **Fallibility.** `apply_to_mcp_config` returns
 `Result<McpServerConfig, RmcpServerKitError>`. It fails with `RmcpServerKitError::Config` when
-any duration string in the config cannot be parsed by `humantime` - for
+any duration string in the config cannot be parsed by the humantime-compatible
+duration parser - for
 example `request_timeout = "not-a-duration"`. Calling `validate_server_config`
 first catches common structural errors before the bridge runs, giving cleaner
 diagnostics.

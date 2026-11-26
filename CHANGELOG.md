@@ -13,8 +13,17 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- Duration strings are parsed by an in-crate, humantime-compatible parser; the
+  `humantime` and `humantime-serde` dependencies are removed, which resolves the
+  unmaintained-dependency exception RUSTSEC-2026-0542 (its ignore is gone from
+  `deny.toml` and `.cargo/audit.toml`). Same grammar as `humantime` 2.4.0 with two
+  deviations: whitespace inside a number (`"1 0s"`, `"1. 5s"`) is now rejected
+  instead of being skipped, and a value whose nanosecond carry overflows the
+  seconds counter (`"18446744073709551615s 1000000000ns"`) is an error instead of
+  a panic. Parse error messages have new wording; the kit's own messages are
+  unchanged.
 - Supply chain only: `deny.toml` and `.cargo/audit.toml` ignore RUSTSEC-2026-0543 (`chrono`
-  unmaintained), RUSTSEC-2026-0542 (`humantime` unmaintained) and RUSTSEC-2026-0387
+  unmaintained) and RUSTSEC-2026-0387
   (`crypto-bigint` timing, via `jsonwebtoken`), each with the reason it does not
   apply and the real fix noted next to it.
 - `rmcp` moved from 3.6.0 to 3.11.0. Consumer notes:

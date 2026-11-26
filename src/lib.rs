@@ -140,6 +140,7 @@ pub mod admin;
 /// Re-exports for the [`secrecy`] crate's secret-wrapper types.
 pub mod secret;
 
+mod duration_text;
 pub(crate) mod forwarded;
 #[cfg(feature = "oauth")]
 pub(crate) mod oauth_as;

@@ -68,6 +68,7 @@ use crate::{
         SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
     },
     diagnostics::{oauth_claim_values, plaintext_oauth_tokens, upstream_error_bodies},
+    duration_text::parse_duration,
     error::RmcpServerKitError,
     rbac::first_matching_scope_role,
     session_binding::validate_configured_secret,
@@ -1564,7 +1565,7 @@ impl OAuthConfig {
         }
         // Validate jwks_cache_ttl parses as a humantime duration so the
         // limiter constructor can rely on a non-fallback value (M5).
-        let _parsed_ttl = humantime::parse_duration(&self.jwks_cache_ttl).map_err(|error| {
+        let _parsed_ttl = parse_duration(&self.jwks_cache_ttl).map_err(|error| {
             RmcpServerKitError::Config(format!(
                 "oauth.jwks_cache_ttl {:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {error}",
                 self.jwks_cache_ttl
@@ -1692,7 +1693,7 @@ impl OAuthConfig {
             return Ok(());
         };
         if let Some(raw_ttl) = &proxy.consent_ttl {
-            let ttl = humantime::parse_duration(raw_ttl).map_err(|error| {
+            let ttl = parse_duration(raw_ttl).map_err(|error| {
                 RmcpServerKitError::Config(format!(
                     "oauth.proxy.consent_ttl {raw_ttl:?} is not a valid humantime duration \
                      (e.g. \"30d\", \"12h\", \"0s\"): {error}"
@@ -2890,7 +2891,7 @@ impl OAuthProxyConfig {
     pub(crate) fn effective_consent_ttl(&self) -> Duration {
         self.consent_ttl
             .as_deref()
-            .and_then(|value| humantime::parse_duration(value).ok())
+            .and_then(|value| parse_duration(value).ok())
             .unwrap_or(Duration::from_hours(720))
     }
 
@@ -3564,7 +3565,7 @@ impl JwksCacheShared {
             tracing::debug!("jsonwebtoken crypto provider already installed");
         }
 
-        let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
+        let ttl = parse_duration(&config.jwks_cache_ttl).map_err(|error| {
             RmcpServerKitError::Config(format!(
                 "invalid jwks_cache_ttl {:?}: {error}",
                 config.jwks_cache_ttl
@@ -13753,6 +13754,134 @@ role = "admin"
         assert!(
             !builder_rendered.contains(SEALING_SECRET_A),
             "builder Debug must not print sealing secrets: {builder_rendered}"
+        );
+        Ok(())
+    }
+
+    /// The validated-config error for a rejected `consent_ttl` value.
+    fn consent_ttl_parse_error(value: &str) -> anyhow::Result<String> {
+        let error = parse_duration(value)
+            .err()
+            .context("value must be rejected by the parser")?;
+        Ok(RmcpServerKitError::Config(format!(
+            "oauth.proxy.consent_ttl {value:?} is not a valid humantime duration \
+             (e.g. \"30d\", \"12h\", \"0s\"): {error}"
+        ))
+        .to_string())
+    }
+
+    /// Validate an HTTPS config whose proxy carries `consent_ttl`.
+    fn validate_consent_ttl(value: &str) -> (Result<(), String>, Duration) {
+        let mut cfg = validation_https_config();
+        let mut proxy = demo_proxy();
+        proxy.consent_ttl = Some(value.to_owned());
+        let effective = proxy.effective_consent_ttl();
+        cfg.proxy = Some(proxy);
+        (cfg.validate().map_err(|error| error.to_string()), effective)
+    }
+
+    /// `jwks_cache_ttl` parses identically in `validate` and in `JwksCache::new`.
+    #[tokio::test]
+    async fn duration_boundary_jwks_ttl_validate_and_constructor() -> anyhow::Result<()> {
+        for (value, expected) in [
+            ("10m", Duration::from_mins(10)),
+            ("1h30m", Duration::from_mins(90)),
+            ("0s", Duration::ZERO),
+            ("1.5s", Duration::from_millis(1_500)),
+        ] {
+            let mut cfg = validation_https_config();
+            cfg.jwks_cache_ttl = value.into();
+            anyhow::ensure!(cfg.validate().is_ok(), "{value:?}");
+            anyhow::ensure!(JwksCache::new(&cfg)?.shared.ttl == expected, "{value:?}");
+        }
+        for value in ["1 0s", "18446744073709551615s 1000000000ns"] {
+            let mut cfg = validation_https_config();
+            cfg.jwks_cache_ttl = value.into();
+            let parse_error = parse_duration(value)
+                .err()
+                .context("value must be rejected by the parser")?;
+            let validated = cfg.validate().err().map(|error| error.to_string());
+            anyhow::ensure!(
+                validated
+                    == Some(
+                        RmcpServerKitError::Config(format!(
+                            "oauth.jwks_cache_ttl {value:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {parse_error}"
+                        ))
+                        .to_string()
+                    ),
+                "{value:?}: {validated:?}"
+            );
+            let constructed = JwksCache::new(&cfg).err().map(|error| error.to_string());
+            anyhow::ensure!(
+                constructed
+                    == Some(
+                        RmcpServerKitError::Config(format!(
+                            "invalid jwks_cache_ttl {value:?}: {parse_error}"
+                        ))
+                        .to_string()
+                    ),
+                "{value:?}: {constructed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A zero `consent_ttl` and a sub-second one validate and resolve exactly.
+    #[test]
+    fn duration_boundary_consent_ttl_zero_and_subsecond_accepted() -> anyhow::Result<()> {
+        for (value, expected) in [
+            ("0s", Duration::ZERO),
+            ("0", Duration::ZERO),
+            ("500ms", Duration::from_millis(500)),
+            ("1ns", Duration::from_nanos(1)),
+        ] {
+            let outcome = validate_consent_ttl(value);
+            anyhow::ensure!(outcome == (Ok(()), expected), "{value:?}: {outcome:?}");
+        }
+        Ok(())
+    }
+
+    /// `consent_ttl` accepts exactly 400 days and rejects longer or malformed values.
+    #[test]
+    fn duration_boundary_consent_ttl_cap_and_malformed() -> anyhow::Result<()> {
+        let cap = Duration::from_hours(400 * 24);
+        for value in ["400days", "9600h", "399d 24h"] {
+            let outcome = validate_consent_ttl(value);
+            anyhow::ensure!(outcome == (Ok(()), cap), "{value:?}: {outcome:?}");
+        }
+        for value in ["400d 1ns", "401d"] {
+            let outcome = validate_consent_ttl(value);
+            let expected = RmcpServerKitError::Config(format!(
+                "oauth.proxy.consent_ttl {value:?} exceeds 400 days, the browser cookie lifetime cap"
+            ))
+            .to_string();
+            anyhow::ensure!(outcome.0 == Err(expected), "{value:?}: {outcome:?}");
+        }
+        for value in ["soon", "30", "18446744073709551615s 1000000000ns"] {
+            let outcome = validate_consent_ttl(value);
+            anyhow::ensure!(
+                outcome
+                    == (
+                        Err(consent_ttl_parse_error(value)?),
+                        Duration::from_hours(720)
+                    ),
+                "{value:?}: {outcome:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `"0 0s"` (formerly zero) is rejected before the 30-day fallback applies.
+    #[test]
+    fn duration_boundary_consent_ttl_zero_with_inner_space_rejected() -> anyhow::Result<()> {
+        let outcome = validate_consent_ttl("0 0s");
+        anyhow::ensure!(
+            outcome
+                == (
+                    Err(consent_ttl_parse_error("0 0s")?),
+                    Duration::from_hours(720)
+                ),
+            "{outcome:?}"
         );
         Ok(())
     }

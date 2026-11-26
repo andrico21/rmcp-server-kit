@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::{
     auth::{AuthConfig, MtlsConfig, RateLimitConfig},
     bounded_limiter::KeyEvictionPolicy,
+    duration_text::parse_duration,
     error::{Result as RmcpResult, RmcpServerKitError},
     forwarded::{MAX_CONFIGURABLE_SCANNED_ENTRIES, MAX_SCANNED_ENTRIES},
     session_binding,
@@ -508,8 +509,8 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Path to the TLS private key (PEM). Required for TLS/mTLS.
     pub tls_key_path: Option<PathBuf>,
-    /// Per-handshake deadline on the TLS accept path, parsed via
-    /// `humantime`. Idle or slow-loris connections are dropped once it
+    /// Per-handshake deadline on the TLS accept path, parsed by the
+    /// humantime-compatible duration parser. Idle or slow-loris connections are dropped once it
     /// elapses. Startup-only (not hot-reloadable); ignored unless TLS is
     /// configured. Default: `10s`.
     #[serde(default = "default_tls_handshake_timeout")]
@@ -520,10 +521,12 @@ pub struct ServerConfig {
     /// TLS is configured. Default: `256`.
     #[serde(default = "default_max_concurrent_tls_handshakes")]
     pub max_concurrent_tls_handshakes: usize,
-    /// Graceful shutdown timeout, parsed via `humantime`.
+    /// Graceful shutdown timeout, parsed by the humantime-compatible duration
+    /// parser.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: String,
-    /// Per-request timeout, parsed via `humantime`.
+    /// Per-request timeout, parsed by the humantime-compatible duration
+    /// parser.
     #[serde(default = "default_request_timeout")]
     pub request_timeout: String,
     /// Maximum request body size in bytes. Default: 1 MiB.
@@ -1826,7 +1829,7 @@ fn first_set_oauth_env(flags: &[(&'static str, bool)]) -> Option<&'static str> {
 ///
 /// Returns [`RmcpServerKitError::Config`] when `value` is not a valid duration.
 fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServerKitError> {
-    humantime::parse_duration(value).map_err(|error| {
+    parse_duration(value).map_err(|error| {
         RmcpServerKitError::Config(format!("invalid duration for {field}: {value:?}: {error}"))
     })
 }
@@ -2460,7 +2463,7 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
             server.tls_handshake_timeout.as_str(),
         ),
     ] {
-        if humantime::parse_duration(value).is_err() {
+        if parse_duration(value).is_err() {
             return Err(RmcpServerKitError::Config(format!(
                 "invalid duration for {field}: {value:?}"
             )));
@@ -2470,7 +2473,7 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
     // The handshake deadline must be a positive duration: a zero value
     // would reap every TLS handshake before it could complete. Mirrors
     // check #11 in `McpServerConfig::check`.
-    if humantime::parse_duration(&server.tls_handshake_timeout)
+    if parse_duration(&server.tls_handshake_timeout)
         .is_ok_and(|duration| duration == Duration::ZERO)
     {
         return Err(RmcpServerKitError::Config(
@@ -2526,8 +2529,7 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
 /// Returns `RmcpServerKitError::Config` naming `server.sse_retry` when the
 /// value parses to less than 1 ms.
 fn check_sse_retry_floor(server: &ServerConfig) -> RmcpResult<()> {
-    if humantime::parse_duration(&server.sse_retry).is_ok_and(|duration| duration.as_millis() == 0)
-    {
+    if parse_duration(&server.sse_retry).is_ok_and(|duration| duration.as_millis() == 0) {
         return Err(RmcpServerKitError::Config(
             "server.sse_retry must be at least 1ms; set sse_priming_enabled = false to turn the priming event off".into(),
         ));
@@ -9315,5 +9317,168 @@ client_ip = false
                     .map(|(value, _)| value.to_owned())
             })
             .collect()
+    }
+
+    /// Setter and reader for one server duration string field.
+    type DurationField = (
+        &'static str,
+        fn(&mut ServerConfig, String),
+        fn(&McpServerConfig) -> Duration,
+    );
+
+    /// The six server duration strings bridged by `apply_to_mcp_config`.
+    #[expect(
+        deprecated,
+        reason = "deliberate: config::tests::SERVER_DURATION_FIELDS reads the bridged values through the deprecated public fields"
+    )]
+    const SERVER_DURATION_FIELDS: [DurationField; 6] = [
+        (
+            "server.request_timeout",
+            |server, value| server.request_timeout = value,
+            |config| config.request_timeout,
+        ),
+        (
+            "server.shutdown_timeout",
+            |server, value| server.shutdown_timeout = value,
+            |config| config.shutdown_timeout,
+        ),
+        (
+            "server.session_idle_timeout",
+            |server, value| server.session_idle_timeout = value,
+            |config| config.session_idle_timeout,
+        ),
+        (
+            "server.sse_keep_alive",
+            |server, value| server.sse_keep_alive = value,
+            |config| config.sse_keep_alive,
+        ),
+        (
+            "server.sse_retry",
+            |server, value| server.sse_retry = value,
+            |config| config.sse_retry,
+        ),
+        (
+            "server.tls_handshake_timeout",
+            |server, value| server.tls_handshake_timeout = value,
+            |config| config.tls_handshake_timeout,
+        ),
+    ];
+
+    /// Server duration strings: exact accepted values, D3 and D3b rejected.
+    #[test]
+    fn duration_boundary_server_string_fields_accept_and_reject() -> anyhow::Result<()> {
+        for (field, set, get) in SERVER_DURATION_FIELDS {
+            let mut server = ServerConfig::default();
+            set(&mut server, "2m 30.5s".to_owned());
+            let config =
+                server.apply_to_mcp_config(McpServerConfig::new("127.0.0.1:1", "t", "0.0.0"))?;
+            anyhow::ensure!(get(&config) == Duration::new(150, 500_000_000), "{field}");
+            anyhow::ensure!(validate_server_config(&server).is_ok(), "{field}");
+
+            for value in ["1 0s", "18446744073709551615s 1000000000ns"] {
+                let mut rejected = ServerConfig::default();
+                set(&mut rejected, value.to_owned());
+                let parse_error = parse_duration(value)
+                    .err()
+                    .context("value must be rejected by the parser")?;
+                let bridged = rejected
+                    .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:1", "t", "0.0.0"))
+                    .err()
+                    .map(|error| error.to_string());
+                anyhow::ensure!(
+                    bridged
+                        == Some(
+                            RmcpServerKitError::Config(format!(
+                                "invalid duration for {field}: {value:?}: {parse_error}"
+                            ))
+                            .to_string()
+                        ),
+                    "{field} {value:?}: {bridged:?}"
+                );
+                let validated = validate_server_config(&rejected)
+                    .err()
+                    .map(|error| error.to_string());
+                anyhow::ensure!(
+                    validated
+                        == Some(
+                            RmcpServerKitError::Config(format!(
+                                "invalid duration for {field}: {value:?}"
+                            ))
+                            .to_string()
+                        ),
+                    "{field} {value:?}: {validated:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Zero TLS-handshake and verification-wait durations are rejected.
+    #[test]
+    fn duration_boundary_tls_and_verification_zero_rejected() -> anyhow::Result<()> {
+        for zero in ["0", "0s", "0ns"] {
+            let server =
+                toml::from_str::<ServerConfig>(&format!("tls_handshake_timeout = {zero:?}"))?;
+            let tls = validate_server_config(&server)
+                .err()
+                .map(|error| error.to_string());
+            anyhow::ensure!(
+                tls == Some(
+                    RmcpServerKitError::Config(
+                        "server.tls_handshake_timeout must be greater than zero".into()
+                    )
+                    .to_string()
+                ),
+                "{zero:?}: {tls:?}"
+            );
+            let auth_server =
+                toml::from_str::<ServerConfig>(&format!("[auth]\nverification_wait = {zero:?}"))?;
+            let wait = validate_server_config(&auth_server)
+                .err()
+                .map(|error| error.to_string());
+            anyhow::ensure!(
+                wait == Some(
+                    RmcpServerKitError::Config(
+                        "auth.verification_wait must be greater than zero".into()
+                    )
+                    .to_string()
+                ),
+                "{zero:?}: {wait:?}"
+            );
+        }
+        let smallest = toml::from_str::<ServerConfig>(
+            "tls_handshake_timeout = \"1ns\"\n[auth]\nverification_wait = \"1ns\"",
+        )?;
+        anyhow::ensure!(validate_server_config(&smallest).is_ok());
+        anyhow::ensure!(
+            smallest.auth.map(|auth| auth.verification_wait) == Some(Duration::from_nanos(1))
+        );
+        Ok(())
+    }
+
+    /// `sse_retry` below one millisecond is rejected; exactly `1ms` is accepted.
+    #[test]
+    fn duration_boundary_sse_retry_floor_is_one_millisecond() -> anyhow::Result<()> {
+        for below in ["999us", "999999ns", "0.999ms"] {
+            let server = toml::from_str::<ServerConfig>(&format!("sse_retry = {below:?}"))?;
+            let floor = validate_server_config(&server)
+                .err()
+                .map(|error| error.to_string());
+            anyhow::ensure!(
+                floor == Some(
+                    RmcpServerKitError::Config(
+                        "server.sse_retry must be at least 1ms; set sse_priming_enabled = false to turn the priming event off".into()
+                    )
+                    .to_string()
+                ),
+                "{below:?}: {floor:?}"
+            );
+        }
+        let floor_value = toml::from_str::<ServerConfig>("sse_retry = \"1ms\"")?;
+        anyhow::ensure!(validate_server_config(&floor_value).is_ok());
+        let config =
+            floor_value.apply_to_mcp_config(McpServerConfig::new("127.0.0.1:1", "t", "0.0.0"))?;
+        anyhow::ensure!(config.sse_retry == Duration::from_millis(1));
+        Ok(())
     }
 }

@@ -3,10 +3,9 @@
 # fix. rmcp-server-kit validates JWTs with public keys only and never decrypts RSA
 # payloads, so this timing sidechannel does not apply.
 #
-# RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0542 (humantime): unmaintained,
+# RUSTSEC-2026-0543 (chrono): unmaintained,
 # no known vulnerability. Real fix: move off chrono (jiff or time) once rmcp
-# drops it, and replace humantime/humantime-serde with an in-crate duration
-# parser or a maintained crate.
+# drops it.
 #
 # RUSTSEC-2026-0387: crypto-bigint 0.5.5 timing variability, reached through
 # jsonwebtoken -> p256/p384. Only public-key JWT verification happens here, so
@@ -15,6 +14,5 @@
 ignore = [
   "RUSTSEC-2023-0071",
   "RUSTSEC-2026-0543",
-  "RUSTSEC-2026-0542",
   "RUSTSEC-2026-0387",
 ]

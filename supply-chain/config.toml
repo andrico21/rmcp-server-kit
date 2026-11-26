@@ -539,14 +539,6 @@ criteria = "safe-to-deploy"
 version = "1.0.3"
 criteria = "safe-to-deploy"
 
-[[exemptions.humantime]]
-version = "2.4.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.humantime-serde]]
-version = "1.1.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.hybrid-array]]
 version = "0.4.15"
 criteria = "safe-to-deploy"

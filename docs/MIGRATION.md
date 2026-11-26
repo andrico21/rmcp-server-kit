@@ -3,6 +3,15 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Unreleased: in-crate duration parser
+
+Duration strings in configuration (`"30s"`, `"1h30m"`, `"1.5h"`) are now parsed
+in-crate instead of by `humantime` / `humantime-serde`. The grammar is the same
+as `humantime` 2.4.0 with two deviations: whitespace inside a number (`"1 0s"`,
+`"0 0s"`) is rejected instead of being skipped, and a value whose nanosecond
+carry overflows the seconds counter returns an error instead of panicking. No
+configuration change is needed for any sane value; parse error text is new.
+
 ## Migrating to the rmcp 3.11 release: default method-not-found and skills
 
 - rmcp 3.11 (rust-sdk #1446): if your handler does not override `complete`,
