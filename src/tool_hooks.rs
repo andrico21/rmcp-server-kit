@@ -1033,10 +1033,6 @@ mod tests {
         time::Duration,
     };
     use std::{
-        env,
-        fs::{self, OpenOptions},
-        path::PathBuf,
-        process::{self, Command, Stdio},
         sync::{Mutex, PoisonError},
         time::Instant,
     };
@@ -1067,6 +1063,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::test_support::{Isolation, isolate};
 
     type DelegationTransport = (
         DelegationProbe,
@@ -2950,81 +2947,11 @@ mod tests {
     #[test]
     /// Pins that a cap abort logs the cap message, never a serialization failure.
     fn over_cap_replacement_does_not_log_serialization_failure() -> anyhow::Result<()> {
-        // The body runs in a fresh child process: a parallel test that reaches the
-        // same `warn!` callsite with no subscriber can cache `Interest::never` for
-        // it (tracing-core's single-dispatcher fast path), dropping this capture.
-        if let Some(sentinel) = env::var_os(CAP_LOG_SENTINEL_ENV) {
-            fs::write(&sentinel, "started")?;
-            return capture_cap_abort_logs_body();
+        if isolate("tool_hooks::tests::over_cap_replacement_does_not_log_serialization_failure")?
+            == Isolation::ParentDone
+        {
+            return Ok(());
         }
-        let path = env::temp_dir().join(format!(
-            "rmcp-server-kit-cap-log-{}-{}",
-            process::id(),
-            CAP_LOG_SENTINEL_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        drop(
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .with_context(|| format!("reserve sentinel {}", path.display()))?,
-        );
-        let sentinel = SentinelFile(path);
-        let output = Command::new(env::current_exe()?)
-            .args([
-                "tool_hooks::tests::over_cap_replacement_does_not_log_serialization_failure",
-                "--exact",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env(CAP_LOG_SENTINEL_ENV, &sentinel.0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?
-            .wait_with_output()?;
-        let marker = fs::read_to_string(&sentinel.0)?;
-        let child_state = if marker == "started" {
-            "started"
-        } else {
-            "child never started"
-        };
-        assert!(
-            output.status.success() && marker == "started",
-            "isolated child failed: status={}, sentinel={child_state}, stdout={}, stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
-    }
-
-    /// Env var that marks the isolated child of
-    /// `over_cap_replacement_does_not_log_serialization_failure`; its value is
-    /// the sentinel path the child writes `started` to.
-    const CAP_LOG_SENTINEL_ENV: &str = "RMCP_SERVER_KIT_CAP_LOG_SENTINEL";
-
-    /// Per-process sequence that keeps sentinel paths unique.
-    static CAP_LOG_SENTINEL_SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    /// Sentinel path removed on drop, so success, failure and early return
-    /// all clean it up.
-    struct SentinelFile(PathBuf);
-
-    // Drop audit: non-blocking, sync `fs::remove_file`; a failure is logged, never panics.
-    impl Drop for SentinelFile {
-        fn drop(&mut self) {
-            if let Err(error) = fs::remove_file(&self.0) {
-                tracing::warn!(path = %self.0.display(), %error, "sentinel cleanup failed");
-            }
-        }
-    }
-
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/tool_hooks.rs::capture_cap_abort_logs_body keeps the uniform test signature while it cannot fail"
-    )]
-    /// Captures the logs of one cap abort; runs only in the isolated child.
-    fn capture_cap_abort_logs_body() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)

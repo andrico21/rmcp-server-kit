@@ -2658,7 +2658,10 @@ mod tests {
     use super::*;
     #[cfg(feature = "metrics")]
     use crate::metrics::McpMetrics;
-    use crate::transport::{ClientIp, PeerAddr, RequestId};
+    use crate::{
+        test_support::{Isolation, isolate},
+        transport::{ClientIp, PeerAddr, RequestId},
+    };
 
     // rmcp parser differential (RMCP_UPGRADE_CHECKLIST.md section 3)
     #[derive(Debug, PartialEq)]
@@ -3231,6 +3234,11 @@ mod tests {
     /// Rbac deny lines carry client fields when enabled.
     #[test]
     fn rbac_deny_lines_carry_client_fields_when_enabled() -> anyhow::Result<()> {
+        if isolate("rbac::tests::rbac_deny_lines_carry_client_fields_when_enabled")?
+            == Isolation::ParentDone
+        {
+            return Ok(());
+        }
         let fields = DenyLogFields {
             client_ip: Some("198.51.100.4".parse().context("ip parses")?),
             peer_ip: Some("10.0.0.1".parse().context("ip parses")?),
@@ -3253,13 +3261,14 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/rbac.rs::rbac_deny_lines_omit_client_fields_by_default keeps the uniform test signature while it cannot fail"
-    )]
     #[test]
     /// Rbac deny lines omit client fields by default.
     fn rbac_deny_lines_omit_client_fields_by_default() -> anyhow::Result<()> {
+        if isolate("rbac::tests::rbac_deny_lines_omit_client_fields_by_default")?
+            == Isolation::ParentDone
+        {
+            return Ok(());
+        }
         let logs = capture_rbac_deny_logs(&DenyLogFields::default());
 
         assert_all_rbac_deny_messages_present(&logs);
@@ -3269,14 +3278,16 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/rbac.rs::optional_non_empty_argument_allowlist_warns_once_at_policy_construction keeps the uniform test signature while it cannot fail"
-    )]
     #[test]
     /// Optional non empty argument allowlist warns once at policy construction.
     fn optional_non_empty_argument_allowlist_warns_once_at_policy_construction()
     -> anyhow::Result<()> {
+        if isolate(
+            "rbac::tests::optional_non_empty_argument_allowlist_warns_once_at_policy_construction",
+        )? == Isolation::ParentDone
+        {
+            return Ok(());
+        }
         let config =
             allowlist_warning_policy(ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]));
 
@@ -5083,6 +5094,11 @@ mod tests {
     #[tokio::test]
     /// Rbac middleware logs client fields from extensions.
     async fn rbac_middleware_logs_client_fields_from_extensions() -> anyhow::Result<()> {
+        if isolate("rbac::tests::rbac_middleware_logs_client_fields_from_extensions")?
+            == Isolation::ParentDone
+        {
+            return Ok(());
+        }
         let policy = Arc::new(enabled_policy(RoleConfig::new(
             "viewer",
             vec!["echo".into()],
@@ -8399,6 +8415,11 @@ mod tests {
     /// Denial logs and responses match the captured pre-refactor bytes.
     #[tokio::test]
     async fn evaluate_tool_call_preserves_deny_surface() -> anyhow::Result<()> {
+        if isolate("rbac::tests::evaluate_tool_call_preserves_deny_surface")?
+            == Isolation::ParentDone
+        {
+            return Ok(());
+        }
         let fields = DenyLogFields {
             client_ip: Some("198.51.100.4".parse()?),
             peer_ip: Some("10.0.0.1".parse()?),

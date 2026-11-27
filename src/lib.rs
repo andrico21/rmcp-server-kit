@@ -151,6 +151,8 @@ pub(crate) mod session_binding;
 pub(crate) mod ssrf;
 pub(crate) mod ssrf_resolver;
 pub(crate) mod task_binding;
+#[cfg(test)]
+mod test_support;
 
 /// Opt-in tool-call hooks (before/after) and result-size cap.
 pub mod tool_hooks;

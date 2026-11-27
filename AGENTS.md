@@ -60,7 +60,8 @@ rmcp-server-kit/
 │   ├── metrics.rs              Prometheus registry + /metrics listener (feature = "metrics")
 │   ├── config.rs               TOML configuration structs + validation
 │   ├── error.rs                RmcpServerKitError + IntoResponse mapping
-│   └── secret.rs               Re-exports of `secrecy` wrappers
+│   ├── secret.rs               Re-exports of `secrecy` wrappers
+│   └── test_support.rs         Test-only helper `isolate()`: re-runs one test in a fresh process (cfg(test))
 ├── tests/
 │   ├── unit/                 In-process tests (no I/O)
 │   │   ├── api_auto_traits.rs
@@ -431,6 +432,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 10. **A feature-gated test target errors instead of skipping.** The `[[test]]` tables carry `required-features`, so `cargo test --test e2e_oauth_mtls` without `--features oauth,test-helpers,oauth-mtls-client` fails with "requires the features" rather than running an empty binary. Locally always use `--all-features`; CI's feature matrix covers the narrower builds.
 11. **The mutants job is schedule-only and lint-capped.** `cargo-mutants` runs from the nightly `schedule` event (not on PRs), with `CARGO_BUILD_WARNINGS: allow` and a 180-minute per-shard cap, because deny-level lints make mutants unviable and a single shard otherwise approaches GitHub's 6-hour ceiling. It is advisory (`continue-on-error`). The oauth-feature modules `src/oauth_as.rs` and `src/oauth_seal.rs` are covered by the separate `mutants-oauth` job (cargo-mutants ignores `cfg`, so they need `--features oauth`). On GitLab the default-feature `mutants` job covers `src/rbac.rs` and `src/auth.rs` in 4 shards; `src/oauth.rs` is mutation-tested by no job.
 
+12. **Log-capture tests can lose events to tracing's callsite interest cache.** A test that installs a scoped capture subscriber (`with_default` / `set_default`) and asserts on the captured text is not safe next to parallel tests: if another thread with NO subscriber is the first to register the same `tracing` callsite, `Interest::never` is cached for it and the capturing thread silently records nothing (an empty capture, not an error). A kept-alive `NoSubscriber` dispatch plus `rebuild_interest_cache()` narrows the window but is not a guarantee. Run such a test in its own process instead: call `crate::test_support::isolate("<exact libtest name>")?` as the first statement and return early on `Isolation::ParentDone` (see `rbac::tests::evaluate_tool_call_preserves_deny_surface` and `tool_hooks::tests::over_cap_replacement_does_not_log_serialization_failure`). The helper's name guard fails a copy-pasted name, and the parent fails if the child never started, so a typo cannot pass vacuously.
 ---
 
 ## 11. Glossary
