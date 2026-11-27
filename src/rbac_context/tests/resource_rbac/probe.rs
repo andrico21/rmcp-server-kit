@@ -55,7 +55,10 @@ impl ResourceProbe {
     pub(super) fn listing(&self) -> ListResourcesResult {
         let mut listed = ListResourcesResult::with_all_items(self.script.listing.clone());
         listed.next_cursor = Some(CURSOR.to_owned());
-        listed
+        match self.script.public_ttl {
+            Some(ttl) => listed.with_cache_scope(CacheScope::Public).with_ttl_ms(ttl),
+            None => listed,
+        }
     }
 }
 
@@ -103,7 +106,10 @@ impl ServerHandler for ResourceProbe {
         self.record("list_skills");
         let mut listed = ListSkillsResult::with_all_items(self.script.skills.clone());
         listed.next_cursor = Some(CURSOR.to_owned());
-        Ok(listed)
+        Ok(match self.script.public_ttl {
+            Some(ttl) => listed.with_cache_scope(CacheScope::Public).with_ttl_ms(ttl),
+            None => listed,
+        })
     }
 
     // cancel-safe: in-memory test code; no lock, permit or state outlives an await.

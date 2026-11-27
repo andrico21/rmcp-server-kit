@@ -6,14 +6,9 @@ use super::*;
 #[tokio::test]
 async fn rbac_skills_analyst_lists_only_the_granted_skill() -> anyhow::Result<()> {
     let server = RbacSkillsServer::start(validated(&main_rbac(&["acme/billing"]))?).await?;
-    let session = server.session(&server.analyst).await?;
 
     let frame = server
-        .call(
-            (&server.analyst, &session),
-            "skills/list",
-            serde_json::json!({}),
-        )
+        .call_current(&server.analyst, "skills/list", serde_json::json!({}))
         .await?;
 
     let listed: ListSkillsResult = frame_result(&frame)?;
@@ -103,14 +98,9 @@ async fn rbac_skills_resource_reads_follow_grants_and_canonical_form() -> anyhow
 #[tokio::test]
 async fn rbac_skills_resource_list_holds_exactly_the_permitted_uris() -> anyhow::Result<()> {
     let server = RbacSkillsServer::start(validated(&main_rbac(&["acme/billing"]))?).await?;
-    let session = server.session(&server.analyst).await?;
 
     let frame = server
-        .call(
-            (&server.analyst, &session),
-            "resources/list",
-            serde_json::json!({}),
-        )
+        .call_current(&server.analyst, "resources/list", serde_json::json!({}))
         .await?;
 
     assert_eq!(

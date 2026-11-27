@@ -24,12 +24,16 @@ async fn cache_scope_is_forced_private_only_under_rbac() -> anyhow::Result<()> {
         let mut session = Session::start(probe.clone(), rbac, false);
         let fetched_result = expect_response(
             session
-                .exchange(sent_as(get_skill_at(BILLING_SKILL), 1, Some("analyst"))?)
+                .exchange(sent_as_current(
+                    get_skill_at(BILLING_SKILL),
+                    1,
+                    Some("analyst"),
+                )?)
                 .await?,
         )?;
         let read_result = expect_response(
             session
-                .exchange(sent_as(read_request(PUB_FILE), 2, Some("analyst"))?)
+                .exchange(sent_as_current(read_request(PUB_FILE), 2, Some("analyst"))?)
                 .await?,
         )?;
         session.finish().await?;

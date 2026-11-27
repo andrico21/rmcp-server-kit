@@ -1758,7 +1758,9 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that `tools/list` hides denied tools and marks the listing private.
+    /// Pins that `tools/list` hides denied tools, and that a peer which
+    /// negotiated 2026-07-28 gets the listing marked private (rmcp strips cache
+    /// hints for older peers).
     #[tokio::test]
     async fn tools_list_hides_denied_tools() -> anyhow::Result<()> {
         let (token, hash) = generate_api_key()?;
@@ -1805,10 +1807,38 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("allowed_tool")
         );
+
+        let current_resp = client
+            .post(format!("{base}/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/list")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3_u32,
+                    "method": "tools/list",
+                    "params": { "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    } }
+                })
+                .to_string(),
+            )
+            .send()
+            .await?;
+        assert_eq!(current_resp.status(), 200);
+        let current_body = mcp_response_json(current_resp).await?;
+        let current_tools = current_body
+            .pointer("/result/tools")
+            .and_then(serde_json::Value::as_array)
+            .context("2026-07-28 tools list must be an array")?;
+        assert_eq!(current_tools.len(), 1);
         assert_eq!(
-            list_body
-                .get("result")
-                .and_then(|result| result.get("cacheScope"))
+            current_body
+                .pointer("/result/cacheScope")
                 .and_then(serde_json::Value::as_str),
             Some("private")
         );

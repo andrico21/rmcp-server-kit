@@ -950,8 +950,15 @@ mod tests {
         )
     }
 
+    /// A `tools/list` page the inner handler marks `Public`, the worst case for
+    /// a role-filtered list: filtering must force `Private`, and an unfiltered
+    /// list must keep `Public`. rmcp fills a missing scope with `Private` for
+    /// 2026-07-28 peers, so a page with no scope could not show either.
     fn page(names: &[&'static str]) -> ListToolsResult {
-        ListToolsResult::with_all_items(names.iter().map(|name| tool(name)).collect())
+        let mut page =
+            ListToolsResult::with_all_items(names.iter().map(|name| tool(name)).collect());
+        page.cache_scope = Some(CacheScope::Public);
+        page
     }
 
     fn policy(role: RoleConfig) -> Arc<ArcSwap<RbacPolicy>> {
@@ -995,6 +1002,9 @@ mod tests {
             params: None,
             extensions: Extensions::default(),
         });
+        // rmcp strips cache hints from results for peers older than 2026-07-28,
+        // so the cache-hint assertions need a peer that negotiated that version.
+        let _previous_meta = request.extensions_mut().insert(coverage_meta());
         if let Some(present) = identity {
             let mut parts = Request::new(()).into_parts().0;
             let _previous_identity = parts.extensions.insert(present);
@@ -1088,7 +1098,8 @@ mod tests {
         .await?;
 
         assert_eq!(result.tools, vec![tool("a_x"), tool("b_y")]);
-        assert_eq!(result.cache_scope, None);
+        // An inner `Public` scope passes through untouched: only filtering forces `Private`.
+        assert_eq!(result.cache_scope, Some(CacheScope::Public));
         Ok(())
     }
 
@@ -1110,7 +1121,8 @@ mod tests {
         .await?;
 
         assert_eq!(result.tools, vec![tool("a_x"), tool("b_y")]);
-        assert_eq!(result.cache_scope, None);
+        // An inner `Public` scope passes through untouched: only filtering forces `Private`.
+        assert_eq!(result.cache_scope, Some(CacheScope::Public));
         Ok(())
     }
 
@@ -1122,10 +1134,8 @@ mod tests {
             vec!["a_x".to_owned(), "b_y".to_owned()],
             vec!["*".to_owned()],
         ));
-        let mut inner_page = page(&["a_x", "b_y"]);
-        inner_page.cache_scope = Some(CacheScope::Public);
 
-        let result = list_tools_for_viewer(inner_page, rbac).await?;
+        let result = list_tools_for_viewer(page(&["a_x", "b_y"]), rbac).await?;
 
         assert_eq!(result.tools, vec![tool("a_x"), tool("b_y")]);
         assert_eq!(result.cache_scope, Some(CacheScope::Private));

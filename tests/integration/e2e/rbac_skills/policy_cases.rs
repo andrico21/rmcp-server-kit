@@ -159,14 +159,9 @@ name = "legacy"
 async fn rbac_skills_toml_policy_matches_the_programmatic_one() -> anyhow::Result<()> {
     let config: RbacConfig = toml::from_str(MAIN_RBAC_TOML).context("[rbac] parses")?;
     let server = RbacSkillsServer::start(validated(&config)?).await?;
-    let session = server.session(&server.analyst).await?;
 
     let frame = server
-        .call(
-            (&server.analyst, &session),
-            "skills/list",
-            serde_json::json!({}),
-        )
+        .call_current(&server.analyst, "skills/list", serde_json::json!({}))
         .await?;
 
     let listed: ListSkillsResult = frame_result(&frame)?;
