@@ -13,6 +13,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- Internal only, no behaviour change: the bootstrap CRL fetch phase takes its
+  deadline as a crate-private parameter (`bootstrap_fetch_with_deadline`);
+  `bootstrap_fetch`, `bootstrap_fetch_with_server_chain` and `serve()` still pass
+  the unchanged 10 s `BOOTSTRAP_TIMEOUT`. The end-to-end bootstrap test now passes
+  its own 60 s deadline, so a loaded machine can no longer cut the fetch short and
+  fail it with an incomplete CRL cache.
 - Duration strings are parsed by an in-crate, humantime-compatible parser; the
   `humantime` and `humantime-serde` dependencies are removed, which resolves the
   unmaintained-dependency exception RUSTSEC-2026-0542 (its ignore is gone from

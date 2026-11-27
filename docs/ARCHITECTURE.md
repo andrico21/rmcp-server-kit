@@ -582,7 +582,7 @@ Lifecycle:
    `verifier_state`. Because `tokio_rustls::TlsAcceptor` clones the verifier
    `Arc` from the `ServerConfig` at construction, the dynamic verifier MUST
    be the Arc handed to rustls.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:2427`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:2442`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
