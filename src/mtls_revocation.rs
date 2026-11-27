@@ -2199,6 +2199,28 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
     server_chain: &[CertificateDer<'static>],
     config: MtlsConfig,
 ) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
+    bootstrap_fetch_with_deadline(roots, ca_certs, server_chain, config, BOOTSTRAP_TIMEOUT).await
+}
+
+/// Body of [`bootstrap_fetch_with_server_chain`] with the fetch-phase deadline
+/// as a parameter, so a test can size it independently of the production
+/// [`BOOTSTRAP_TIMEOUT`] the wrapper passes.
+///
+/// `deadline` bounds only the fetch phase; the final verifier build runs
+/// after it and is not covered.
+///
+/// # Errors
+///
+/// Returns an error if the initial verifier cannot be built.
+// cancel-safe: identical to `bootstrap_fetch` (see its comment); `deadline` is
+// a plain `Duration` read synchronously before any await.
+async fn bootstrap_fetch_with_deadline(
+    roots: Arc<RootCertStore>,
+    ca_certs: &[CertificateDer<'static>],
+    server_chain: &[CertificateDer<'static>],
+    config: MtlsConfig,
+    deadline: Duration,
+) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
     install_crl_crypto_provider();
     let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
@@ -2250,7 +2272,7 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
         crl_cpu: &bootstrap_crl_cpu,
         trusted_origins: &trusted_origins,
     };
-    let initial_cache = bootstrap_fetch_urls(&fetch_ctx, &urls).await;
+    let initial_cache = bootstrap_fetch_urls(&fetch_ctx, &urls, deadline).await;
 
     let set = {
         let permit = Arc::clone(&bootstrap_crl_cpu)
@@ -2272,8 +2294,8 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
     Ok((set, discover_rx))
 }
 
-/// Fetch every bootstrap CDP URL concurrently under [`BOOTSTRAP_TIMEOUT`],
-/// returning whatever was fetched successfully before the deadline.
+/// Fetch every bootstrap CDP URL concurrently under `deadline`, returning
+/// whatever was fetched successfully before the deadline.
 #[expect(
     clippy::cognitive_complexity,
     reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
@@ -2284,6 +2306,7 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
 async fn bootstrap_fetch_urls(
     ctx: &CrlFetchContext<'_>,
     urls: &[String],
+    deadline: Duration,
 ) -> HashMap<String, CachedCrl> {
     let mut initial_cache = HashMap::new();
     let mut tasks = JoinSet::new();
@@ -2313,7 +2336,7 @@ async fn bootstrap_fetch_urls(
         });
     }
 
-    let timeout: Sleep = sleep(BOOTSTRAP_TIMEOUT);
+    let timeout: Sleep = sleep(deadline);
     tokio::pin!(timeout);
 
     while !tasks.is_empty() {
@@ -2322,7 +2345,7 @@ async fn bootstrap_fetch_urls(
         // aborts remaining fetches - the intended deadline behavior.
         tokio::select! {
             () = &mut timeout => {
-                tracing::warn!("CRL bootstrap timed out after {:?}", BOOTSTRAP_TIMEOUT);
+                tracing::warn!("CRL bootstrap timed out after {:?}", deadline);
                 break;
             }
             maybe_joined = tasks.join_next() => {
@@ -5745,6 +5768,16 @@ mod tests {
     /// build can afford.
     const COMMIT_FIXTURE_COUNT: usize = 3;
 
+    /// Fetch-phase deadline the end-to-end bootstrap test passes to
+    /// `bootstrap_fetch_with_deadline`, instead of the production 10 s
+    /// `BOOTSTRAP_TIMEOUT`. Serially fetching and parsing four large CRLs
+    /// takes about 4 s on an idle machine and was measured up to 13.3 s with
+    /// every core oversubscribed 2x, so the production deadline made this
+    /// test's outcome depend on machine load, not on the offload it pins. 60 s
+    /// is at least 3x that worst measured completed fetch phase (an empirical
+    /// margin, not a bound).
+    const E2E_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(60);
+
     /// Floor for `yield_progress_count_until`'s counter. A mutant that runs
     /// the measured CPU-bound work inline (no `.await` point at all) leaves
     /// the counter at 0 or 1, since the executor never gets a chance to poll
@@ -6464,12 +6497,20 @@ mod tests {
         }
     }
 
-    /// Pins that `bootstrap_fetch`'s offloaded CRL parses and initial
-    /// verifier build keep a `current_thread` runtime responsive end to end,
-    /// through the real network path: trusted loopback origins (the CDPs
-    /// named in the configured CA certificate) can now be fetched through
-    /// `wiremock`, where before they would have been blocked at the
-    /// pre-flight stage.
+    /// Pins that bootstrap's offloaded CRL parses and initial verifier build
+    /// keep a `current_thread` runtime responsive end to end, through the real
+    /// network path: trusted loopback origins (the CDPs named in the
+    /// configured CA certificate) can now be fetched through `wiremock`, where
+    /// before they would have been blocked at the pre-flight stage. It runs
+    /// `bootstrap_fetch_with_deadline` with `E2E_BOOTSTRAP_DEADLINE`, so the
+    /// production fetch-phase deadline cannot cut the fetch short on a loaded
+    /// machine and leave the cache incomplete.
+    ///
+    /// It measures responsiveness during bootstrap only: the bootstrapped
+    /// `CrlSet` is retained and dropped after the measurement, so the
+    /// synchronous destruction of its large state (measured at up to about
+    /// 0.5 s on a heavily oversubscribed machine, enough alone to fail the
+    /// gap check) is not covered here.
     ///
     /// Unlike the helper-level progress-count tests above, a plain
     /// scheduling-progress count cannot tell offload from a stall here: the
@@ -6524,10 +6565,20 @@ mod tests {
         let baseline = fetch_baseline.min(rebuild_baseline);
 
         let ca_certs = vec![ca.der().clone()];
+        // The measured future hands the bootstrapped set to this slot instead
+        // of dropping it, so destroying the large `CrlSet` (a synchronous free
+        // on the runtime thread) happens after the measurement, not inside it.
+        let mut retained_set = None;
         let (max_gap, bootstrap_result) = max_ticker_gap_until(async {
-            let (set, discover_rx) = bootstrap_fetch(arc_roots, &ca_certs, config)
-                .await
-                .map_err(anyhow::Error::from)?;
+            let (set, discover_rx) = bootstrap_fetch_with_deadline(
+                arc_roots,
+                &ca_certs,
+                &[],
+                config,
+                E2E_BOOTSTRAP_DEADLINE,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
             drop(discover_rx);
             for url in &cdp_urls {
                 if !set.__test_cache_contains(url) {
@@ -6536,9 +6587,13 @@ mod tests {
                     );
                 }
             }
+            retained_set = Some(set);
             Ok(())
         })
         .await;
+        // Dropped here, outside the measurement and before any early return,
+        // so a failing run frees it at a known point too.
+        drop(retained_set);
         bootstrap_result.context("bootstrap_fetch over the large CRLs must succeed")?;
 
         assert!(
