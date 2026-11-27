@@ -3,7 +3,7 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
-## Unreleased: in-crate duration parser
+## Migrating to 3.22.0: in-crate duration parser
 
 Duration strings in configuration (`"30s"`, `"1h30m"`, `"1.5h"`) are now parsed
 in-crate instead of by `humantime` / `humantime-serde`. The grammar is the same
@@ -12,7 +12,7 @@ as `humantime` 2.4.0 with two deviations: whitespace inside a number (`"1 0s"`,
 carry overflows the seconds counter returns an error instead of panicking. No
 configuration change is needed for any sane value; parse error text is new.
 
-## Unreleased: rmcp 3.12 behaviour changes
+## Migrating to 3.22.0: rmcp 3.12 behaviour changes
 
 - Cache hints are omitted for older peers. rmcp 3.12 strips `ttlMs` and
   `cacheScope` from results for peers that negotiated a protocol version older
