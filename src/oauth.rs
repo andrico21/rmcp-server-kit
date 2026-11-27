@@ -6020,7 +6020,8 @@ pub(crate) mod tests {
 
     use anyhow::Context as _;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use rsa::{pkcs8, rand_core};
+    use rand::rngs::SysRng;
+    use rsa::pkcs8;
     use tokio::time::timeout;
     use tracing::subscriber;
     use tracing_subscriber::fmt as subscriber_fmt;
@@ -7225,16 +7226,16 @@ role = "admin"
 
     /// Generate an RSA-2048 keypair and return `(private_pem, jwks_json)`.
     pub(crate) fn generate_test_keypair(kid: &str) -> anyhow::Result<(String, serde_json::Value)> {
-        let mut rng = rand_core::OsRng;
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).context("keypair generation")?;
+        let mut rng = SysRng;
+        let private_key = rsa::PrivateKey::new(&mut rng, 2048).context("keypair generation")?;
         let private_pem = private_key
             .to_pkcs8_pem(pkcs8::LineEnding::LF)
             .context("PKCS8 PEM export")?
             .to_string();
 
         let public_key = private_key.to_public_key();
-        let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-        let exponent = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+        let n = URL_SAFE_NO_PAD.encode(public_key.n().to_be_bytes_trimmed_vartime());
+        let exponent = URL_SAFE_NO_PAD.encode(public_key.e().to_be_bytes_trimmed_vartime());
 
         let jwks = serde_json::json!({
             "keys": [{
@@ -8409,10 +8410,6 @@ role = "admin"
 
     // - L4: kid-strict key lookup + require_subject -
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/oauth.rs::unknown_kid_with_named_keys_rejected keeps the uniform test signature while it only asserts"
-    )]
     #[test]
     /// Rejects an unknown kid instead of falling back to an unnamed key.
     fn unknown_kid_with_named_keys_rejected() -> anyhow::Result<()> {
@@ -8421,14 +8418,14 @@ role = "admin"
             "kid-1".to_owned(),
             (
                 JwkAlg::Explicit(Algorithm::RS256),
-                DecodingKey::from_secret(b"named"),
+                DecodingKey::from_secret(b"named")?,
             ),
         ));
         let cached = CachedKeys {
             keys,
             unnamed_keys: vec![(
                 JwkAlg::Explicit(Algorithm::RS256),
-                DecodingKey::from_secret(b"unnamed"),
+                DecodingKey::from_secret(b"unnamed")?,
             )],
             fetched_at: Instant::now(),
             ttl: Duration::from_secs(300),
@@ -8445,10 +8442,6 @@ role = "admin"
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/oauth.rs::no_kid_token_matches_unnamed_key keeps the uniform test signature while it only asserts"
-    )]
     #[test]
     /// Matches a kid-less token against an unnamed JWKS key.
     fn no_kid_token_matches_unnamed_key() -> anyhow::Result<()> {
@@ -8457,14 +8450,14 @@ role = "admin"
             "kid-1".to_owned(),
             (
                 JwkAlg::Explicit(Algorithm::RS256),
-                DecodingKey::from_secret(b"named"),
+                DecodingKey::from_secret(b"named")?,
             ),
         ));
         let cached = CachedKeys {
             keys,
             unnamed_keys: vec![(
                 JwkAlg::Explicit(Algorithm::RS256),
-                DecodingKey::from_secret(b"unnamed"),
+                DecodingKey::from_secret(b"unnamed")?,
             )],
             fetched_at: Instant::now(),
             ttl: Duration::from_secs(300),

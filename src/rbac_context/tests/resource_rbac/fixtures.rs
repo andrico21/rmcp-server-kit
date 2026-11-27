@@ -80,8 +80,10 @@ pub(super) enum Accept {
     EchoPlus(&'static str),
 }
 
-/// Everything a probe answers, fixed per case. The probe sets `cache_scope`
-/// only when `public_ttl` is `Some`.
+/// Everything a probe answers, fixed per case. The probe marks its results
+/// `Public` with that TTL only when `public_ttl` is `Some`: rmcp fills a missing
+/// `Private` scope for 2026-07-28 peers, so a case that asserts RBAC forced
+/// `Private` must start from `Public`.
 #[derive(Clone)]
 #[expect(
     clippy::field_scoped_visibility_modifiers,
@@ -169,6 +171,19 @@ pub(super) fn sent_as(
     if let Some(name) = role {
         attach_identity(&mut message, caller(name))?;
     }
+    Ok(message)
+}
+
+/// Like [`sent_as`], for a peer that negotiated 2026-07-28: rmcp strips the
+/// cache hints a result carries for older peers, so assertions on `ttlMs` and
+/// `cacheScope` need this version.
+pub(super) fn sent_as_current(
+    request: ClientRequest,
+    id: i64,
+    role: Option<&str>,
+) -> anyhow::Result<ClientJsonRpcMessage> {
+    let mut message = sent_as(request, id, role)?;
+    attach_meta(&mut message, coverage_meta())?;
     Ok(message)
 }
 

@@ -47,7 +47,7 @@ an rmcp bump changes the surface:
 
 | Constant / table | Role |
 |---|---|
-| `EXPECTED_UPSTREAM_METHOD_COUNT` | method count of the pinned rmcp `ServerHandler` (32 for 3.11.0) |
+| `EXPECTED_UPSTREAM_METHOD_COUNT` | method count of the pinned rmcp `ServerHandler` (32 for 3.11.0 and 3.12.0) |
 | `HOOKED_HANDLER_DIRECTLY_DELEGATED`, `HOOKED_HANDLER_BEHAVIORAL_WRAPPED`, `HOOKED_HANDLER_INTENTIONALLY_DEFAULTED`, `RBAC_CONTEXT_HANDLER_DIRECTLY_DELEGATED`, `RBAC_CONTEXT_HANDLER_BEHAVIORAL_WRAPPED`, `RBAC_CONTEXT_HANDLER_INTENTIONALLY_DEFAULTED` | per-wrapper classification of every upstream method |
 | `HOOKED_HANDLER_IMPL_METHOD_COUNT`, `RBAC_CONTEXT_HANDLER_IMPL_METHOD_COUNT` | how many methods each wrapper's own impl must scan to; catches a mis-scoped scanner or a silently shrunk impl |
 | `HOOKED_HANDLER_SOURCE`, `RBAC_CONTEXT_HANDLER_SOURCE`, `HOOKED_HANDLER_IMPL_ANCHOR`, `RBAC_CONTEXT_HANDLER_IMPL_ANCHOR` | the file and the column-0 full-generic impl anchor each scanner reads |

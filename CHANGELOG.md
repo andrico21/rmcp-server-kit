@@ -13,6 +13,19 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- Dependency update: `rmcp` and `rmcp-macros` 3.11.0 to 3.12.0, `jsonwebtoken`
+  11 to 12, the `rsa` dev-dependency 0.9 to 0.10 and the RustCrypto stack that
+  moves with them (`rmcp` 3.12 adds `jiff`; `jsonwebtoken` 12 and `rsa` 0.10
+  remove `rand` 0.8, `generic-array`, `crypto-common`, `num-bigint-dig` and
+  others), plus the semver-compatible lockfile updates. Behaviour changes that
+  come from upstream (see `docs/MIGRATION.md`): `rmcp` omits `ttlMs` and
+  `cacheScope` for peers older than protocol `2026-07-28` (the `private` scope RBAC
+  forces on filtered lists is visible to `2026-07-28` peers only), and answers a
+  malformed Streamable HTTP body with `400` and a JSON-RPC error instead of
+  `415`. `jsonwebtoken` 12 rejects tokens with unknown critical header
+  extensions and empty HMAC keys. `matchit` stays at 0.8.4 (`axum` pins it).
+  The `RUSTSEC-2023-0071` and `RUSTSEC-2026-0387` ignores are removed from
+  `deny.toml` and `.cargo/audit.toml`: neither advisory matches the new tree.
 - Internal only, no behaviour change: the bootstrap CRL fetch phase takes its
   deadline as a crate-private parameter (`bootstrap_fetch_with_deadline`);
   `bootstrap_fetch`, `bootstrap_fetch_with_server_chain` and `serve()` still pass

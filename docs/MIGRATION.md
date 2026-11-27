@@ -12,6 +12,18 @@ as `humantime` 2.4.0 with two deviations: whitespace inside a number (`"1 0s"`,
 carry overflows the seconds counter returns an error instead of panicking. No
 configuration change is needed for any sane value; parse error text is new.
 
+## Unreleased: rmcp 3.12 behaviour changes
+
+- Cache hints are omitted for older peers. rmcp 3.12 strips `ttlMs` and
+  `cacheScope` from results for peers that negotiated a protocol version older
+  than `2026-07-28`; it keeps them, and fills a missing one (`ttlMs` 0, scope
+  `private`), for peers on `2026-07-28` or newer. The `private` scope that RBAC
+  forces on a role-filtered `tools/list`, `resources/list` or `skills/list` is
+  therefore only visible to `2026-07-28` peers. Older peers never used the hint.
+- A request body that is not a valid JSON-RPC message now gets HTTP `400` with a
+  JSON-RPC error (`-32700` for invalid JSON, `-32600` otherwise) where it got
+  `415` with a plain-text message.
+
 ## Migrating to the rmcp 3.11 release: default method-not-found and skills
 
 - rmcp 3.11 (rust-sdk #1446): if your handler does not override `complete`,

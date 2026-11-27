@@ -148,13 +148,20 @@ async fn listings_are_filtered_per_role_in_restrict_mode() -> anyhow::Result<()>
         ),
     ];
     for (filtering, role, request, expected, method) in rows {
-        let probe = ResourceProbe::new(Script::default());
+        let probe = ResourceProbe::new(Script {
+            public_ttl: Some(5_000),
+            ..Script::default()
+        });
         let mut session = Session::start(
             probe.clone(),
             shared(analyst_policy(true, &["acme/billing"])),
             filtering,
         );
-        let listed = expect_listing(session.exchange(sent_as(request(), 1, role)?).await?)?;
+        let listed = expect_listing(
+            session
+                .exchange(sent_as_current(request(), 1, role)?)
+                .await?,
+        )?;
         session.finish().await?;
         assert_eq!(
             uris(&listed),
@@ -169,12 +176,13 @@ async fn listings_are_filtered_per_role_in_restrict_mode() -> anyhow::Result<()>
     // A granted role whose page filters to nothing still gets the cursor.
     let probe = ResourceProbe::new(Script {
         listing: [HR_SKILL, PRIV_FILE].map(resource).to_vec(),
+        public_ttl: Some(5_000),
         ..Script::default()
     });
     let frame = dispatch(
         &probe,
         shared(analyst_policy(true, &["acme/billing"])),
-        sent_as(list_resources_request(), 1, Some("analyst"))?,
+        sent_as_current(list_resources_request(), 1, Some("analyst"))?,
     )
     .await?;
     let listed = expect_listing(frame)?;
@@ -199,12 +207,13 @@ async fn skills_list_keeps_only_granted_safe_registered_skills() -> anyhow::Resu
             skill(UNSAFE_SKILL, "b"),
             skill(UNREGISTERED_MANIFEST, "y"),
         ],
+        public_ttl: Some(5_000),
         ..Script::default()
     });
     let frame = dispatch(
         &probe,
         shared(analyst_policy(true, &["acme/billing"])),
-        sent_as(list_skills_request(), 1, Some("analyst"))?,
+        sent_as_current(list_skills_request(), 1, Some("analyst"))?,
     )
     .await?;
     let listed = expect_skills(frame)?;

@@ -70,13 +70,41 @@ impl RbacSkillsServer {
         .await?;
         assert_eq!(response.status(), 200, "{method} {params}");
         let text = response.text().await.context("read MCP response body")?;
-        let payload = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim_start)
-            .find(|payload| !payload.is_empty())
-            .unwrap_or(text.as_str());
-        Ok(payload.to_owned())
+        Ok(frame_payload(&text).to_owned())
+    }
+
+    /// One stateless 2026-07-28 JSON-RPC request for `token`, parsed. rmcp
+    /// strips the cache hints from results for older peers, so assertions on
+    /// `cacheScope` need this version.
+    pub(super) async fn call_current(
+        &self,
+        token: &str,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let object = params
+            .as_object_mut()
+            .context("request params must be a JSON object")?;
+        let _previous_meta = object.insert("_meta".to_owned(), meta);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 9_u32, "method": method, "params": params });
+        let response = self
+            .client
+            .post(format!("{}/mcp", self.base.base))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", method)
+            .body(body.to_string())
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200, "{method} {params}");
+        let text = response.text().await.context("read MCP response body")?;
+        Ok(serde_json::from_str(frame_payload(&text))?)
     }
 
     /// [`Self::call_text`], parsed.
@@ -134,4 +162,14 @@ impl RbacSkillsServer {
         };
         Ok((status, frames))
     }
+}
+
+/// The JSON of the first non-empty SSE `data:` line, or the whole body when it
+/// is plain JSON.
+fn frame_payload(text: &str) -> &str {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .find(|payload| !payload.is_empty())
+        .unwrap_or(text)
 }
