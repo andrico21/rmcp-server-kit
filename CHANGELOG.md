@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.22.0] - 2026-11-27
+
 ### Changed
 
 - Dependency update: `rmcp` and `rmcp-macros` 3.11.0 to 3.12.0, `jsonwebtoken`
