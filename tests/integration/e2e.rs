@@ -61,6 +61,8 @@ mod tests {
     use futures::stream;
     #[cfg(feature = "oauth")]
     use jsonwebtoken::Algorithm;
+    #[cfg(feature = "oauth")]
+    use rand::rngs::SysRng;
     use reqwest::header::HeaderMap;
     use rmcp::{
         handler::server::ServerHandler,
@@ -91,7 +93,7 @@ mod tests {
         transport::{ForwardedHeaderMode, McpServerConfig, serve_with_listener},
     };
     #[cfg(feature = "oauth")]
-    use rsa::{pkcs8, pkcs8::EncodePrivateKey as _, rand_core, traits::PublicKeyParts as _};
+    use rsa::{pkcs8, pkcs8::EncodePrivateKey as _, traits::PublicKeyParts as _};
     use rustls::crypto::ring;
     use secrecy::SecretString;
     use serde::de::DeserializeOwned;
@@ -3193,8 +3195,8 @@ mod tests {
 
     #[cfg(feature = "oauth")]
     fn generate_oauth_test_keypair(kid: &str) -> anyhow::Result<(String, serde_json::Value)> {
-        let mut rng = rand_core::OsRng;
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).context("keypair generation")?;
+        let mut rng = SysRng;
+        let private_key = rsa::PrivateKey::new(&mut rng, 2048).context("keypair generation")?;
         let private_pem = private_key
             .to_pkcs8_pem(pkcs8::LineEnding::LF)
             .context("PKCS8 PEM export")?
@@ -3206,8 +3208,8 @@ mod tests {
                 "use": "sig",
                 "alg": "RS256",
                 "kid": kid,
-                "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
-                "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())
+                "n": URL_SAFE_NO_PAD.encode(public_key.n().to_be_bytes_trimmed_vartime()),
+                "e": URL_SAFE_NO_PAD.encode(public_key.e().to_be_bytes_trimmed_vartime())
             }]
         });
         Ok((private_pem, jwks))

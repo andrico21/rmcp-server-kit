@@ -1,14 +1,5 @@
 [advisories]
-# RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa` 0.9.x. No upstream
-# fix. rmcp-server-kit validates JWTs with public keys only and never decrypts RSA
-# payloads, so this timing sidechannel does not apply.
-#
 # RUSTSEC-2026-0543 (chrono): unmaintained,
 # no known vulnerability. Real fix: move off chrono (jiff or time) once rmcp
 # drops it.
-#
-# RUSTSEC-2026-0387: crypto-bigint 0.5.5 timing variability, reached through
-# jsonwebtoken -> p256/p384. Only public-key JWT verification happens here, so
-# secret-dependent timing does not apply. Real fix: crypto-bigint >= 0.7.6,
-# which needs a jsonwebtoken release on the newer RustCrypto stack.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0543", "RUSTSEC-2026-0387"]
+ignore = ["RUSTSEC-2026-0543"]

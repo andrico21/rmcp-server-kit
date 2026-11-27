@@ -44,6 +44,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use rand::rngs::SysRng;
 use rmcp::{
     ErrorData,
     handler::server::ServerHandler,
@@ -63,9 +64,8 @@ use rmcp_server_kit::{
     transport::{McpServerConfig, serve},
 };
 use rsa::{
-    RsaPrivateKey,
+    PrivateKey,
     pkcs8::{EncodePrivateKey as _, LineEnding},
-    rand_core::OsRng,
     traits::PublicKeyParts as _,
 };
 use serde::Deserialize;
@@ -305,7 +305,7 @@ fn mint_access_token(idp: &FakeIdp) -> anyhow::Result<String> {
 /// # Errors
 /// Returns an error if key generation or PEM export fails.
 fn generate_signing_key() -> anyhow::Result<(EncodingKey, Value)> {
-    let private_key = RsaPrivateKey::new(&mut OsRng, 2048).context("RSA key generation")?;
+    let private_key = PrivateKey::new(&mut SysRng, 2048).context("RSA key generation")?;
     let pem = private_key
         .to_pkcs8_pem(LineEnding::LF)
         .context("PKCS#8 export")?;
@@ -313,8 +313,8 @@ fn generate_signing_key() -> anyhow::Result<(EncodingKey, Value)> {
     let public_key = private_key.to_public_key();
     let jwks = json!({"keys": [{
         "kty": "RSA", "use": "sig", "alg": "RS256", "kid": KEY_ID,
-        "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
-        "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
+        "n": URL_SAFE_NO_PAD.encode(public_key.n().to_be_bytes_trimmed_vartime()),
+        "e": URL_SAFE_NO_PAD.encode(public_key.e().to_be_bytes_trimmed_vartime()),
     }]});
     Ok((signing_key, jwks))
 }

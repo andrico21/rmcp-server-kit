@@ -3,9 +3,9 @@
 use anyhow::{Context as _, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use rand::rngs::SysRng;
 use rsa::{
     pkcs8::{self, EncodePrivateKey as _},
-    rand_core,
     traits::PublicKeyParts as _,
 };
 use serde_json::{Map, Value, json};
@@ -19,12 +19,12 @@ pub(super) struct Identity {
 
 impl Identity {
     pub(super) fn generate() -> anyhow::Result<Self> {
-        let private = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048)?;
+        let private = rsa::PrivateKey::new(&mut SysRng, 2048)?;
         let pem = private.to_pkcs8_pem(pkcs8::LineEnding::LF)?;
         let public = private.to_public_key();
         Ok(Self {
             key: EncodingKey::from_rsa_pem(pem.as_bytes())?,
-            jwks: json!({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"case-key", "n":URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())}]}),
+            jwks: json!({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"case-key", "n":URL_SAFE_NO_PAD.encode(public.n().to_be_bytes_trimmed_vartime()),"e":URL_SAFE_NO_PAD.encode(public.e().to_be_bytes_trimmed_vartime())}]}),
         })
     }
 

@@ -157,7 +157,7 @@ shlex = "2"
 prometheus = { version = "0.14", optional = true }
 
 # OAuth 2.1 JWT (optional)
-jsonwebtoken = { version = "11", features = ["rust_crypto"], optional = true }
+jsonwebtoken = { version = "12", features = ["rust_crypto"], optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = [
   "rustls-no-provider",
   "json",
@@ -202,7 +202,7 @@ test-helpers = []
 
 [dev-dependencies]
 rcgen = "0.14"
-rsa = "0.9"
+rsa = "0.10"
 wiremock = "0.6"
 reqwest = { version = "0.13.4", default-features = false, features = [
   "rustls-no-provider",

@@ -1810,9 +1810,9 @@ mod tests {
     /// Mint a real RS256 upstream JWT and publish its key through the upstream JWKS route.
     async fn upstream_jwt(server: &Harness) -> anyhow::Result<String> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use rand::rngs::SysRng;
         use rsa::{
             pkcs8::{EncodePrivateKey as _, LineEnding},
-            rand_core,
             traits::PublicKeyParts as _,
         };
         use wiremock::{
@@ -1820,9 +1820,9 @@ mod tests {
             matchers::{method, path},
         };
         let (pem,jwks) = spawn_blocking(|| -> anyhow::Result<_> {
-            let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng,2048)?;
+            let key = rsa::PrivateKey::new(&mut SysRng,2048)?;
             let public = key.to_public_key();
-            let jwks = json!({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"task12-upstream-key","n":URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())}]});
+            let jwks = json!({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"task12-upstream-key","n":URL_SAFE_NO_PAD.encode(public.n().to_be_bytes_trimmed_vartime()),"e":URL_SAFE_NO_PAD.encode(public.e().to_be_bytes_trimmed_vartime())}]});
             Ok((key.to_pkcs8_pem(LineEnding::LF)?.to_string(),jwks))
         }).await??;
         Mock::given(method("GET"))
